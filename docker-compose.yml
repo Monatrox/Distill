@@ -1,0 +1,23 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q listeners | grep -q '5672'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  distill:
+    build: .
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URI: amqp://guest:guest@rabbitmq:5672/%2f
+      DISTILL_API_KEY: change-me-in-development
+      DISTILL_BIND_ADDRESS: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
