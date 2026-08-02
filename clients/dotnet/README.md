@@ -2,6 +2,8 @@
 
 `Distill.Client` is a small dependency-free .NET client for the Distill HTTP API.
 
+For drop-in integration with existing `ILogger` applications, see the companion [Distill.Extensions.Logging provider](Distill.Extensions.Logging/README.md).
+
 It targets .NET 8 and supports:
 
 - simplified channel creation with presets and overrides;
