@@ -516,6 +516,7 @@ The guiding goal is simple:
 
 ## Documentation
 
+- [.NET SDK](clients/dotnet/README.md)
 - [Communication surface improvements](docs/communication_surface_improvements.md)
 - [C#/.NET integration guide](docs/csharp_integration.md)
 - [Technical specification](docs/technical_specification.md)

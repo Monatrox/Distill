@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageId>Distill.Client</PackageId>
+    <Description>Dependency-free .NET client for the Distill structured logging service.</Description>
+    <PackageTags>distill logging structured-logging aggregation observability</PackageTags>
+  </PropertyGroup>
+</Project>
