@@ -182,6 +182,35 @@ Invoke-WebRequest `
 
 The channel setup connects to PostgreSQL, initializes the required sink tables, registers the RabbitMQ exchange, and starts the channel actor.
 
+### A simpler channel request
+
+For a friendlier self-hosted setup, set `DISTILL_DEFAULT_SINK_CONNECTION_STRING`. Distill will generate the RabbitMQ exchange and routing key from the channel name and apply the selected preset:
+
+```powershell
+$env:DISTILL_DEFAULT_SINK_CONNECTION_STRING = "postgresql://distill:password@host.docker.internal:5432/logs"
+```
+
+Then create a channel with only its intent and any overrides you need:
+
+```powershell
+$request = '{
+  "name": "checkout.latency",
+  "preset": "metrics",
+  "retention_hours": 720
+}'
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:8080/channels `
+  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -ContentType "application/json" `
+  -Body $request
+```
+
+Available presets are `raw_events`, `errors_only`, `metrics`, `audit`, and `count`. Presets are starting points, not restrictions: send `severity_threshold`, `aggregator`, buffering, ordering, retention, or other supported properties to override them. Set `"aggregator": null` explicitly when a preset’s aggregation should be disabled.
+
+Use `POST /channels/validate` with the same request shape to resolve and validate a channel without registering it.
+
 ### 3. Send a structured event
 
 ```powershell
@@ -223,6 +252,31 @@ Expected response:
 ```
 
 `accepted` means the event was accepted into Distill’s durable delivery path. It does not promise that the PostgreSQL row is already queryable at the instant the HTTP response arrives.
+
+For a single event, the channel-bound endpoint removes the repeated `channel_id` field and can generate the timestamp and event ID:
+
+```powershell
+$event = '{
+  "severity": "error",
+  "message": "Payment authorization failed",
+  "attributes": {
+    "order_id": "ord-123",
+    "retryable": true
+  },
+  "metadata": {
+    "service": "checkout-api"
+  }
+}'
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:8080/channels/orders.production/events `
+  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -ContentType "application/json" `
+  -Body $event
+```
+
+Use `POST /channels/{channel_id}/test` with this same simple event shape to see whether the event would be directly persisted, aggregated, or both without enqueueing it.
 
 ## Choosing a channel policy
 
@@ -300,9 +354,19 @@ All management and ingestion requests except health checks require the `X-API-Ke
 | `GET` | `/metrics` | Prometheus-style service metrics |
 | `POST` | `/ingest` | Ingest one or more JSON events |
 | `POST` | `/ingest` with Protobuf | Ingest a Protobuf `IngestRequest` |
+| `POST` | `/v1/logs` | Ingest OTLP/HTTP JSON log records |
+| `POST` | `/channels` | Create a channel from a preset and overrides |
+| `POST` | `/channels/validate` | Validate and resolve a channel request |
 | `PUT` | `/channels/{channel_id}` | Create or replace a channel |
-| `GET` | `/channels/{channel_id}/config` | Check whether a channel is active |
+| `GET` | `/channels/{channel_id}/config` | Inspect sanitized effective configuration |
+| `POST` | `/channels/{channel_id}/events` | Ingest one simple event for a channel |
+| `POST` | `/channels/{channel_id}/test` | Preview validation and routing for an event |
 | `POST` | `/channels/{channel_id}/schema` | Register or replace a runtime schema |
+| `POST` | `/channels/{channel_id}/pause` | Stop accepting events while retaining the channel |
+| `POST` | `/channels/{channel_id}/resume` | Resume a paused channel |
+| `POST` | `/channels/{channel_id}/flush` | Flush the active aggregate window |
+| `POST` | `/channels/{channel_id}/archive` | Flush and stop accepting events |
+| `POST` | `/channels/{channel_id}/clone` | Create a new channel from an existing definition |
 
 ### JSON ingestion
 
@@ -314,6 +378,19 @@ All management and ingestion requests except health checks require the `X-API-Ke
 - `payload` — any JSON value.
 
 `event_id` is optional, but stable UUIDs are strongly recommended. They allow idempotent retries when a response is lost after successful admission. `metadata` is optional and is a string-to-string map.
+
+### OpenTelemetry Logs
+
+Distill also accepts OTLP/HTTP JSON at `POST /v1/logs`. Supply the destination through `X-Distill-Channel` or the OTLP resource attribute `distill.channel`. OTLP resource and record attributes are preserved as structured event properties, and trace/span identifiers are retained in metadata.
+
+```http
+POST /v1/logs
+Content-Type: application/json
+X-API-Key: change-me-in-development
+X-Distill-Channel: orders.production
+```
+
+The adapter feeds the same validation, severity routing, aggregation, RabbitMQ delivery, and PostgreSQL persistence path as native ingestion.
 
 ### Protobuf ingestion
 
@@ -354,6 +431,8 @@ Distill requires:
 | `DISTILL_API_KEY` | Yes | Shared API key for management and ingestion |
 | `DISTILL_BIND_ADDRESS` | No | HTTP bind address; defaults to `127.0.0.1:8080` |
 | `DISTILL_CONFIG_PATH` | No | JSON file containing startup channel definitions |
+| `DISTILL_DEFAULT_SINK_CONNECTION_STRING` | No | PostgreSQL sink used by simplified `POST /channels` requests |
+| `DISTILL_EXCHANGE_NAME_PREFIX` | No | Generated exchange prefix; defaults to `distill` |
 
 Startup configuration uses this shape:
 

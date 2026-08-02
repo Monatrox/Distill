@@ -1,5 +1,7 @@
 //! Loads and validates runtime Protobuf descriptors.
 
+// Rust guideline compliant 2026-02-21
+
 use crate::{domain::MessageSchemaDefinition, errors::DistillError};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use prost_reflect::{DescriptorPool, MessageDescriptor};
@@ -21,6 +23,10 @@ struct RegisteredSchema {
 }
 
 impl SchemaRegistry {
+    pub async fn remove(&self, channel_id: &str) {
+        self.schemas.write().await.remove(channel_id);
+    }
+
     pub async fn register(
         &self,
         channel_id: &str,

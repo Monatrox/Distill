@@ -1,5 +1,7 @@
 //! Loads process and channel configuration from environment variables and JSON files.
 
+// Rust guideline compliant 2026-02-21
+
 use crate::{domain::ChannelDefinition, errors::DistillError};
 use anyhow::Context;
 use serde::Deserialize;
@@ -11,6 +13,8 @@ pub struct Settings {
     pub rabbitmq_uri: String,
     pub api_key: String,
     pub config_path: Option<PathBuf>,
+    pub default_sink_connection_string: Option<String>,
+    pub exchange_name_prefix: String,
 }
 
 impl fmt::Debug for Settings {
@@ -21,6 +25,14 @@ impl fmt::Debug for Settings {
             .field("rabbitmq_uri", &"[REDACTED]")
             .field("api_key", &"[REDACTED]")
             .field("config_path", &self.config_path)
+            .field(
+                "default_sink_connection_string",
+                &self
+                    .default_sink_connection_string
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .field("exchange_name_prefix", &self.exchange_name_prefix)
             .finish()
     }
 }
@@ -38,12 +50,18 @@ impl Settings {
             .context("DISTILL_BIND_ADDRESS must be a socket address")?;
         let rabbitmq_uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required")?;
         let api_key = env::var("DISTILL_API_KEY").context("DISTILL_API_KEY is required")?;
+        let default_sink_connection_string =
+            env::var("DISTILL_DEFAULT_SINK_CONNECTION_STRING").ok();
+        let exchange_name_prefix =
+            env::var("DISTILL_EXCHANGE_NAME_PREFIX").unwrap_or_else(|_| "distill".to_string());
 
         Ok(Self {
             http: HttpSettings { bind_address },
             rabbitmq_uri,
             api_key,
             config_path: env::var_os("DISTILL_CONFIG_PATH").map(PathBuf::from),
+            default_sink_connection_string,
+            exchange_name_prefix,
         })
     }
 }
