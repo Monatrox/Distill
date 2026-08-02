@@ -56,8 +56,34 @@ For high-volume producers, use `IngestAsync` with stable `EventId` values. If a 
 
 ## Add the project
 
+`ProjectReference` paths are resolved relative to the consuming `.csproj`, not relative to the solution file. For a quick diagnosis, use the absolute path first:
+
 ```xml
-<ProjectReference Include="..\\Distill.Client\\Distill.Client.csproj" />
+<ItemGroup>
+  <ProjectReference Include="A:\Dev\Rust\Projects\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj" />
+</ItemGroup>
+```
+
+Once that works, replace the absolute path with a relative path calculated from the consuming project's directory. In PowerShell, verify the result before adding it:
+
+```powershell
+$consumerProject = "A:\path\to\MyApp.csproj"
+$reference = "..\..\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj"
+$consumerDirectory = Split-Path -Parent $consumerProject
+[IO.Path]::GetFullPath((Join-Path $consumerDirectory $reference))
+Test-Path (Join-Path $consumerDirectory $reference)
+```
+
+The final command must return `True`. The reference should be a `ProjectReference`, not a `Reference` or `PackageReference`:
+
+```xml
+<ProjectReference Include="..\..\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj" />
+```
+
+If using an IDE, add `Distill.Client.csproj` as an existing project in the solution and then add it as a project reference. Reload the solution after correcting the path.
+
+```xml
+<ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
 ```
 
 Build it locally with:
