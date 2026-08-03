@@ -2,12 +2,12 @@
 
 use crate::{
     aggregation::AggregatorState,
+    broker::RabbitPublisher,
     buffer::{EventBuffer, MemoryBudget},
     domain::{ChannelDefinition, LogEvent, OrderingMode},
     errors::DistillError,
     metrics::Metrics,
     routing::{RouteDecision, classify},
-    sink::RabbitPublisher,
 };
 use chrono::{DateTime, Duration, Utc};
 use std::{sync::Arc, time::Duration as StdDuration};
