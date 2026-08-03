@@ -27,7 +27,15 @@ public sealed record CreateChannelRequest
     [JsonIgnore]
     public bool DisableAggregator { get; init; }
 
-    /// Gets or initializes an optional sink configuration override.
+    /// Gets or initializes the named sink used by this channel.
+    [JsonPropertyName("sink_id")]
+    public string? SinkId { get; init; }
+
+    /// Gets or initializes a legacy inline sink configuration override.
+    ///
+    /// Prefer <see cref="SinkId"/>. Sink credentials should be provisioned by the Distill CLI
+    /// or deployment system, not passed through application configuration.
+    [Obsolete("Use SinkId and provision the sink with the Distill CLI.")]
     [JsonPropertyName("sink_config")]
     public SinkConfig? SinkConfig { get; init; }
 
@@ -214,6 +222,10 @@ public sealed record EffectiveChannelConfig
     /// Gets the channel identifier.
     [JsonPropertyName("channel_id")]
     public string ChannelId { get; init; } = string.Empty;
+
+    /// Gets the named sink selected by the channel, when one is configured.
+    [JsonPropertyName("sink_id")]
+    public string? SinkId { get; init; }
 
     /// Gets the configured severity threshold.
     [JsonPropertyName("severity_threshold")]

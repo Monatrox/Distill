@@ -6,7 +6,7 @@ It targets .NET 8 or later and assumes the operator has:
 
 - an HTTP address for the Distill service;
 - the Distill API key;
-- a PostgreSQL connection string for the logging repository; and
+- a sink provisioned separately with the Distill CLI or deployment system; and
 - source access when a generated Protobuf client, schema registration, or operational customization is required.
 
 ## 1. Integration model
@@ -23,12 +23,12 @@ Distill channel actor
 RabbitMQ
     │ internal consumer; ack after sink success
     ▼
-PostgreSQL logging repository
+Configured Distill sink
 ```
 
-RabbitMQ is transport, buffering, retry, and dead-letter infrastructure. PostgreSQL is the v1 persistence destination. The C# process should treat a successful HTTP response as “durably handed to Distill,” not as proof that the row is already queryable in PostgreSQL.
+RabbitMQ is transport, buffering, retry, and dead-letter infrastructure. The configured Distill sink may be PostgreSQL, MySQL, SQL Server, or HTTP. The C# process should treat a successful HTTP response as “durably handed to Distill,” not as proof that a record is already queryable in the sink.
 
-## 2. Deployment and connection strings
+## 2. Deployment and sink administration
 
 For a local, self-contained Distill environment:
 
@@ -36,62 +36,69 @@ For a local, self-contained Distill environment:
 docker compose up --build
 ```
 
-The Compose deployment starts Distill and RabbitMQ. The configured sink is operated separately and may be PostgreSQL or another supported destination. Configure the Distill process with:
+The Compose deployment starts Distill and RabbitMQ. Sink administration is a deployment concern and should be performed before the application starts sending logs. The C# application should not receive or store the sink connection string.
+
+Configure the Distill process with:
 
 ```text
 RABBITMQ_URI=amqp://user:password@rabbitmq.example.com:5672/%2f
 DISTILL_API_KEY=<secret>
 DISTILL_BIND_ADDRESS=0.0.0.0:8080
+DISTILL_SINKS_CONFIG_PATH=/etc/distill/sinks.json
 ```
 
-`RABBITMQ_URI` is the service's broker connection. PostgreSQL is intentionally not a process-level Distill setting: each channel supplies its own PostgreSQL connection string in `sink_config.connection_string`. When the channel is created or updated, Distill connects to that database, initializes the required tables, and registers the sink for that channel. `rabbitmq_config.connection_string` remains part of the channel contract for self-description, while the current broker connection is process-level.
+For PostgreSQL, provision a named sink with the CLI:
+
+```powershell
+$env:DISTILL_POSTGRES_URL = "postgresql://distill:password@postgres:5432/logs?sslmode=require"
+distill sink create postgres-primary `
+  --driver postgres `
+  --connection-string-env DISTILL_POSTGRES_URL `
+  --file sinks.json `
+  --default
+```
+
+For an HTTP sink, keep the endpoint in the manifest and the bearer token in the Distill process environment:
+
+```powershell
+$env:DISTILL_COLLECTOR_TOKEN = "replace-with-a-secret"
+distill sink create custom-http `
+  --driver http `
+  --url https://collector.example.com/distill `
+  --bearer-token-env DISTILL_COLLECTOR_TOKEN `
+  --file sinks.json `
+  --default
+```
+
+`RABBITMQ_URI` is the service's broker connection. `DISTILL_SINKS_CONFIG_PATH` points to the named sink manifest. The manifest contains secret references, not database passwords or bearer tokens. `rabbitmq_config.connection_string` remains part of the advanced channel contract for self-description, while the current broker connection is process-level.
 
 When PostgreSQL is provisioned by .NET Aspire, ensure the connection string is reachable from the Distill process. If Distill runs in Docker and PostgreSQL runs on the host, `localhost` in the Aspire connection string points to the container itself; use a host-reachable address such as `host.docker.internal` or attach both services to a shared Docker network. If both run under Compose, use the Compose service name, such as `postgres`.
 
-Never place either connection string or the API key in source control, event payloads, metadata, or ordinary application logs. Use .NET configuration providers, a secret manager, or container secrets.
+Never place a sink connection string, bearer token, or API key in source control, event payloads, metadata, or ordinary application logs. Use the Distill CLI, a secret manager, or container secrets. The C# application only needs the Distill base URL and API key.
 
 ## 3. Create a channel
 
 Channels must exist before ingestion. The channel identifier must contain only lowercase ASCII letters, digits, `.`, `-`, or `_`.
 
 ```csharp
-using System.Net.Http.Headers;
-using System.Net.Http.Json;
+using Distill.Client;
 
-var channel = new
+var distill = DistillClient.Create(
+    new Uri("http://localhost:8080/"),
+    apiKey);
+
+var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
-    channel_id = "orders.production",
-    severity_threshold = "warning",
-    rabbitmq_config = new
-    {
-        connection_string = rabbitMqConnectionString,
-        exchange_name = "distill.orders.production",
-        routing_key_prefix = "orders."
-    },
-    sink_config = new
-    {
-        driver = "postgres",
-        connection_string = postgresConnectionString
-    },
-    // null means every event is persisted immediately, including low severity events.
-    aggregator = (object?)null,
-    retention_hours = (int?)null,
-    compression_enabled = false,
-    buffer_bytes = 50 * 1024 * 1024,
-    ttl_seconds = 3600,
-    mailbox_capacity = 1024,
-    ordering = "first_come_first_served",
-    allowed_lateness_ms = 5000
-};
-
-using var client = new HttpClient { BaseAddress = new Uri("http://localhost:8080") };
-client.DefaultRequestHeaders.Add("X-API-Key", apiKey);
-
-using var response = await client.PutAsJsonAsync("/channels/orders.production", channel);
-response.EnsureSuccessStatusCode(); // 204 No Content
+    Name = "orders.production",
+    Preset = "raw_events",
+    SinkId = "postgres-primary",
+    DisableAggregator = true
+});
 ```
 
-A successful `PUT` returns `204`. Common failures are:
+`SinkId` may be omitted when `postgres-primary` is the configured default. The application never receives the PostgreSQL connection string. A successful simplified creation returns the sanitized channel configuration. Use `CreateOrReplaceChannelAsync` only when an operator needs to supply the complete advanced definition.
+
+Common failures are:
 
 | Status | Meaning |
 |---|---|
@@ -303,7 +310,7 @@ Required event fields:
 - `severity_level`: `unknown`, `trace`, `debug`, `info`, `warning`, `error`, or `critical`.
 - `payload`: any JSON value. Objects are recommended for queryable structured logs.
 
-`event_id` is optional, but a producer should always provide a stable UUID. Distill uses it for idempotent PostgreSQL writes when RabbitMQ redelivers a message. `metadata` is optional and is a string-to-string map.
+`event_id` is optional, but a producer should always provide a stable UUID. Distill uses it for idempotent sink writes when RabbitMQ redelivers a message. `metadata` is optional and is a string-to-string map.
 
 ## 5. Protobuf ingestion
 
@@ -383,9 +390,9 @@ The HTTP response reports admission to Distill's delivery path:
 2. The channel actor either buffers it for aggregation or publishes it to RabbitMQ.
 3. RabbitMQ confirms the durable publication.
 4. Distill returns a successful response.
-5. The internal consumer writes to PostgreSQL and acknowledges only after success.
+5. The internal consumer writes to the configured sink and acknowledges only after success.
 
-PostgreSQL outages therefore may cause a backlog after an HTTP request has succeeded. The consumer retries transient failures with bounded backoff. Exhausted messages go to the `distill.dead-letter` exchange and durable dead-letter queue for operator investigation. Because writes are idempotent, the C# producer may safely retry an HTTP request using the same `event_id` after a timeout, although the response may have been lost after successful admission.
+Sink outages therefore may cause a backlog after an HTTP request has succeeded. The consumer retries transient failures with bounded backoff. Exhausted messages go to the `distill.dead-letter` exchange and durable dead-letter queue for operator investigation. Because writes are idempotent, the C# producer may safely retry an HTTP request using the same `event_id` after a timeout, although the response may have been lost after successful admission.
 
 Recommended producer policy:
 
@@ -448,16 +455,15 @@ Do not create a new `HttpClient` per event. Batch related events when practical,
 
 Before enabling production logging, verify:
 
-- Distill can reach RabbitMQ and PostgreSQL.
+- Distill can reach RabbitMQ and the configured sink.
 - The channel was created successfully with the intended threshold and aggregator.
-- The channel's `sink_config.driver` is `postgres` for v1.
-- The channel's `sink_config.connection_string` points to the intended logging repository.
+- The channel's `sink_id` is the intended named sink, or it intentionally uses the configured default.
 - The API key is stored as a secret and transmitted only over TLS in production.
 - `/health` is monitored.
 - `/metrics` is scraped, especially received, persisted, aggregate, and error counters.
 - RabbitMQ durable queues and the dead-letter queue have disk/retention monitoring.
-- PostgreSQL uniqueness on `event_id` and `aggregate_id` remains intact.
-- A test event can be traced from the C# client to the PostgreSQL repository.
+- The selected sink's uniqueness constraints on `event_id` and `aggregate_id` remain intact.
+- A test event can be traced from the C# client to the selected sink or downstream HTTP adapter.
 
 ## 10. Source-level extension points
 
@@ -465,7 +471,7 @@ With full source access, the most relevant extension points are:
 
 - add a typed generated C# contract package matching `src/proto.rs`;
 - add an authenticated TLS deployment policy at the HTTP ingress;
-- extend the sink registry for additional drivers while preserving per-channel routing;
+- extend the sink registry for additional drivers while preserving named-sink references;
 - add an explicit channel status endpoint exposing delivery health;
 - add integration tests covering `HttpClient`, RabbitMQ, PostgreSQL, retries, and dead-letter recovery.
 

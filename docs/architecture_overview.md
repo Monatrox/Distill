@@ -13,7 +13,7 @@ A dynamic, hot-path logging aggregator built in Rust where different log categor
 - **Ingest Endpoint**: Accepts structured log events (JSON/Protobuf)
 - **RabbitMQ Cluster**: Message broker used for buffering, routing, retries, and dead-letter handling; it is not the persistence destination
 - **Config Store**: External configuration management (files, database, or external API)
-- **External Data Store**: User-specified persistence sink for logs and aggregates. PostgreSQL is the v1 implementation; the final system will support pluggable sinks such as MSSQL, MySQL, SQLite, Seq, and others.
+- **External Data Store**: User-specified persistence sink for logs and aggregates. Built-in drivers currently include PostgreSQL, MySQL, SQL Server, and HTTP for external adapters.
 
 ### Internal Components
 
@@ -83,7 +83,7 @@ When creating a channel, users specify the external datastore connection string:
   },
   "sink_config": {                // External persistence sink connection
     "connection_string": "postgresql://user:pass@db.example.com:5432/hotlogs",
-      "driver": "postgres",         // PostgreSQL in v1; future sinks include mysql, mssql, sqlite, seq, etc.
+      "sink_id": "postgres-primary", // named sink from DISTILL_SINKS_CONFIG_PATH
     "database": "hotlogs"
   }
 }
@@ -95,7 +95,7 @@ When creating a channel, users specify the external datastore connection string:
 - Historical rollups for compliance/archival
 - Queryable historical data
 
-The connection string in `sink_config.connection_string` points to the external sink where all persisted logs and aggregates will be written.
+The named sink manifest points to the external sink where all persisted logs and aggregates will be written. Credentials are resolved from environment variables or mounted secret files on the Distill host.
 
 ---
 

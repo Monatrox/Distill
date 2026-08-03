@@ -65,9 +65,11 @@ mod tests {
                 exchange_name: "test".to_string(),
                 routing_key_prefix: String::new(),
             },
+            sink_id: None,
             sink_config: SinkConfig {
                 driver: "postgres".to_string(),
                 connection_string: "postgres://localhost".to_string(),
+                headers: std::collections::HashMap::new(),
             },
             aggregator,
             message_schema: None,

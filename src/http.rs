@@ -14,7 +14,7 @@ use crate::{
     metrics::Metrics,
     routing::{RouteDecision, classify},
     schema::SchemaRegistry,
-    sink::{PostgresSink, RabbitConsumer, RabbitPublisher, Sink},
+    sink::{RabbitConsumer, RabbitPublisher, Sink, build_sink},
 };
 use anyhow::Context;
 use axum::{
@@ -52,6 +52,8 @@ pub struct AppState {
     rabbitmq_uri: String,
     default_sink_connection_string: Option<String>,
     exchange_name_prefix: String,
+    sinks: Arc<RwLock<HashMap<String, Arc<dyn Sink>>>>,
+    default_sink_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -88,6 +90,20 @@ impl AppState {
             })
             .await?,
         );
+        let sinks = Arc::new(RwLock::new(HashMap::new()));
+        let mut default_sink_id = None;
+        if let Some(path) = settings.sinks_config_path.clone() {
+            let contents = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("reading sink configuration from {}", path.display()))?;
+            let sink_file = config::parse_sinks(&contents)?;
+            default_sink_id = sink_file.default_sink_id;
+            for definition in sink_file.sinks {
+                let sink_config = config::resolve_sink(&definition)?;
+                let sink = build_sink(&sink_config).await?;
+                sinks.write().await.insert(definition.sink_id, sink);
+            }
+        }
         let state = Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             rabbit,
@@ -101,13 +117,17 @@ impl AppState {
             rabbitmq_uri: settings.rabbitmq_uri,
             default_sink_connection_string: settings.default_sink_connection_string,
             exchange_name_prefix: settings.exchange_name_prefix,
+            sinks,
+            default_sink_id,
         };
 
         if let Some(path) = settings.config_path {
             let contents = tokio::fs::read_to_string(&path).await.with_context(|| {
                 format!("reading channel configuration from {}", path.display())
             })?;
-            for definition in config::parse_channels(&contents)? {
+            for definition in
+                config::parse_channels_with_default(&contents, state.default_sink_id.as_deref())?
+            {
                 state.register_channel(definition).await?;
             }
         }
@@ -124,8 +144,20 @@ impl AppState {
         } else {
             self.schemas.remove(&channel_id).await;
         }
-        let sink: Arc<dyn Sink> =
-            Arc::new(PostgresSink::connect(&definition.sink_config.connection_string).await?);
+        let sink: Arc<dyn Sink> = if let Some(sink_id) = &definition.sink_id {
+            self.sinks
+                .read()
+                .await
+                .get(sink_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DistillError::InvalidConfiguration(format!(
+                        "channel '{channel_id}' references undefined sink '{sink_id}'"
+                    ))
+                })?
+        } else {
+            build_sink(&definition.sink_config).await?
+        };
         let old = self.channels.read().await.get(&channel_id).cloned();
         if let Some(previous) = old {
             previous.handle.flush().await?;
@@ -158,6 +190,7 @@ impl AppState {
     ) -> Result<ChannelDefinition, DistillError> {
         request.to_definition(
             self.default_sink_connection_string.as_deref(),
+            self.default_sink_id.as_deref(),
             &self.exchange_name_prefix,
             &self.rabbitmq_uri,
         )
@@ -772,6 +805,7 @@ fn client_message(error: &DistillError) -> String {
 struct CreateChannelRequest {
     name: String,
     preset: ChannelPreset,
+    sink_id: Option<String>,
     severity_threshold: Option<SeverityLevel>,
     aggregator: Option<Value>,
     rabbitmq_config: Option<RabbitMqConfig>,
@@ -793,6 +827,8 @@ struct CreateChannelRequestWire {
     name: String,
     #[serde(default)]
     preset: ChannelPreset,
+    #[serde(default)]
+    sink_id: Option<String>,
     #[serde(default)]
     severity_threshold: Option<SeverityLevel>,
     #[serde(default)]
@@ -833,6 +869,7 @@ impl<'de> Deserialize<'de> for CreateChannelRequest {
         Ok(Self {
             name: wire.name,
             preset: wire.preset,
+            sink_id: wire.sink_id,
             severity_threshold: wire.severity_threshold,
             aggregator: wire.aggregator,
             rabbitmq_config: wire.rabbitmq_config,
@@ -854,25 +891,41 @@ impl CreateChannelRequest {
     fn to_definition(
         &self,
         default_sink_connection_string: Option<&str>,
+        default_sink_id: Option<&str>,
         exchange_name_prefix: &str,
         rabbitmq_uri: &str,
     ) -> Result<ChannelDefinition, DistillError> {
         let preset = self.preset.defaults();
+        if self.sink_id.is_some() && self.sink_config.is_some() {
+            return Err(DistillError::InvalidConfiguration(
+                "specify either sink_id or sink_config, not both".to_string(),
+            ));
+        }
         let sink_connection_string = self
             .sink_config
             .as_ref()
             .map(|sink| sink.connection_string.clone())
-            .or_else(|| default_sink_connection_string.map(ToOwned::to_owned))
-            .ok_or_else(|| {
-                DistillError::InvalidConfiguration(
-                    "sink_config is required unless DISTILL_DEFAULT_SINK_CONNECTION_STRING is set"
-                        .to_string(),
-                )
-            })?;
+            .or_else(|| default_sink_connection_string.map(ToOwned::to_owned));
+        let sink_id = self.sink_id.clone().or_else(|| {
+            (self.sink_config.is_none() && sink_connection_string.is_none())
+                .then(|| default_sink_id.map(ToOwned::to_owned))
+                .flatten()
+        });
+        if sink_connection_string.is_none() && sink_id.is_none() {
+            return Err(DistillError::InvalidConfiguration(
+                "sink_id or sink_config is required unless a default sink is configured"
+                    .to_string(),
+            ));
+        }
         let sink_config = self.sink_config.clone().unwrap_or(SinkConfig {
             driver: "postgres".to_string(),
-            connection_string: sink_connection_string,
+            connection_string: sink_connection_string.unwrap_or_default(),
+            headers: std::collections::HashMap::new(),
         });
+        /*
+            The empty placeholder is intentionally ignored when `sink_id` is set. It keeps the
+            existing internal channel actor shape stable while named sinks are resolved by AppState.
+        */
         let rabbitmq_config = self.rabbitmq_config.clone().unwrap_or(RabbitMqConfig {
             connection_string: rabbitmq_uri.to_string(),
             exchange_name: format!("{exchange_name_prefix}.{}", self.name),
@@ -882,6 +935,7 @@ impl CreateChannelRequest {
             channel_id: self.name.clone(),
             severity_threshold: self.severity_threshold.unwrap_or(preset.severity_threshold),
             rabbitmq_config,
+            sink_id,
             sink_config,
             aggregator: if self.aggregator_present {
                 match &self.aggregator {
@@ -1086,6 +1140,7 @@ struct ChannelConfigResponse {
 #[derive(Debug, Serialize)]
 struct PublicChannelConfig {
     channel_id: String,
+    sink_id: Option<String>,
     severity_threshold: SeverityLevel,
     rabbitmq_exchange: String,
     routing_key_prefix: String,
@@ -1116,6 +1171,7 @@ impl PublicChannelConfig {
     fn from_definition(definition: &ChannelDefinition) -> Self {
         Self {
             channel_id: definition.channel_id.clone(),
+            sink_id: definition.sink_id.clone(),
             severity_threshold: definition.severity_threshold,
             rabbitmq_exchange: definition.rabbitmq_config.exchange_name.clone(),
             routing_key_prefix: definition.rabbitmq_config.routing_key_prefix.clone(),
@@ -1166,6 +1222,7 @@ mod tests {
         let definition = request
             .to_definition(
                 Some("postgres://localhost/logs"),
+                None,
                 "distill",
                 "amqp://rabbit",
             )
@@ -1191,6 +1248,7 @@ mod tests {
         let definition = request
             .to_definition(
                 Some("postgres://localhost/logs"),
+                None,
                 "distill",
                 "amqp://rabbit",
             )

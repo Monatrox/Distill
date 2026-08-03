@@ -2,6 +2,7 @@
 
 // Rust guideline compliant 2026-02-21
 use anyhow::Context;
+use clap::Parser;
 use mimalloc::MiMalloc;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -9,6 +10,7 @@ use tracing::info;
 mod aggregation;
 mod buffer;
 mod channel;
+mod cli;
 mod config;
 mod domain;
 mod errors;
@@ -24,6 +26,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let command = cli::Cli::parse();
+    if command.command.is_some() {
+        return command.run();
+    }
+
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(

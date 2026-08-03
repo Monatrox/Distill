@@ -4,6 +4,8 @@
 
 It is intentionally a separate package from `Distill.Client`: applications that want direct control can use the base client without taking a logging-provider dependency.
 
+Provision the Distill sink and channels before starting the application. The provider only sends events; it does not receive, store, or manage PostgreSQL/HTTP sink credentials. Use the Distill CLI to configure a named sink and make it the default, or create channels with explicit sink names.
+
 ## Registration
 
 ```csharp

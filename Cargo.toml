@@ -38,6 +38,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 lapin = { version = "2.5", default-features = false, features = ["rustls"] }
 mimalloc = "0.1"
@@ -45,7 +46,11 @@ prost = "0.13"
 prost-reflect = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "json", "uuid"] }
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls", "tds73", "tokio"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
 subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

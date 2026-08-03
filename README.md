@@ -4,7 +4,7 @@
 
 Distill is a self-hosted, structured logging service for teams that want more control than “store everything forever” and more insight than “grep a mountain of text later.”
 
-Send Distill the events that matter. Keep important events intact. Distill the rest into meaningful, durable aggregate metrics—counts, averages, minimums, maximums, sums, and event-duration measurements—then persist the result in PostgreSQL.
+Send Distill the events that matter. Keep important events intact. Distill the rest into meaningful, durable aggregate metrics—counts, averages, minimums, maximums, sums, and event-duration measurements—then persist the result in a supported sink.
 
 It is a focused place between application logging and long-term observability:
 
@@ -16,7 +16,7 @@ application events
         │
         ├── important events → preserved individually
         ├── routine events   → distilled into aggregates
-        └── durable delivery → PostgreSQL
+        └── durable delivery → configured sink
 ```
 
 ## Why Distill?
@@ -86,9 +86,40 @@ Aggregates can be emitted for the overall active window, every N events, or ever
 
 ### Durable, bounded delivery
 
-Distill uses RabbitMQ as a durable delivery boundary and PostgreSQL as the persistence destination configured for each channel.
+Distill uses RabbitMQ as a durable delivery boundary and a per-channel sink as the persistence destination. Built-in drivers are `postgres`, `mysql`, `sqlserver` (also accepted as `mssql`), and `http`.
 
-An event is accepted only after RabbitMQ confirms publication. The internal consumer acknowledges delivery only after PostgreSQL confirms an idempotent write. Transient failures are retried with bounded backoff; exhausted deliveries go to a durable dead-letter path for investigation.
+An event is accepted only after RabbitMQ confirms publication. The internal consumer acknowledges delivery only after the configured sink confirms an idempotent write. Transient failures are retried with bounded backoff; exhausted deliveries go to a durable dead-letter path for investigation.
+
+### Sink configuration
+
+Channels select their sink when they are created:
+
+```json
+{
+  "name": "payments",
+  "sink_config": {
+    "driver": "mysql",
+    "connection_string": "mysql://user:password@db/logs"
+  }
+}
+```
+
+The HTTP driver posts each event or aggregate as JSON to the configured URL. Custom headers can be supplied for authentication. A `2xx` response, or `409 Conflict` for an already-known record, acknowledges delivery; other responses are retried or dead-lettered by the normal delivery path.
+
+```json
+{
+  "name": "payments",
+  "sink_config": {
+    "driver": "http",
+    "connection_string": "http://payments-sink:8081/distill",
+    "headers": {
+      "Authorization": "Bearer replace-me"
+    }
+  }
+}
+```
+
+HTTP receivers should deduplicate using `X-Distill-Record-Id`. The record type is supplied in `X-Distill-Record-Type` as either `event` or `aggregate`.
 
 The service also uses bounded mailboxes, buffers, and process memory accounting. A database outage should create controlled backpressure and a visible delivery problem—not an unbounded memory spiral.
 
@@ -126,7 +157,7 @@ Your application owns the event shape:
 Requirements:
 
 - Docker and Docker Compose;
-- PostgreSQL for the sink used by each channel.
+- PostgreSQL, MySQL, SQL Server, or an HTTP receiver for the configured sink.
 
 Start the local service:
 
@@ -138,9 +169,42 @@ Distill will be available at `http://localhost:8080`. RabbitMQ’s management UI
 
 The Compose file uses `change-me-in-development` as the development API key. Replace it before using the service outside a local test environment.
 
-### 2. Create a channel
+### 2. Configure a sink with the CLI
 
-Channels are created or replaced with `PUT /channels/{channel_id}`. The current v1 contract keeps the complete channel definition explicit so the persistence and aggregation behavior is unambiguous.
+The CLI writes a sink manifest without storing database credentials in it. Set the secret in the environment used by the Distill process:
+
+```powershell
+$env:DISTILL_POSTGRES_URL = "postgresql://distill:password@host.docker.internal:5432/logs"
+distill sink create postgres-primary `
+  --driver postgres `
+  --connection-string-env DISTILL_POSTGRES_URL `
+  --file sinks.json `
+  --default
+```
+
+Point the service at the manifest:
+
+```powershell
+$env:DISTILL_SINKS_CONFIG_PATH = "./sinks.json"
+```
+
+For an advanced/custom integration, use the HTTP sink and keep its bearer token outside the manifest:
+
+```powershell
+$env:DISTILL_COLLECTOR_TOKEN = "replace-me"
+distill sink create custom-http `
+  --driver http `
+  --url https://collector.example.com/distill `
+  --bearer-token-env DISTILL_COLLECTOR_TOKEN `
+  --file sinks.json `
+  --default
+```
+
+See [the complete CLI guide](docs/cli.md) for secret files, deployment manifests, sink listing, and security guidance.
+
+### 3. Create a channel
+
+Channels reference a named sink, or use the configured default when `sink_id` is omitted. Credentials and connection strings do not belong in channel definitions.
 
 ```powershell
 $channel = @'
@@ -152,10 +216,7 @@ $channel = @'
     "exchange_name": "distill.orders.production",
     "routing_key_prefix": "orders."
   },
-  "sink_config": {
-    "driver": "postgres",
-    "connection_string": "postgresql://distill:password@host.docker.internal:5432/logs"
-  },
+  "sink_id": "postgres-primary",
   "aggregator": {
     "function": "count",
     "granularity": "per_t_time",
@@ -180,14 +241,14 @@ Invoke-WebRequest `
   -Body $channel
 ```
 
-The channel setup connects to PostgreSQL, initializes the required sink tables, registers the RabbitMQ exchange, and starts the channel actor.
+The channel setup connects to the named sink, initializes the required tables when applicable, registers the RabbitMQ exchange, and starts the channel actor.
 
 ### A simpler channel request
 
-For a friendlier self-hosted setup, set `DISTILL_DEFAULT_SINK_CONNECTION_STRING`. Distill will generate the RabbitMQ exchange and routing key from the channel name and apply the selected preset:
+For a friendlier self-hosted setup, configure `default_sink_id` in the sink manifest. Distill will generate the RabbitMQ exchange and routing key from the channel name and apply the selected preset:
 
 ```powershell
-$env:DISTILL_DEFAULT_SINK_CONNECTION_STRING = "postgresql://distill:password@host.docker.internal:5432/logs"
+$env:DISTILL_SINKS_CONFIG_PATH = "./sinks.json"
 ```
 
 Then create a channel with only its intent and any overrides you need:
@@ -414,10 +475,10 @@ Distill is designed around a clear handoff contract:
 2. The channel actor classifies it for direct persistence, aggregation, or both.
 3. Distill publishes the event or aggregate to RabbitMQ.
 4. RabbitMQ confirms durable publication.
-5. The internal consumer writes to the channel’s PostgreSQL sink.
+5. The internal consumer writes to the channel’s configured sink.
 6. The consumer acknowledges only after an idempotent sink write succeeds.
 
-If PostgreSQL is temporarily unavailable, messages are retried with bounded backoff. Exhausted messages are sent to the durable `distill.dead-letter` exchange and queue for operator investigation.
+If the configured sink is temporarily unavailable, messages are retried with bounded backoff. Exhausted messages are sent to the durable `distill.dead-letter` exchange and queue for operator investigation.
 
 Because writes are idempotent, producers should retry an event using the same `event_id` when a request times out.
 
@@ -431,7 +492,8 @@ Distill requires:
 | `DISTILL_API_KEY` | Yes | Shared API key for management and ingestion |
 | `DISTILL_BIND_ADDRESS` | No | HTTP bind address; defaults to `127.0.0.1:8080` |
 | `DISTILL_CONFIG_PATH` | No | JSON file containing startup channel definitions |
-| `DISTILL_DEFAULT_SINK_CONNECTION_STRING` | No | PostgreSQL sink used by simplified `POST /channels` requests |
+| `DISTILL_SINKS_CONFIG_PATH` | No | JSON sink manifest containing named sinks and secret references |
+| `DISTILL_DEFAULT_SINK_CONNECTION_STRING` | No | Legacy PostgreSQL fallback for simplified channel requests |
 | `DISTILL_EXCHANGE_NAME_PREFIX` | No | Generated exchange prefix; defaults to `distill` |
 
 Startup configuration uses this shape:
@@ -447,10 +509,7 @@ Startup configuration uses this shape:
         "exchange_name": "distill.security.audit",
         "routing_key_prefix": "security."
       },
-      "sink_config": {
-        "driver": "postgres",
-        "connection_string": "postgresql://distill:password@postgres:5432/logs"
-      },
+      "sink_id": "postgres-primary",
       "aggregator": null,
       "retention_hours": 2160,
       "compression_enabled": false,

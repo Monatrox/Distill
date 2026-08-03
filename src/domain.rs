@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, path::PathBuf};
 use uuid::Uuid;
 
 pub type EventId = Uuid;
@@ -55,6 +55,9 @@ pub struct ChannelDefinition {
     pub channel_id: String,
     pub severity_threshold: SeverityLevel,
     pub rabbitmq_config: RabbitMqConfig,
+    #[serde(default)]
+    pub sink_id: Option<String>,
+    #[serde(default)]
     pub sink_config: SinkConfig,
     pub aggregator: Option<AggregatorSpec>,
     #[serde(default)]
@@ -89,7 +92,11 @@ impl ChannelDefinition {
         if self.buffer_bytes == 0 || self.mailbox_capacity == 0 {
             return Err("buffer_bytes and mailbox_capacity must be positive".to_string());
         }
-        self.sink_config.validate()
+        if self.sink_id.is_none() {
+            self.sink_config.validate()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -108,10 +115,12 @@ pub struct MessageSchemaDefinition {
     pub descriptor_set_base64: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct SinkConfig {
     pub driver: String,
     pub connection_string: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 impl fmt::Debug for SinkConfig {
@@ -120,20 +129,43 @@ impl fmt::Debug for SinkConfig {
             .debug_struct("SinkConfig")
             .field("driver", &self.driver)
             .field("connection_string", &"[REDACTED]")
+            .field("headers", &"[REDACTED]")
             .finish()
     }
 }
 
 impl SinkConfig {
-    fn validate(&self) -> Result<(), String> {
-        if self.driver != "postgres" {
-            return Err("v1 supports only the postgres sink driver".to_string());
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.driver.as_str(),
+            "postgres" | "mysql" | "sqlserver" | "mssql" | "http"
+        ) {
+            return Err(format!(
+                "unsupported sink driver '{}'; supported drivers are postgres, mysql, sqlserver, mssql, and http",
+                self.driver
+            ));
         }
         if self.connection_string.is_empty() {
             return Err("sink connection_string must not be empty".to_string());
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SinkDefinition {
+    pub sink_id: String,
+    pub driver: String,
+    #[serde(default)]
+    pub connection_string: Option<String>,
+    #[serde(default)]
+    pub connection_string_env: Option<String>,
+    #[serde(default)]
+    pub connection_string_file: Option<PathBuf>,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
