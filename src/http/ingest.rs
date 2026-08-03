@@ -4,18 +4,20 @@
 use super::{
     AppState, Bytes, CONTENT_TYPE, DistillError, HeaderMap, IngestItemError, IngestResponse,
     IntoResponse, Json, LogEvent, Message, Path, SimpleEventRequest, State, StatusCode, Uuid,
-    Value, authorize, client_message, error_code, otlp_events,
+    Value, client_message, error_code, otlp_events,
 };
 
 pub(super) async fn health() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
+pub(super) async fn metrics(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, DistillError> {
+    Ok((
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics.prometheus(),
-    )
+    ))
 }
 
 pub(super) async fn ingest(
@@ -23,7 +25,6 @@ pub(super) async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>), DistillError> {
-    authorize(&headers, &state)?;
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -60,7 +61,6 @@ pub(super) async fn otlp_logs(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Result<(StatusCode, Json<IngestResponse>), DistillError> {
-    authorize(&headers, &state)?;
     let default_channel = headers
         .get("X-Distill-Channel")
         .and_then(|value| value.to_str().ok());
@@ -77,10 +77,8 @@ pub(super) async fn otlp_logs(
 pub(super) async fn post_event(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
     Json(request): Json<SimpleEventRequest>,
 ) -> Result<(StatusCode, Json<IngestResponse>), DistillError> {
-    authorize(&headers, &state)?;
     let event = request.into_event(channel_id);
     let response = submit_events(&state, vec![event]).await?;
     Ok((StatusCode::ACCEPTED, Json(response)))

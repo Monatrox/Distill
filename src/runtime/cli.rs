@@ -1,9 +1,23 @@
 //! Provides the local, declarative Distill administration CLI.
 
-use crate::{config::SinkFile, domain::SinkDefinition};
+use crate::{
+    config::{HttpLimits, SinkFile},
+    domain::SinkDefinition,
+};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+
+/// Default maximum HTTP request body size in bytes.
+///
+/// Two MiB accommodates normal structured log batches while limiting memory retained by a request.
+const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Default maximum duration for an HTTP request.
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+/// Default number of concurrent HTTP requests handled by Distill.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
+/// Default process-wide request allowance per rolling minute.
+const DEFAULT_MAX_REQUESTS_PER_MINUTE: usize = 6_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -12,8 +26,27 @@ use std::{collections::HashMap, fs, path::PathBuf};
     about = "Distill logging service and administration CLI"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub http: HttpOptions,
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Configures process-wide HTTP resource controls.
+#[derive(Debug, Args, Clone)]
+pub struct HttpOptions {
+    /// Maximum request body size in bytes; use 0 to disable this limit.
+    #[arg(long, env = "DISTILL_REQUEST_BODY_LIMIT_BYTES", default_value_t = DEFAULT_REQUEST_BODY_LIMIT_BYTES)]
+    request_body_limit_bytes: usize,
+    /// Maximum request duration in seconds; use 0 to disable this limit.
+    #[arg(long, env = "DISTILL_REQUEST_TIMEOUT_SECONDS", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
+    request_timeout_seconds: u64,
+    /// Maximum simultaneous requests; use 0 to disable this limit.
+    #[arg(long, env = "DISTILL_MAX_CONCURRENT_REQUESTS", default_value_t = DEFAULT_MAX_CONCURRENT_REQUESTS)]
+    max_concurrent_requests: usize,
+    /// Maximum requests per rolling minute; use 0 to disable this limit.
+    #[arg(long, env = "DISTILL_MAX_REQUESTS_PER_MINUTE", default_value_t = DEFAULT_MAX_REQUESTS_PER_MINUTE)]
+    max_requests_per_minute: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +135,19 @@ pub struct ListSinks {
 }
 
 impl Cli {
+    pub fn http_limits(&self) -> HttpLimits {
+        HttpLimits {
+            request_body_limit_bytes: (self.http.request_body_limit_bytes != 0)
+                .then_some(self.http.request_body_limit_bytes),
+            request_timeout: (self.http.request_timeout_seconds != 0)
+                .then(|| Duration::from_secs(self.http.request_timeout_seconds)),
+            max_concurrent_requests: (self.http.max_concurrent_requests != 0)
+                .then_some(self.http.max_concurrent_requests),
+            max_requests_per_minute: (self.http.max_requests_per_minute != 0)
+                .then_some(self.http.max_requests_per_minute),
+        }
+    }
+
     pub fn run(self) -> anyhow::Result<()> {
         match self.command.context("a CLI command is required")? {
             Command::Sink { command } => match command {

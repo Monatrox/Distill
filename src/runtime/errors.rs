@@ -6,6 +6,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DistillError {
+    #[error("invalid API key")]
+    Unauthorized,
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("channel not found: {0}")]
@@ -16,6 +18,8 @@ pub enum DistillError {
     SchemaValidation(String),
     #[error("buffer admission rejected for channel {0}")]
     BufferFull(String),
+    #[error("request throttled")]
+    RequestThrottled,
     #[error("persistence delivery failed: {0}")]
     Persistence(String),
 }
@@ -29,6 +33,7 @@ pub struct ErrorEnvelope {
 impl IntoResponse for DistillError {
     fn into_response(self) -> axum::response::Response {
         let (status, code) = match &self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
             Self::InvalidRequest(_) | Self::SchemaValidation(_) => {
                 (StatusCode::BAD_REQUEST, "INVALID_REQUEST")
             }
@@ -39,6 +44,7 @@ impl IntoResponse for DistillError {
             Self::BufferFull(_) | Self::Persistence(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE")
             }
+            Self::RequestThrottled => (StatusCode::TOO_MANY_REQUESTS, "REQUEST_THROTTLED"),
         };
 
         let message = if matches!(self, Self::Persistence(_)) {

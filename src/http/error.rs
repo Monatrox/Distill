@@ -5,10 +5,12 @@ use super::DistillError;
 
 pub(super) fn error_code(error: &DistillError) -> &'static str {
     match error {
+        DistillError::Unauthorized => "UNAUTHORIZED",
         DistillError::InvalidRequest(_) | DistillError::SchemaValidation(_) => "INVALID_REQUEST",
         DistillError::ChannelNotFound(_) => "CHANNEL_NOT_FOUND",
         DistillError::InvalidConfiguration(_) => "INVALID_CONFIGURATION",
         DistillError::BufferFull(_) | DistillError::Persistence(_) => "SERVICE_UNAVAILABLE",
+        DistillError::RequestThrottled => "REQUEST_THROTTLED",
     }
 }
 

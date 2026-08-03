@@ -4,16 +4,14 @@
 use super::{
     AppState, ChannelConfigResponse, ChannelDefinition, ChannelLifecycle,
     ChannelValidationResponse, CloneChannelRequest, CreateChannelRequest, DistillError,
-    EventTestResponse, HeaderMap, Json, MessageSchemaDefinition, Path, PublicChannelConfig,
-    RouteDecision, SimpleEventRequest, State, StatusCode, authorize, classify,
+    EventTestResponse, Json, MessageSchemaDefinition, Path, PublicChannelConfig, RouteDecision,
+    SimpleEventRequest, State, StatusCode, classify,
 };
 
 pub(super) async fn post_channel(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<ChannelConfigResponse>), DistillError> {
-    authorize(&headers, &state)?;
     let definition = state.build_channel_definition(&request)?;
     state.register_channel(definition).await?;
     let channel_id = request.name.clone();
@@ -23,10 +21,8 @@ pub(super) async fn post_channel(
 
 pub(super) async fn validate_channel(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<CreateChannelRequest>,
 ) -> Result<Json<ChannelValidationResponse>, DistillError> {
-    authorize(&headers, &state)?;
     let definition = state.build_channel_definition(&request)?;
     definition
         .validate()
@@ -43,10 +39,8 @@ pub(super) async fn validate_channel(
 pub(super) async fn put_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
     Json(definition): Json<ChannelDefinition>,
 ) -> Result<StatusCode, DistillError> {
-    authorize(&headers, &state)?;
     if definition.channel_id != channel_id {
         return Err(DistillError::InvalidConfiguration(
             "path channel_id must match the request body".to_string(),
@@ -59,10 +53,8 @@ pub(super) async fn put_channel(
 pub(super) async fn test_event(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
     Json(request): Json<SimpleEventRequest>,
 ) -> Result<Json<EventTestResponse>, DistillError> {
-    authorize(&headers, &state)?;
     let record = state
         .channels
         .read()
@@ -93,10 +85,8 @@ pub(super) async fn test_event(
 pub(super) async fn post_schema(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
     Json(definition): Json<MessageSchemaDefinition>,
 ) -> Result<StatusCode, DistillError> {
-    authorize(&headers, &state)?;
     if !state.channels.read().await.contains_key(&channel_id) {
         return Err(DistillError::ChannelNotFound(channel_id));
     }
@@ -113,18 +103,14 @@ pub(super) async fn post_schema(
 pub(super) async fn get_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    authorize(&headers, &state)?;
     Ok(Json(state.channel_config(&channel_id).await?))
 }
 
 pub(super) async fn pause_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    authorize(&headers, &state)?;
     Ok(Json(
         state
             .set_lifecycle(&channel_id, ChannelLifecycle::Paused)
@@ -135,9 +121,7 @@ pub(super) async fn pause_channel(
 pub(super) async fn resume_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    authorize(&headers, &state)?;
     Ok(Json(
         state
             .set_lifecycle(&channel_id, ChannelLifecycle::Active)
@@ -148,9 +132,7 @@ pub(super) async fn resume_channel(
 pub(super) async fn flush_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    authorize(&headers, &state)?;
     let record = state
         .channels
         .read()
@@ -165,9 +147,7 @@ pub(super) async fn flush_channel(
 pub(super) async fn archive_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    authorize(&headers, &state)?;
     let record = state
         .channels
         .read()
@@ -186,10 +166,8 @@ pub(super) async fn archive_channel(
 pub(super) async fn clone_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
-    headers: HeaderMap,
     Json(request): Json<CloneChannelRequest>,
 ) -> Result<(StatusCode, Json<ChannelConfigResponse>), DistillError> {
-    authorize(&headers, &state)?;
     let source = state
         .channels
         .read()

@@ -1,0 +1,3 @@
+{$DISTILL_PUBLIC_HOST:localhost} {
+    reverse_proxy distill:8080
+}

@@ -21,20 +21,25 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::Utc;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{Duration, sleep};
-use tower_http::trace::TraceLayer;
+use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
 mod auth;
@@ -44,7 +49,7 @@ mod error;
 mod ingest;
 mod otlp;
 
-use auth::authorize;
+use auth::authenticate;
 use channels::{
     archive_channel, clone_channel, flush_channel, get_channel, pause_channel, post_channel,
     post_schema, put_channel, resume_channel, test_event, validate_channel,
@@ -60,6 +65,8 @@ use uuid::Uuid;
 
 const STARTUP_CONNECTION_ATTEMPTS: u32 = 30;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Defines the rolling period for the process-wide request allowance.
+const REQUEST_RATE_WINDOW: Duration = Duration::from_mins(1);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,12 +76,31 @@ pub struct AppState {
     schemas: SchemaRegistry,
     metrics: Arc<Metrics>,
     budget: Arc<MemoryBudget>,
-    api_key: Arc<String>,
+    ingest_api_key: Arc<String>,
+    admin_api_key: Arc<String>,
     rabbitmq_uri: String,
     default_sink_connection_string: Option<String>,
     exchange_name_prefix: String,
     sinks: Arc<RwLock<HashMap<String, Arc<dyn Sink>>>>,
     default_sink_id: Option<String>,
+    http_limits: config::HttpLimits,
+    request_controls: RequestControls,
+}
+
+#[derive(Clone, Debug)]
+struct RequestControls {
+    concurrent: Option<Arc<Semaphore>>,
+    rate: Option<Arc<Mutex<RequestRateWindow>>>,
+}
+
+#[derive(Debug)]
+struct RequestRateWindow {
+    maximum: usize,
+    admitted: VecDeque<Instant>,
+}
+
+struct RequestPermit {
+    _concurrency: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Clone)]
@@ -94,6 +120,7 @@ enum ChannelLifecycle {
 
 impl AppState {
     pub async fn connect(settings: Settings) -> anyhow::Result<Self> {
+        let http_limits = settings.http.limits.clone();
         let rabbit_uri = settings.rabbitmq_uri.clone();
         let rabbit = retry_startup_connection("RabbitMQ publisher", || {
             let rabbit_uri = rabbit_uri.clone();
@@ -134,12 +161,15 @@ impl AppState {
             budget: Arc::new(MemoryBudget::new(
                 crate::domain::DEFAULT_PROCESS_MEMORY_BYTES,
             )),
-            api_key: Arc::new(settings.api_key),
+            ingest_api_key: Arc::new(settings.ingest_api_key),
+            admin_api_key: Arc::new(settings.admin_api_key),
             rabbitmq_uri: settings.rabbitmq_uri,
             default_sink_connection_string: settings.default_sink_connection_string,
             exchange_name_prefix: settings.exchange_name_prefix,
             sinks,
             default_sink_id,
+            request_controls: RequestControls::new(&http_limits),
+            http_limits,
         };
 
         if let Some(path) = settings.config_path {
@@ -294,26 +324,134 @@ where
     ))
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/ingest", post(ingest))
-        .route("/v1/logs", post(otlp_logs))
-        .route("/channels", post(post_channel))
-        .route("/channels/validate", post(validate_channel))
-        .route("/channels/{channel_id}", put(put_channel))
-        .route("/channels/{channel_id}/events", post(post_event))
-        .route("/channels/{channel_id}/test", post(test_event))
-        .route("/channels/{channel_id}/config", get(get_channel))
-        .route("/channels/{channel_id}/schema", post(post_schema))
-        .route("/channels/{channel_id}/pause", post(pause_channel))
-        .route("/channels/{channel_id}/resume", post(resume_channel))
-        .route("/channels/{channel_id}/flush", post(flush_channel))
-        .route("/channels/{channel_id}/archive", post(archive_channel))
-        .route("/channels/{channel_id}/clone", post(clone_channel))
+pub fn public_router(state: AppState) -> Router {
+    let authenticated = authenticated_routes(
+        Router::new()
+            .route("/metrics", get(metrics))
+            .route("/ingest", post(ingest))
+            .route("/v1/logs", post(otlp_logs))
+            .route("/channels/{channel_id}/events", post(post_event)),
+        Arc::clone(&state.ingest_api_key),
+        &state.http_limits,
+    );
+    build_router(
+        Router::new()
+            .route("/health", get(health))
+            .merge(authenticated),
+        state,
+    )
+}
+
+/// Builds the loopback-only administrative router.
+pub fn admin_router(state: AppState) -> Router {
+    let authenticated = authenticated_routes(
+        Router::new()
+            .route("/channels", post(post_channel))
+            .route("/channels/validate", post(validate_channel))
+            .route("/channels/{channel_id}", put(put_channel))
+            .route("/channels/{channel_id}/test", post(test_event))
+            .route("/channels/{channel_id}/config", get(get_channel))
+            .route("/channels/{channel_id}/schema", post(post_schema))
+            .route("/channels/{channel_id}/pause", post(pause_channel))
+            .route("/channels/{channel_id}/resume", post(resume_channel))
+            .route("/channels/{channel_id}/flush", post(flush_channel))
+            .route("/channels/{channel_id}/archive", post(archive_channel))
+            .route("/channels/{channel_id}/clone", post(clone_channel)),
+        Arc::clone(&state.admin_api_key),
+        &state.http_limits,
+    );
+    build_router(authenticated, state)
+}
+
+fn build_router(router: Router<AppState>, state: AppState) -> Router {
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_request_controls,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn authenticated_routes(
+    router: Router<AppState>,
+    expected_key: Arc<String>,
+    limits: &config::HttpLimits,
+) -> Router<AppState> {
+    let mut router = router;
+    if let Some(limit) = limits.request_body_limit_bytes {
+        router = router.layer(RequestBodyLimitLayer::new(limit));
+    }
+    if let Some(timeout) = limits.request_timeout {
+        router = router.layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ));
+    }
+    router.layer(middleware::from_fn_with_state(expected_key, authenticate))
+}
+
+impl RequestControls {
+    fn new(limits: &config::HttpLimits) -> Self {
+        Self {
+            concurrent: limits
+                .max_concurrent_requests
+                .map(|maximum| Arc::new(Semaphore::new(maximum))),
+            rate: limits.max_requests_per_minute.map(|maximum| {
+                Arc::new(Mutex::new(RequestRateWindow {
+                    maximum,
+                    admitted: VecDeque::new(),
+                }))
+            }),
+        }
+    }
+
+    fn acquire(&self) -> Result<RequestPermit, DistillError> {
+        let permit = self
+            .concurrent
+            .as_ref()
+            .map(|semaphore| semaphore.clone().try_acquire_owned())
+            .transpose()
+            .map_err(|_| DistillError::RequestThrottled)?;
+        if let Some(rate) = &self.rate {
+            let mut rate = rate
+                .lock()
+                .expect("request-rate mutex must not be poisoned");
+            let now = Instant::now();
+            while rate
+                .admitted
+                .front()
+                .is_some_and(|admitted| now.duration_since(*admitted) >= REQUEST_RATE_WINDOW)
+            {
+                rate.admitted.pop_front();
+            }
+            if rate.admitted.len() >= rate.maximum {
+                return Err(DistillError::RequestThrottled);
+            }
+            rate.admitted.push_back(now);
+        }
+        Ok(RequestPermit {
+            _concurrency: permit,
+        })
+    }
+}
+
+async fn enforce_request_controls(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    match state.request_controls.acquire() {
+        Ok(permit) => {
+            let response = next.run(request).await;
+            drop(permit);
+            response
+        }
+        Err(error) => error.into_response(),
+    }
 }
 
 impl AppState {
@@ -400,6 +538,39 @@ mod tests {
         assert_eq!(event.payload["order_id"], "ord-123");
         assert_eq!(event.payload["retryable"], true);
         assert_eq!(event.payload["attempt"], 2);
+    }
+
+    #[test]
+    fn request_controls_reject_excess_concurrency() {
+        let controls = RequestControls {
+            concurrent: Some(Arc::new(Semaphore::new(1))),
+            rate: None,
+        };
+        let permit = controls
+            .acquire()
+            .expect("first request should be admitted");
+        assert!(matches!(
+            controls.acquire(),
+            Err(DistillError::RequestThrottled)
+        ));
+        drop(permit);
+        assert!(controls.acquire().is_ok());
+    }
+
+    #[test]
+    fn request_controls_reject_excess_rate() {
+        let controls = RequestControls {
+            concurrent: None,
+            rate: Some(Arc::new(Mutex::new(RequestRateWindow {
+                maximum: 1,
+                admitted: VecDeque::new(),
+            }))),
+        };
+        assert!(controls.acquire().is_ok());
+        assert!(matches!(
+            controls.acquire(),
+            Err(DistillError::RequestThrottled)
+        ));
     }
 
     #[test]

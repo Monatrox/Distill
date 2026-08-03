@@ -165,9 +165,9 @@ Start the local service:
 docker compose up --build
 ```
 
-Distill will be available at `http://localhost:8080`. RabbitMQ’s management UI is available at `http://localhost:15672` with the local Compose credentials.
+Compose publishes Distill through Caddy at `https://localhost`; it is the only publicly exposed Distill service. Caddy uses a local development certificate for `localhost`, so trust its local CA or use an HTTP client’s development-only certificate bypass. Set `DISTILL_PUBLIC_HOST` to a real DNS name for automatic ACME certificates in a production deployment. Administrative routes are not published, and RabbitMQ’s ports are bound to host loopback only.
 
-The Compose file uses `change-me-in-development` as the development API key. Replace it before using the service outside a local test environment.
+The Compose file uses separate development keys for ingestion and administration. Replace both before using the service outside a local test environment.
 
 ### 2. Configure a sink with the CLI
 
@@ -235,8 +235,8 @@ $channel = @'
 
 Invoke-WebRequest `
   -Method Put `
-  -Uri http://localhost:8080/channels/orders.production `
-  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -Uri http://127.0.0.1:8081/channels/orders.production `
+  -Headers @{ "X-API-Key" = "change-me-admin-in-development" } `
   -ContentType "application/json" `
   -Body $channel
 ```
@@ -262,8 +262,8 @@ $request = '{
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri http://localhost:8080/channels `
-  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -Uri http://127.0.0.1:8081/channels `
+  -Headers @{ "X-API-Key" = "change-me-admin-in-development" } `
   -ContentType "application/json" `
   -Body $request
 ```
@@ -298,8 +298,8 @@ $event = @'
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri http://localhost:8080/ingest `
-  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -Uri https://localhost/ingest `
+  -Headers @{ "X-API-Key" = "change-me-ingest-in-development" } `
   -ContentType "application/json" `
   -Body $event
 ```
@@ -331,8 +331,8 @@ $event = '{
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri http://localhost:8080/channels/orders.production/events `
-  -Headers @{ "X-API-Key" = "change-me-in-development" } `
+  -Uri https://localhost/channels/orders.production/events `
+  -Headers @{ "X-API-Key" = "change-me-ingest-in-development" } `
   -ContentType "application/json" `
   -Body $event
 ```
@@ -407,27 +407,27 @@ That gives you a compact view of normal behavior and a detailed trail when somet
 
 ## HTTP API
 
-All management and ingestion requests except health checks require the `X-API-Key` header.
+Ingestion and metrics requests require the ingest key and use the public listener. Management requests require the separate admin key and are only served by the loopback-only administrative listener. Invalid or missing credentials return `401 Unauthorized`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness check |
-| `GET` | `/metrics` | Prometheus-style service metrics |
+| `GET` | `/metrics` | Prometheus-style service metrics; requires the ingest key |
 | `POST` | `/ingest` | Ingest one or more JSON events |
 | `POST` | `/ingest` with Protobuf | Ingest a Protobuf `IngestRequest` |
 | `POST` | `/v1/logs` | Ingest OTLP/HTTP JSON log records |
-| `POST` | `/channels` | Create a channel from a preset and overrides |
-| `POST` | `/channels/validate` | Validate and resolve a channel request |
-| `PUT` | `/channels/{channel_id}` | Create or replace a channel |
-| `GET` | `/channels/{channel_id}/config` | Inspect sanitized effective configuration |
-| `POST` | `/channels/{channel_id}/events` | Ingest one simple event for a channel |
-| `POST` | `/channels/{channel_id}/test` | Preview validation and routing for an event |
-| `POST` | `/channels/{channel_id}/schema` | Register or replace a runtime schema |
-| `POST` | `/channels/{channel_id}/pause` | Stop accepting events while retaining the channel |
-| `POST` | `/channels/{channel_id}/resume` | Resume a paused channel |
-| `POST` | `/channels/{channel_id}/flush` | Flush the active aggregate window |
-| `POST` | `/channels/{channel_id}/archive` | Flush and stop accepting events |
-| `POST` | `/channels/{channel_id}/clone` | Create a new channel from an existing definition |
+| `POST` | `http://127.0.0.1:8081/channels` | Create a channel from a preset and overrides |
+| `POST` | `http://127.0.0.1:8081/channels/validate` | Validate and resolve a channel request |
+| `PUT` | `http://127.0.0.1:8081/channels/{channel_id}` | Create or replace a channel |
+| `GET` | `http://127.0.0.1:8081/channels/{channel_id}/config` | Inspect sanitized effective configuration |
+| `POST` | `https://localhost/channels/{channel_id}/events` | Ingest one simple event for a channel |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/test` | Preview validation and routing for an event |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/schema` | Register or replace a runtime schema |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/pause` | Stop accepting events while retaining the channel |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/resume` | Resume a paused channel |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/flush` | Flush the active aggregate window |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/archive` | Flush and stop accepting events |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/clone` | Create a new channel from an existing definition |
 
 ### JSON ingestion
 
@@ -447,7 +447,7 @@ Distill also accepts OTLP/HTTP JSON at `POST /v1/logs`. Supply the destination t
 ```http
 POST /v1/logs
 Content-Type: application/json
-X-API-Key: change-me-in-development
+X-API-Key: change-me-ingest-in-development
 X-Distill-Channel: orders.production
 ```
 
@@ -484,13 +484,36 @@ Because writes are idempotent, producers should retry an event using the same `e
 
 ## Configuration
 
+### HTTP resource controls
+
+The server applies the following process-wide defaults to both listeners. Pass a value of `0` to disable an individual control. The same values can be provided through the listed environment variables for container deployments.
+
+```powershell
+distill `
+  --request-body-limit-bytes 2097152 `
+  --request-timeout-seconds 30 `
+  --max-concurrent-requests 128 `
+  --max-requests-per-minute 6000
+```
+
+- `--request-body-limit-bytes` / `DISTILL_REQUEST_BODY_LIMIT_BYTES`: 2 MiB default.
+- `--request-timeout-seconds` / `DISTILL_REQUEST_TIMEOUT_SECONDS`: 30 seconds default.
+- `--max-concurrent-requests` / `DISTILL_MAX_CONCURRENT_REQUESTS`: 128 default.
+- `--max-requests-per-minute` / `DISTILL_MAX_REQUESTS_PER_MINUTE`: 6000 default, shared across the process in a rolling one-minute window.
+
 Distill requires:
 
 | Variable | Required | Description |
 |---|---:|---|
 | `RABBITMQ_URI` | Yes | Process-level RabbitMQ connection |
-| `DISTILL_API_KEY` | Yes | Shared API key for management and ingestion |
-| `DISTILL_BIND_ADDRESS` | No | HTTP bind address; defaults to `127.0.0.1:8080` |
+| `DISTILL_INGEST_API_KEY` | Yes | API key for public ingestion endpoints |
+| `DISTILL_ADMIN_API_KEY` | Yes | Separate API key for loopback-only management endpoints; must differ from the ingest key |
+| `DISTILL_BIND_ADDRESS` | No | Public ingestion/metrics bind address; defaults to `127.0.0.1:8080` |
+| `DISTILL_ADMIN_BIND_ADDRESS` | No | Loopback-only administrative bind address; defaults to `127.0.0.1:8081` and rejects non-loopback addresses |
+| `DISTILL_REQUEST_BODY_LIMIT_BYTES` | No | Maximum HTTP request body size; defaults to `2097152`, `0` disables |
+| `DISTILL_REQUEST_TIMEOUT_SECONDS` | No | Maximum HTTP request duration; defaults to `30`, `0` disables |
+| `DISTILL_MAX_CONCURRENT_REQUESTS` | No | Maximum simultaneous HTTP requests; defaults to `128`, `0` disables |
+| `DISTILL_MAX_REQUESTS_PER_MINUTE` | No | Process-wide rolling request allowance; defaults to `6000`, `0` disables |
 | `DISTILL_CONFIG_PATH` | No | JSON file containing startup channel definitions |
 | `DISTILL_SINKS_CONFIG_PATH` | No | JSON sink manifest containing named sinks and secret references |
 | `DISTILL_DEFAULT_SINK_CONNECTION_STRING` | No | Legacy PostgreSQL fallback for simplified channel requests |

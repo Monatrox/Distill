@@ -31,6 +31,7 @@ pub async fn run() -> anyhow::Result<()> {
     if command.command.is_some() {
         return command.run();
     }
+    let http_limits = command.http_limits();
 
     tracing_subscriber::fmt()
         .json()
@@ -40,22 +41,33 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .init();
 
-    let settings = config::Settings::from_env().context("loading Distill configuration")?;
+    let settings =
+        config::Settings::from_env(http_limits).context("loading Distill configuration")?;
     let listener = TcpListener::bind(settings.http.bind_address)
         .await
         .context("binding HTTP listener")?;
+    let admin_listener = TcpListener::bind(settings.http.admin_bind_address)
+        .await
+        .context("binding administrative HTTP listener")?;
     let state = http::AppState::connect(settings).await?;
-    let app = http::router(state);
+    let app = http::public_router(state.clone());
+    let admin_app = http::admin_router(state);
 
     info!(
         event.name = "distill.http.started",
         address = %listener.local_addr()?,
-        "Distill HTTP server started"
+        "Distill public HTTP server started"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("running HTTP server")?;
+    info!(
+        event.name = "distill.http.admin_started",
+        address = %admin_listener.local_addr()?,
+        "Distill loopback administrative HTTP server started"
+    );
+    tokio::try_join!(
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
+        axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal()),
+    )
+    .context("running HTTP servers")?;
 
     Ok(())
 }

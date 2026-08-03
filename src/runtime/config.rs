@@ -8,13 +8,14 @@ use crate::{
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, net::SocketAddr, path::PathBuf};
+use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone)]
 pub struct Settings {
     pub http: HttpSettings,
     pub rabbitmq_uri: String,
-    pub api_key: String,
+    pub ingest_api_key: String,
+    pub admin_api_key: String,
     pub config_path: Option<PathBuf>,
     pub sinks_config_path: Option<PathBuf>,
     pub default_sink_connection_string: Option<String>,
@@ -27,7 +28,8 @@ impl fmt::Debug for Settings {
             .debug_struct("Settings")
             .field("http", &self.http)
             .field("rabbitmq_uri", &"[REDACTED]")
-            .field("api_key", &"[REDACTED]")
+            .field("ingest_api_key", &"[REDACTED]")
+            .field("admin_api_key", &"[REDACTED]")
             .field("config_path", &self.config_path)
             .field("sinks_config_path", &self.sinks_config_path)
             .field(
@@ -45,31 +47,73 @@ impl fmt::Debug for Settings {
 #[derive(Debug, Clone)]
 pub struct HttpSettings {
     pub bind_address: SocketAddr,
+    pub admin_bind_address: SocketAddr,
+    pub limits: HttpLimits,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpLimits {
+    pub request_body_limit_bytes: Option<usize>,
+    pub request_timeout: Option<Duration>,
+    pub max_concurrent_requests: Option<usize>,
+    pub max_requests_per_minute: Option<usize>,
 }
 
 impl Settings {
-    pub fn from_env() -> anyhow::Result<Self> {
+    pub fn from_env(limits: HttpLimits) -> anyhow::Result<Self> {
         let bind_address = env::var("DISTILL_BIND_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()
             .context("DISTILL_BIND_ADDRESS must be a socket address")?;
+        let admin_bind_address = parse_admin_bind_address(
+            &env::var("DISTILL_ADMIN_BIND_ADDRESS")
+                .unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
+        )?;
         let rabbitmq_uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required")?;
-        let api_key = env::var("DISTILL_API_KEY").context("DISTILL_API_KEY is required")?;
+        let ingest_api_key =
+            env::var("DISTILL_INGEST_API_KEY").context("DISTILL_INGEST_API_KEY is required")?;
+        let admin_api_key =
+            env::var("DISTILL_ADMIN_API_KEY").context("DISTILL_ADMIN_API_KEY is required")?;
+        validate_api_keys(&ingest_api_key, &admin_api_key)?;
         let default_sink_connection_string =
             env::var("DISTILL_DEFAULT_SINK_CONNECTION_STRING").ok();
         let exchange_name_prefix =
             env::var("DISTILL_EXCHANGE_NAME_PREFIX").unwrap_or_else(|_| "distill".to_string());
 
         Ok(Self {
-            http: HttpSettings { bind_address },
+            http: HttpSettings {
+                bind_address,
+                admin_bind_address,
+                limits,
+            },
             rabbitmq_uri,
-            api_key,
+            ingest_api_key,
+            admin_api_key,
             config_path: env::var_os("DISTILL_CONFIG_PATH").map(PathBuf::from),
             sinks_config_path: env::var_os("DISTILL_SINKS_CONFIG_PATH").map(PathBuf::from),
             default_sink_connection_string,
             exchange_name_prefix,
         })
     }
+}
+
+fn parse_admin_bind_address(value: &str) -> anyhow::Result<SocketAddr> {
+    let address: SocketAddr = value
+        .parse()
+        .context("DISTILL_ADMIN_BIND_ADDRESS must be a socket address")?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!(
+            "DISTILL_ADMIN_BIND_ADDRESS must use a loopback address; administrative routes are local-only"
+        );
+    }
+    Ok(address)
+}
+
+fn validate_api_keys(ingest_api_key: &str, admin_api_key: &str) -> anyhow::Result<()> {
+    if ingest_api_key == admin_api_key {
+        anyhow::bail!("DISTILL_INGEST_API_KEY and DISTILL_ADMIN_API_KEY must be different");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,4 +245,22 @@ pub fn resolve_sink(definition: &SinkDefinition) -> Result<SinkConfig, DistillEr
         connection_string,
         headers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_admin_bind_address, validate_api_keys};
+
+    #[test]
+    fn administrative_listener_requires_loopback() {
+        assert!(parse_admin_bind_address("127.0.0.1:8081").is_ok());
+        assert!(parse_admin_bind_address("[::1]:8081").is_ok());
+        assert!(parse_admin_bind_address("0.0.0.0:8081").is_err());
+    }
+
+    #[test]
+    fn api_keys_must_be_distinct() {
+        assert!(validate_api_keys("ingest", "admin").is_ok());
+        assert!(validate_api_keys("same", "same").is_err());
+    }
 }
