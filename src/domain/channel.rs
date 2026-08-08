@@ -2,13 +2,14 @@
 
 // Rust guideline compliant 2026-02-21
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::{
     AggregatorSpec, OrderingMode, SeverityLevel, SinkConfig, default_allowed_lateness_ms,
     default_buffer_bytes, default_mailbox_capacity, default_ttl_seconds,
 };
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ChannelDefinition {
     pub channel_id: String,
     pub severity_threshold: SeverityLevel,
@@ -58,7 +59,7 @@ impl ChannelDefinition {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RabbitMqConfig {
     pub connection_string: String,
     pub exchange_name: String,
@@ -66,7 +67,7 @@ pub struct RabbitMqConfig {
     pub routing_key_prefix: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct MessageSchemaDefinition {
     pub message_type: String,
     pub version: String,

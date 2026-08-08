@@ -1,13 +1,16 @@
 //! Owns channel actors and routes events through their bounded state.
 
+// Rust guideline compliant 2026-02-21
 use crate::{
-    aggregation::AggregatorState,
     broker::RabbitPublisher,
-    buffer::{EventBuffer, MemoryBudget},
+    core::{
+        aggregation::AggregatorState,
+        buffer::{EventBuffer, MemoryBudget},
+        errors::DistillError,
+        metrics::Metrics,
+        routing::{RouteDecision, classify},
+    },
     domain::{ChannelDefinition, LogEvent, OrderingMode},
-    errors::DistillError,
-    metrics::Metrics,
-    routing::{RouteDecision, classify},
 };
 use chrono::{DateTime, Duration, Utc};
 use std::{sync::Arc, time::Duration as StdDuration};

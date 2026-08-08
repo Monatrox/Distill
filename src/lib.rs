@@ -1,8 +1,10 @@
 //! Contains the Distill application and its internal components.
 //!
 //! The binary crate supplies process-level configuration, while this crate
-//! composes the CLI and HTTP application. Internal modules remain private so
-//! component boundaries can evolve without creating an accidental public API.
+//! composes the CLI and HTTP application. Modules are grouped by concern:
+//! `domain` holds pure types, `core` holds application behavior, `infra`
+//! holds process configuration and CLI plumbing, and `broker`, `persistence`,
+//! and `http` wrap the external surfaces.
 
 // Rust guideline compliant 2026-02-21
 use anyhow::Context;
@@ -11,14 +13,11 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 mod broker;
+mod core;
 mod domain;
 mod http;
+mod infra;
 mod persistence;
-mod runtime;
-
-pub(crate) use runtime::{
-    aggregation, buffer, channel, cli, config, errors, metrics, proto, routing, schema,
-};
 
 /// Runs the Distill command-line application.
 ///
@@ -27,7 +26,7 @@ pub(crate) use runtime::{
 /// # Errors
 /// Returns an error when CLI execution, configuration, listener setup, or the HTTP server fails.
 pub async fn run() -> anyhow::Result<()> {
-    let command = cli::Cli::parse();
+    let command = infra::cli::Cli::parse();
     if command.command.is_some() {
         return command.run();
     }
@@ -42,7 +41,7 @@ pub async fn run() -> anyhow::Result<()> {
         .init();
 
     let settings =
-        config::Settings::from_env(http_limits).context("loading Distill configuration")?;
+        infra::config::Settings::from_env(http_limits).context("loading Distill configuration")?;
     let listener = TcpListener::bind(settings.http.bind_address)
         .await
         .context("binding HTTP listener")?;

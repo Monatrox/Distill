@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 mod aggregation;
@@ -19,7 +20,7 @@ pub(crate) use sink::{SinkConfig, SinkDefinition};
 pub type EventId = Uuid;
 pub type AggregateId = Uuid;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SeverityLevel {
     Unknown = 0,
@@ -31,15 +32,17 @@ pub enum SeverityLevel {
     Critical = 6,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct LogEvent {
     #[serde(default = "Uuid::new_v4")]
+    #[schema(value_type = String, format = "uuid")]
     pub event_id: EventId,
     pub timestamp: DateTime<Utc>,
     pub channel_id: String,
     pub severity_level: SeverityLevel,
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing)]
+    #[schema(ignore = true)]
     pub payload_bytes: Option<Vec<u8>>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,

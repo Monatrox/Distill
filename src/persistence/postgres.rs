@@ -2,9 +2,10 @@
 
 // Rust guideline compliant 2026-02-21
 use super::{
-    AggregatedLog, DistillError, LogEvent, PgPool, PgPoolOptions, Sink, Value, async_trait,
-    count_as_i64, merge_aggregate_values,
+    AggregatedLog, DistillError, LogEvent, PgPool, PgPoolOptions, Sink, async_trait, count_as_i64,
+    merge_aggregate_values,
 };
+use serde_json::Value;
 
 #[derive(Clone)]
 pub struct PostgresSink {
@@ -161,14 +162,15 @@ impl Sink for PostgresSink {
                 ));
             }
             let (merged_value, merged_metadata) = merge_aggregate_values(
-                &incoming_type,
+                aggregate.aggregator_type,
                 existing_value,
                 existing_count,
                 existing_metadata,
                 aggregate.aggregated_value,
                 aggregate.count,
                 metadata,
-            )?;
+            )
+            .map_err(DistillError::Persistence)?;
             (
                 merged_value,
                 existing_count.saturating_add(count_as_i64(aggregate.count)),

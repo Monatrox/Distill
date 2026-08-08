@@ -32,7 +32,7 @@ pub(super) async fn authenticate(
 #[cfg(test)]
 mod tests {
     use super::{authenticate, authorize_with_key};
-    use crate::errors::DistillError;
+    use crate::core::errors::DistillError;
     use axum::{
         Router,
         body::{Body, Bytes},

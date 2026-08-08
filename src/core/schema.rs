@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-02-21
 
-use crate::{domain::MessageSchemaDefinition, errors::DistillError};
+use crate::{core::errors::DistillError, domain::MessageSchemaDefinition};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use prost_reflect::{DescriptorPool, MessageDescriptor};
 use std::{collections::HashMap, sync::Arc};

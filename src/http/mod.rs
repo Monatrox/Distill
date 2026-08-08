@@ -3,21 +3,18 @@
 // Rust guideline compliant 2026-02-21
 
 use crate::{
-    broker::{RabbitConsumer, RabbitPublisher},
-    buffer::MemoryBudget,
-    channel::{self, ChannelHandle},
-    config::{self, Settings},
+    core::{
+        errors::{DistillError, ErrorCode, ErrorEnvelope},
+        metrics::Metrics,
+        registry::{ChannelLifecycle, ChannelRecord, ChannelRegistry},
+        routing::{RouteDecision, classify},
+    },
     domain::{
         AggregatorSpec, ChannelDefinition, Granularity, LogEvent, MessageSchemaDefinition,
         OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig,
     },
-    errors::DistillError,
-    metrics::Metrics,
-    persistence::{Sink, build_sink},
-    routing::{RouteDecision, classify},
-    schema::SchemaRegistry,
+    infra::config::{self, Settings},
 };
-use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -29,7 +26,6 @@ use axum::{
 };
 use chrono::Utc;
 use prost::Message;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -37,16 +33,15 @@ use std::{
     time::Instant,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tokio::time::{Duration, sleep};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Duration;
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
-use tracing::{info, warn};
 
 mod auth;
 mod channels;
 mod dto;
-mod error;
 mod ingest;
+mod openapi;
 mod otlp;
 
 use auth::authenticate;
@@ -58,31 +53,20 @@ use dto::{
     ChannelConfigResponse, ChannelValidationResponse, CloneChannelRequest, CreateChannelRequest,
     EventTestResponse, IngestItemError, IngestResponse, PublicChannelConfig, SimpleEventRequest,
 };
-use error::{client_message, error_code};
 use ingest::{health, ingest, metrics, otlp_logs, post_event};
+use openapi::swagger_ui;
 use otlp::otlp_events;
 use uuid::Uuid;
 
-const STARTUP_CONNECTION_ATTEMPTS: u32 = 30;
-const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Defines the rolling period for the process-wide request allowance.
 const REQUEST_RATE_WINDOW: Duration = Duration::from_mins(1);
 
 #[derive(Clone)]
 pub struct AppState {
-    channels: Arc<RwLock<HashMap<String, ChannelRecord>>>,
-    rabbit: RabbitPublisher,
-    consumer: Arc<RabbitConsumer>,
-    schemas: SchemaRegistry,
+    registry: ChannelRegistry,
     metrics: Arc<Metrics>,
-    budget: Arc<MemoryBudget>,
     ingest_api_key: Arc<String>,
     admin_api_key: Arc<String>,
-    rabbitmq_uri: String,
-    default_sink_connection_string: Option<String>,
-    exchange_name_prefix: String,
-    sinks: Arc<RwLock<HashMap<String, Arc<dyn Sink>>>>,
-    default_sink_id: Option<String>,
     http_limits: config::HttpLimits,
     request_controls: RequestControls,
 }
@@ -103,136 +87,18 @@ struct RequestPermit {
     _concurrency: Option<OwnedSemaphorePermit>,
 }
 
-#[derive(Clone)]
-struct ChannelRecord {
-    definition: ChannelDefinition,
-    handle: ChannelHandle,
-    lifecycle: ChannelLifecycle,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum ChannelLifecycle {
-    Active,
-    Paused,
-    Archived,
-}
-
 impl AppState {
     pub async fn connect(settings: Settings) -> anyhow::Result<Self> {
         let http_limits = settings.http.limits.clone();
-        let rabbit_uri = settings.rabbitmq_uri.clone();
-        let rabbit = retry_startup_connection("RabbitMQ publisher", || {
-            let rabbit_uri = rabbit_uri.clone();
-            async move { RabbitPublisher::connect(&rabbit_uri).await }
-        })
-        .await?;
-        let metrics = Arc::new(Metrics::default());
-        let rabbit_uri = settings.rabbitmq_uri.clone();
-        let consumer_metrics = Arc::clone(&metrics);
-        let consumer = Arc::new(
-            retry_startup_connection("RabbitMQ consumer", || {
-                let rabbit_uri = rabbit_uri.clone();
-                let consumer_metrics = Arc::clone(&consumer_metrics);
-                async move { RabbitConsumer::connect(&rabbit_uri, consumer_metrics).await }
-            })
-            .await?,
-        );
-        let sinks = Arc::new(RwLock::new(HashMap::new()));
-        let mut default_sink_id = None;
-        if let Some(path) = settings.sinks_config_path.clone() {
-            let contents = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("reading sink configuration from {}", path.display()))?;
-            let sink_file = config::parse_sinks(&contents)?;
-            default_sink_id = sink_file.default_sink_id;
-            for definition in sink_file.sinks {
-                let sink_config = config::resolve_sink(&definition)?;
-                let sink = build_sink(&sink_config).await?;
-                sinks.write().await.insert(definition.sink_id, sink);
-            }
-        }
-        let state = Self {
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            rabbit,
-            consumer,
-            schemas: SchemaRegistry::default(),
-            metrics,
-            budget: Arc::new(MemoryBudget::new(
-                crate::domain::DEFAULT_PROCESS_MEMORY_BYTES,
-            )),
+        let registry = ChannelRegistry::connect(&settings).await?;
+        Ok(Self {
+            metrics: registry.metrics(),
+            registry,
             ingest_api_key: Arc::new(settings.ingest_api_key),
             admin_api_key: Arc::new(settings.admin_api_key),
-            rabbitmq_uri: settings.rabbitmq_uri,
-            default_sink_connection_string: settings.default_sink_connection_string,
-            exchange_name_prefix: settings.exchange_name_prefix,
-            sinks,
-            default_sink_id,
             request_controls: RequestControls::new(&http_limits),
             http_limits,
-        };
-
-        if let Some(path) = settings.config_path {
-            let contents = tokio::fs::read_to_string(&path).await.with_context(|| {
-                format!("reading channel configuration from {}", path.display())
-            })?;
-            for definition in
-                config::parse_channels_with_default(&contents, state.default_sink_id.as_deref())?
-            {
-                state.register_channel(definition).await?;
-            }
-        }
-        Ok(state)
-    }
-
-    async fn register_channel(&self, definition: ChannelDefinition) -> Result<(), DistillError> {
-        definition
-            .validate()
-            .map_err(DistillError::InvalidConfiguration)?;
-        let channel_id = definition.channel_id.clone();
-        if let Some(schema) = definition.message_schema.clone() {
-            self.schemas.register(&channel_id, schema).await?;
-        } else {
-            self.schemas.remove(&channel_id).await;
-        }
-        let sink: Arc<dyn Sink> = if let Some(sink_id) = &definition.sink_id {
-            self.sinks
-                .read()
-                .await
-                .get(sink_id)
-                .cloned()
-                .ok_or_else(|| {
-                    DistillError::InvalidConfiguration(format!(
-                        "channel '{channel_id}' references undefined sink '{sink_id}'"
-                    ))
-                })?
-        } else {
-            build_sink(&definition.sink_config).await?
-        };
-        let old = self.channels.read().await.get(&channel_id).cloned();
-        if let Some(previous) = old {
-            previous.handle.flush().await?;
-        }
-        self.consumer
-            .register_exchange(&definition.rabbitmq_config.exchange_name)
-            .await?;
-        self.consumer.register_sink(channel_id.clone(), sink).await;
-        let handle = channel::spawn(
-            definition.clone(),
-            self.rabbit.clone(),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.budget),
-        );
-        self.channels.write().await.insert(
-            channel_id.clone(),
-            ChannelRecord {
-                definition,
-                handle,
-                lifecycle: ChannelLifecycle::Active,
-            },
-        );
-        info!(event.name = "distill.channel.registered", channel.id = %channel_id, "channel registered");
-        Ok(())
+        })
     }
 
     fn build_channel_definition(
@@ -240,88 +106,12 @@ impl AppState {
         request: &CreateChannelRequest,
     ) -> Result<ChannelDefinition, DistillError> {
         request.to_definition(
-            self.default_sink_connection_string.as_deref(),
-            self.default_sink_id.as_deref(),
-            &self.exchange_name_prefix,
-            &self.rabbitmq_uri,
+            self.registry.default_sink_connection_string.as_deref(),
+            self.registry.default_sink_id.as_deref(),
+            &self.registry.exchange_name_prefix,
+            &self.registry.rabbitmq_uri,
         )
     }
-
-    async fn submit_event(&self, event: LogEvent) -> Result<(), DistillError> {
-        event.validate().map_err(DistillError::InvalidRequest)?;
-        let record = self
-            .channels
-            .read()
-            .await
-            .get(&event.channel_id)
-            .cloned()
-            .ok_or_else(|| DistillError::ChannelNotFound(event.channel_id.clone()))?;
-        match record.lifecycle {
-            ChannelLifecycle::Active => {}
-            ChannelLifecycle::Paused => {
-                return Err(DistillError::InvalidRequest(format!(
-                    "channel {} is paused",
-                    event.channel_id
-                )));
-            }
-            ChannelLifecycle::Archived => {
-                return Err(DistillError::InvalidRequest(format!(
-                    "channel {} is archived",
-                    event.channel_id
-                )));
-            }
-        }
-        self.schemas
-            .validate_json(
-                &event.channel_id,
-                &event.payload,
-                event.payload_bytes.as_deref(),
-            )
-            .await?;
-        record.handle.send(event).await
-    }
-
-    async fn set_lifecycle(
-        &self,
-        channel_id: &str,
-        lifecycle: ChannelLifecycle,
-    ) -> Result<ChannelConfigResponse, DistillError> {
-        let mut channels = self.channels.write().await;
-        let record = channels
-            .get_mut(channel_id)
-            .ok_or_else(|| DistillError::ChannelNotFound(channel_id.to_string()))?;
-        record.lifecycle = lifecycle;
-        Ok(ChannelConfigResponse::from_record(record))
-    }
-}
-
-async fn retry_startup_connection<T, F, Fut>(label: &str, mut connect: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, DistillError>>,
-{
-    let mut last_error = None;
-    for attempt in 1..=STARTUP_CONNECTION_ATTEMPTS {
-        match connect().await {
-            Ok(connection) => return Ok(connection),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < STARTUP_CONNECTION_ATTEMPTS {
-                    warn!(
-                        event.name = "distill.startup.connection.retry",
-                        dependency = label,
-                        attempt,
-                        "dependency is not ready; retrying"
-                    );
-                    sleep(STARTUP_RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "{label} did not become available after {STARTUP_CONNECTION_ATTEMPTS} attempts: {}",
-        last_error.expect("startup attempts always record an error")
-    ))
 }
 
 pub fn public_router(state: AppState) -> Router {
@@ -360,11 +150,12 @@ pub fn admin_router(state: AppState) -> Router {
         Arc::clone(&state.admin_api_key),
         &state.http_limits,
     );
-    build_router(authenticated, state)
+    build_router(authenticated.merge(swagger_ui()), state)
 }
 
 fn build_router(router: Router<AppState>, state: AppState) -> Router {
     router
+        .layer(middleware::from_fn(enforce_api_version))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_controls,
@@ -436,6 +227,29 @@ impl RequestControls {
     }
 }
 
+/// Resolves the API version requested by a client.
+///
+/// Requests without the `X-API-VERSION` header use the operator-configured
+/// default version (`DISTILL_API_DEFAULT_VERSION`); the header pins a specific
+/// supported version for clients that must avoid silent drift.
+fn resolve_api_version(headers: &HeaderMap) -> Result<(), DistillError> {
+    match headers
+        .get("X-API-VERSION")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(version) if config::SUPPORTED_API_VERSIONS.contains(&version) => Ok(()),
+        Some(version) => Err(DistillError::UnsupportedApiVersion(version.to_string())),
+        None => Ok(()),
+    }
+}
+
+async fn enforce_api_version(request: Request, next: Next) -> Response {
+    match resolve_api_version(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn enforce_request_controls(
     State(state): State<AppState>,
     request: Request,
@@ -454,22 +268,10 @@ async fn enforce_request_controls(
     }
 }
 
-impl AppState {
-    async fn channel_config(
-        &self,
-        channel_id: &str,
-    ) -> Result<ChannelConfigResponse, DistillError> {
-        let channels = self.channels.read().await;
-        let record = channels
-            .get(channel_id)
-            .ok_or_else(|| DistillError::ChannelNotFound(channel_id.to_string()))?;
-        Ok(ChannelConfigResponse::from_record(record))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use serde_json::json;
 
     fn request(value: Value) -> CreateChannelRequest {
@@ -570,6 +372,20 @@ mod tests {
         assert!(matches!(
             controls.acquire(),
             Err(DistillError::RequestThrottled)
+        ));
+    }
+
+    #[test]
+    fn api_version_header_accepts_supported_versions_and_default() {
+        assert!(resolve_api_version(&HeaderMap::new()).is_ok());
+        let mut supported = HeaderMap::new();
+        supported.insert("X-API-VERSION", HeaderValue::from_static("1"));
+        assert!(resolve_api_version(&supported).is_ok());
+        let mut unsupported = HeaderMap::new();
+        unsupported.insert("X-API-VERSION", HeaderValue::from_static("2"));
+        assert!(matches!(
+            resolve_api_version(&unsupported),
+            Err(DistillError::UnsupportedApiVersion(_))
         ));
     }
 

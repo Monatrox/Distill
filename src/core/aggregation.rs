@@ -1,5 +1,6 @@
 //! Computes bounded rolling aggregates from channel-local events.
 
+// Rust guideline compliant 2026-02-21
 use crate::domain::{AggregatedLog, AggregationFunction, AggregatorSpec, LogEvent};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -258,6 +259,113 @@ fn duration_metadata(events: &[LogEvent], function: AggregationFunction) -> Hash
             json!(interval_sum_seconds),
         ),
     ])
+}
+
+/// Merges a persisted rolling aggregate with the incoming window's aggregate.
+pub(crate) fn merge_aggregate_values(
+    aggregator_type: AggregationFunction,
+    existing_value: f64,
+    existing_count: i64,
+    existing_metadata: Value,
+    incoming_value: f64,
+    incoming_count: u64,
+    incoming_metadata: Value,
+) -> Result<(f64, Value), String> {
+    let mut existing_metadata: HashMap<String, Value> =
+        serde_json::from_value(existing_metadata).map_err(|error| error.to_string())?;
+    let incoming_metadata_map: HashMap<String, Value> =
+        serde_json::from_value(incoming_metadata).map_err(|error| error.to_string())?;
+
+    let value = match aggregator_type {
+        AggregationFunction::Average => {
+            let total_count = existing_count.saturating_add(count_as_i64(incoming_count));
+            if total_count == 0 {
+                0.0
+            } else {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "aggregate counts are represented as f64 in the wire format"
+                )]
+                let existing_count_f64 = existing_count as f64;
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "aggregate counts are represented as f64 in the wire format"
+                )]
+                let incoming_count_f64 = count_as_i64(incoming_count) as f64;
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "aggregate counts are represented as f64 in the wire format"
+                )]
+                let total_count_f64 = total_count as f64;
+                (existing_value * existing_count_f64 + incoming_value * incoming_count_f64)
+                    / total_count_f64
+            }
+        }
+        AggregationFunction::AverageDurationBetweenEvents => {
+            let existing_sum = metadata_f64(&existing_metadata, "interval_sum_seconds");
+            let existing_intervals = metadata_u64(&existing_metadata, "interval_count");
+            let incoming_sum = metadata_f64(&incoming_metadata_map, "interval_sum_seconds");
+            let incoming_intervals = metadata_u64(&incoming_metadata_map, "interval_count");
+            let boundary = match (
+                metadata_timestamp(&existing_metadata, "last_event_timestamp"),
+                metadata_timestamp(&incoming_metadata_map, "first_event_timestamp"),
+            ) {
+                (Some(previous), Some(next)) => next
+                    .signed_duration_since(previous)
+                    .to_std()
+                    .map_or(0.0, |duration| duration.as_secs_f64()),
+                _ => 0.0,
+            };
+            let total_intervals = existing_intervals
+                .saturating_add(incoming_intervals)
+                .saturating_add(u64::from(boundary > 0.0));
+            let total_sum = existing_sum + incoming_sum + boundary;
+            existing_metadata.insert("interval_count".to_string(), json!(total_intervals));
+            existing_metadata.insert("interval_sum_seconds".to_string(), json!(total_sum));
+            if let Some(last) = incoming_metadata_map.get("last_event_timestamp") {
+                existing_metadata.insert("last_event_timestamp".to_string(), last.clone());
+            }
+            if total_intervals == 0 {
+                0.0
+            } else {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "duration interval counts are represented as f64 in the aggregate"
+                )]
+                let total_intervals_f64 = total_intervals as f64;
+                total_sum / total_intervals_f64
+            }
+        }
+        AggregationFunction::Count | AggregationFunction::Sum => existing_value + incoming_value,
+        AggregationFunction::Min => existing_value.min(incoming_value),
+        AggregationFunction::Max => existing_value.max(incoming_value),
+    };
+    if aggregator_type != AggregationFunction::AverageDurationBetweenEvents {
+        existing_metadata.extend(incoming_metadata_map);
+    }
+    Ok((
+        value,
+        serde_json::to_value(existing_metadata).map_err(|error| error.to_string())?,
+    ))
+}
+
+fn metadata_f64(metadata: &HashMap<String, Value>, key: &str) -> f64 {
+    metadata.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn metadata_u64(metadata: &HashMap<String, Value>, key: &str) -> u64 {
+    metadata.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn metadata_timestamp(metadata: &HashMap<String, Value>, key: &str) -> Option<DateTime<Utc>> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
+pub(crate) fn count_as_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

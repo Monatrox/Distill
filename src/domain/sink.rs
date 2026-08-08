@@ -3,8 +3,9 @@
 // Rust guideline compliant 2026-02-21
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, path::PathBuf};
+use utoipa::ToSchema;
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, ToSchema)]
 pub struct SinkConfig {
     pub driver: String,
     pub connection_string: String,

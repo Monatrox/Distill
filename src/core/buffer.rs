@@ -1,5 +1,6 @@
 //! Implements safe owner-local byte-bounded event buffering.
 
+// Rust guideline compliant 2026-02-21
 use crate::domain::LogEvent;
 use std::collections::VecDeque;
 use std::sync::Arc;

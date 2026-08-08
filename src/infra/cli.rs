@@ -1,8 +1,9 @@
 //! Provides the local, declarative Distill administration CLI.
 
+// Rust guideline compliant 2026-02-21
 use crate::{
-    config::{HttpLimits, SinkFile},
     domain::SinkDefinition,
+    infra::config::{HttpLimits, SinkFile},
 };
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};

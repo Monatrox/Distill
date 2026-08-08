@@ -4,10 +4,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 use super::AggregateId;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct AggregatorSpec {
     pub function: AggregationFunction,
     pub granularity: Granularity,
@@ -17,7 +18,7 @@ pub struct AggregatorSpec {
     pub rolling: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregationFunction {
     Average,
@@ -29,7 +30,7 @@ pub enum AggregationFunction {
     Count,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Granularity {
     PerNEvents,
@@ -37,7 +38,7 @@ pub enum Granularity {
     Overall,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderingMode {
     FifoRequired,

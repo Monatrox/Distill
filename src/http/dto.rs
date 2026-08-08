@@ -2,12 +2,14 @@
 
 // Rust guideline compliant 2026-02-21
 use super::{
-    AggregatorSpec, ChannelDefinition, ChannelLifecycle, ChannelRecord, DistillError, Granularity,
-    HashMap, LogEvent, Map, MessageSchemaDefinition, OrderingMode, RabbitMqConfig, SeverityLevel,
-    SinkConfig, Utc, Uuid, Value,
+    AggregatorSpec, ChannelDefinition, ChannelLifecycle, ChannelRecord, DistillError, ErrorCode,
+    Granularity, HashMap, LogEvent, Map, MessageSchemaDefinition, OrderingMode, RabbitMqConfig,
+    SeverityLevel, SinkConfig, Utc, Uuid, Value,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
+#[derive(Debug, ToSchema)]
 pub(super) struct CreateChannelRequest {
     pub(super) name: String,
     pub(super) preset: ChannelPreset,
@@ -24,6 +26,7 @@ pub(super) struct CreateChannelRequest {
     pub(super) mailbox_capacity: Option<usize>,
     pub(super) ordering: Option<OrderingMode>,
     pub(super) allowed_lateness_ms: Option<u64>,
+    #[schema(ignore = true)]
     pub(super) aggregator_present: bool,
 }
 
@@ -173,7 +176,7 @@ impl CreateChannelRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ChannelPreset {
     #[default]
@@ -264,7 +267,7 @@ impl Default for PresetDefaults {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct SimpleEventRequest {
     #[serde(default)]
     pub(super) event_id: Option<Uuid>,
@@ -314,28 +317,29 @@ fn default_info() -> SeverityLevel {
     SeverityLevel::Info
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct CloneChannelRequest {
     pub(super) channel_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct IngestResponse {
     pub(super) accepted: usize,
     pub(super) rejected: usize,
+    #[schema(value_type = String, format = "uuid")]
     pub(super) request_id: Uuid,
     pub(super) durability: &'static str,
     pub(super) errors: Vec<IngestItemError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct IngestItemError {
     pub(super) index: usize,
-    pub(super) error_code: String,
+    pub(super) error_code: ErrorCode,
     pub(super) message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct ChannelConfigResponse {
     pub(super) channel_id: String,
     pub(super) active: bool,
@@ -343,7 +347,7 @@ pub(super) struct ChannelConfigResponse {
     pub(super) effective: PublicChannelConfig,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct PublicChannelConfig {
     pub(super) channel_id: String,
     pub(super) sink_id: Option<String>,
@@ -395,7 +399,7 @@ impl PublicChannelConfig {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct ChannelValidationResponse {
     pub(super) valid: bool,
     pub(super) channel_id: String,
@@ -404,7 +408,7 @@ pub(super) struct ChannelValidationResponse {
     pub(super) effective: PublicChannelConfig,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(super) struct EventTestResponse {
     pub(super) valid: bool,
     pub(super) channel_id: String,

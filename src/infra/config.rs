@@ -3,12 +3,18 @@
 // Rust guideline compliant 2026-02-21
 
 use crate::{
+    core::errors::DistillError,
     domain::{ChannelDefinition, SinkConfig, SinkDefinition},
-    errors::DistillError,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+
+/// API versions that requests may pin via the `X-API-VERSION` header.
+///
+/// The contract advances only on breaking changes; new endpoints and additive
+/// fields extend the current version without adding a new entry here.
+pub const SUPPORTED_API_VERSIONS: [&str; 1] = ["1"];
 
 #[derive(Clone)]
 pub struct Settings {
@@ -20,6 +26,7 @@ pub struct Settings {
     pub sinks_config_path: Option<PathBuf>,
     pub default_sink_connection_string: Option<String>,
     pub exchange_name_prefix: String,
+    pub api_default_version: String,
 }
 
 impl fmt::Debug for Settings {
@@ -40,6 +47,7 @@ impl fmt::Debug for Settings {
                     .map(|_| "[REDACTED]"),
             )
             .field("exchange_name_prefix", &self.exchange_name_prefix)
+            .field("api_default_version", &self.api_default_version)
             .finish()
     }
 }
@@ -79,6 +87,9 @@ impl Settings {
             env::var("DISTILL_DEFAULT_SINK_CONNECTION_STRING").ok();
         let exchange_name_prefix =
             env::var("DISTILL_EXCHANGE_NAME_PREFIX").unwrap_or_else(|_| "distill".to_string());
+        let api_default_version =
+            env::var("DISTILL_API_DEFAULT_VERSION").unwrap_or_else(|_| "1".to_string());
+        validate_default_api_version(&api_default_version)?;
 
         Ok(Self {
             http: HttpSettings {
@@ -93,8 +104,19 @@ impl Settings {
             sinks_config_path: env::var_os("DISTILL_SINKS_CONFIG_PATH").map(PathBuf::from),
             default_sink_connection_string,
             exchange_name_prefix,
+            api_default_version,
         })
     }
+}
+
+fn validate_default_api_version(value: &str) -> anyhow::Result<()> {
+    if !SUPPORTED_API_VERSIONS.contains(&value) {
+        anyhow::bail!(
+            "DISTILL_API_DEFAULT_VERSION must be one of: {}",
+            SUPPORTED_API_VERSIONS.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn parse_admin_bind_address(value: &str) -> anyhow::Result<SocketAddr> {
@@ -249,7 +271,7 @@ pub fn resolve_sink(definition: &SinkDefinition) -> Result<SinkConfig, DistillEr
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_admin_bind_address, validate_api_keys};
+    use super::{parse_admin_bind_address, validate_api_keys, validate_default_api_version};
 
     #[test]
     fn administrative_listener_requires_loopback() {
@@ -262,5 +284,12 @@ mod tests {
     fn api_keys_must_be_distinct() {
         assert!(validate_api_keys("ingest", "admin").is_ok());
         assert!(validate_api_keys("same", "same").is_err());
+    }
+
+    #[test]
+    fn default_api_version_must_be_supported() {
+        assert!(validate_default_api_version("1").is_ok());
+        assert!(validate_default_api_version("2").is_err());
+        assert!(validate_default_api_version("").is_err());
     }
 }

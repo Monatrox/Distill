@@ -1,5 +1,6 @@
 //! Collects low-overhead process metrics for the Prometheus endpoint.
 
+// Rust guideline compliant 2026-02-21
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]

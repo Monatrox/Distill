@@ -1,8 +1,9 @@
 //! Defines the small Protobuf envelope accepted by the ingest endpoint.
 
+// Rust guideline compliant 2026-02-21
 use crate::{
+    core::errors::DistillError,
     domain::{LogEvent, SeverityLevel},
-    errors::DistillError,
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};

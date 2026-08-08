@@ -1,5 +1,6 @@
 //! Classifies events into direct persistence or aggregation paths.
 
+// Rust guideline compliant 2026-02-21
 use crate::domain::{ChannelDefinition, LogEvent};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

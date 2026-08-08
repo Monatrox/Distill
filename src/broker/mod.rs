@@ -2,9 +2,8 @@
 
 // Rust guideline compliant 2026-02-21
 use crate::{
+    core::{errors::DistillError, metrics::Metrics},
     domain::{AggregatedLog, LogEvent},
-    errors::DistillError,
-    metrics::Metrics,
     persistence::Sink,
 };
 use futures_util::StreamExt;
