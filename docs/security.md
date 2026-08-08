@@ -35,6 +35,27 @@ Authentication is implemented as route middleware. Rejected requests do not reac
 
 The health endpoint is intentionally unauthenticated and bypasses the request resource controls so local liveness checks remain reliable. It returns only a success status.
 
+### Failed-authentication throttling
+
+Each listener throttles failed authentication attempts. After 10 failures within a 60-second window, subsequent attempts receive `429 Too Many Requests` until a successful authentication resets the window. The throttle is process-wide per listener (ingest and admin track separately) and does not distinguish source addresses.
+
+### HTTP sink destinations are restricted
+
+Outbound HTTP sink destinations are validated against an operator-controlled policy before a sink client is built:
+
+- the scheme must be `http` or `https`;
+- redirects are disabled on the sink client;
+- the port must be 80, 443, 8080, or 8443 unless allowlisted;
+- raw IP addresses are rejected unless an allowlisted CIDR covers them;
+- hostnames must resolve only to public addresses unless the hostname is allowlisted — loopback, link-local, private, multicast, reserved, NAT, and documentation ranges are denied;
+- operators may approve internal destinations with `DISTILL_SINK_ALLOWLIST` using `host[:port]`, `cidr[:port]`, or `:port` entries.
+
+DNS is resolved when the sink is built (channel registration). Allowlisted hostnames bypass resolution entirely.
+
+### Channel resource settings have hard upper bounds
+
+Channel definitions enforce hard maximums: `buffer_bytes` at 256 MiB, `mailbox_capacity` at 65,536, `ttl_seconds` at 24 hours, `retention_hours` at 900 days, channel identifiers at 128 characters, and decoded schema descriptors at 1 MiB. The total registered channel count defaults to 500 and is configurable with `DISTILL_MAX_CHANNELS` (use 0 to disable).
+
 ### Request resource controls are bounded by default
 
 The process applies these defaults to authenticated routes on both listeners:
@@ -64,10 +85,10 @@ RabbitMQ broker and management ports in the supplied Compose stack bind to host 
 
 The following are known limitations of the current security model:
 
-- HTTP sink destinations are configurable and can make outbound requests to arbitrary URLs. This remains an SSRF risk for anyone who obtains administrative access.
+- HTTP sink destinations remain operator-configurable and can still reach internal services when an operator explicitly approves them through `DISTILL_SINK_ALLOWLIST`; the policy restricts but does not eliminate that capability.
 - API keys do not identify individual clients and do not support independent rotation or targeted revocation.
-- Rate limiting is process-wide and does not distinguish clients, credentials, channels, or source addresses.
-- Administrative resource settings and total channel/sink counts need stronger global quotas and hard upper bounds.
+- Rate limiting is process-wide and does not distinguish clients, credentials, channels, or source addresses; failed-authentication throttling is similarly address-agnostic.
+- Administrative resource settings have hard upper bounds, but per-credential quotas and total sink counts are still unquotaed.
 - RabbitMQ retry handling can still allow a failing sink to delay unrelated delivery work.
 - Channel replacement is not yet a fully transactional state swap across schemas, sinks, broker topology, and actors.
 - The Compose Caddy setup is a development-friendly deployment pattern, not a complete production ingress policy.
@@ -77,11 +98,11 @@ The following are known limitations of the current security model:
 
 Potential follow-up work, in priority order:
 
-1. Replace arbitrary HTTP sink URLs with named operator-managed sinks, or enforce strict scheme, DNS, port, IP-range, redirect, and header policies.
+1. Replace arbitrary HTTP sink URLs with named operator-managed sinks, or enforce strict scheme, DNS, port, IP-range, redirect, and header policies. (Scheme, port, IP-range, redirect, and resolution policies are now enforced; header allowlists, per-sink secret storage, and named destinations remain.)
 2. Introduce key IDs, hashed key storage, scoped permissions, expiration, overlapping rotation, and targeted revocation.
 3. Add audit events for administrative actions and authentication failures without logging credentials or payload secrets.
-4. Make rate limits configurable per credential or source identity, with explicit `Retry-After` behavior and failed-authentication throttling.
-5. Add hard quotas for channels, sinks, schemas, mailbox capacity, buffers, and other resource-affecting settings.
+4. Make rate limits configurable per credential or source identity, with explicit `Retry-After` behavior and failed-authentication throttling. (A coarse per-listener failed-authentication throttle is now in place; per-identity rate limits remain.)
+5. Add hard quotas for channels, sinks, schemas, mailbox capacity, buffers, and other resource-affecting settings. (Hard upper bounds and the channel-count limit are enforced; per-identity quotas and sink-count limits remain.)
 6. Move RabbitMQ retries into durable retry queues and isolate unhealthy destinations.
 7. Make channel replacement transactional and add rollback-focused tests.
 8. Add CI checks for `cargo audit`, dependency policy, container image scanning, security integration tests, and deployment configuration validation.

@@ -1,3 +1,4 @@
+using Distill.Client;
 using Microsoft.Extensions.Logging;
 
 namespace Distill.Extensions.Logging;
@@ -29,11 +30,29 @@ public sealed class DistillLoggerOptions
     /// Gets or sets the behavior when the bounded queue is full.
     public DistillOverflowPolicy OverflowPolicy { get; set; } = DistillOverflowPolicy.DropNewest;
 
-    /// Gets or sets a function that maps an `ILogger` category to a Distill channel.
+    /// Gets or sets a function that maps an ILogger category to a Distill channel.
     public Func<string, string>? ChannelResolver { get; set; }
 
+    /// Gets or sets per-channel overrides for batch size, retry, and queue behavior.
+    public Dictionary<string, PerChannelOptions> ChannelOptions { get; set; } = new(StringComparer.Ordinal);
+
+    /// Gets or sets category-specific minimum log levels.
+    public Dictionary<string, LogLevel> CategoryLevels { get; set; } = new(StringComparer.Ordinal);
+
+    /// Gets or sets a factory that creates a channel definition for a given channel name.
+    public Func<string, CreateChannelRequest>? ChannelFactory { get; set; }
+
     /// Gets or sets a callback invoked after a batch exhausts its retry attempts.
-    public Action<Exception>? DeliveryFailure { get; set; }
+    public Action<DeliveryFailureContext>? DeliveryFailure { get; set; }
+
+    /// Gets or sets a callback invoked after a batch is successfully delivered.
+    public Action<DeliverySuccessContext>? DeliverySuccess { get; set; }
+
+    /// Gets or sets a callback invoked when the channel resolver returns null or whitespace.
+    public Action<string, string>? ChannelResolutionFailed { get; set; }
+
+    /// Gets or sets a callback invoked when automatic channel provisioning fails.
+    public Action<string, Exception>? ChannelProvisioningFailure { get; set; }
 
     internal void Validate()
     {
@@ -63,9 +82,73 @@ public sealed class DistillLoggerOptions
             throw new ArgumentOutOfRangeException(nameof(RetryDelay));
         }
     }
+
+    internal PerChannelOptions GetChannelOptions(string channelId)
+    {
+        if (ChannelOptions is not null && ChannelOptions.TryGetValue(channelId, out var opts))
+        {
+            return opts;
+        }
+
+        return DefaultPerChannelOptions;
+    }
+
+    internal LogLevel GetCategoryLevel(string category)
+    {
+        if (CategoryLevels is not null)
+        {
+            if (CategoryLevels.TryGetValue(category, out var level))
+            {
+                return level;
+            }
+
+            int lastDot = category.Length;
+            while ((lastDot = category.LastIndexOf('.', lastDot - 1)) > 0)
+            {
+                if (CategoryLevels.TryGetValue(category[..lastDot], out level))
+                {
+                    return level;
+                }
+            }
+        }
+
+        return MinimumLevel;
+    }
+
+    private static readonly PerChannelOptions DefaultPerChannelOptions = new();
 }
 
-/// Determines what happens when the provider’s bounded queue is full.
+/// Per-channel overrides for the Distill logging provider.
+public sealed class PerChannelOptions
+{
+    public int? BatchSize { get; set; }
+    public TimeSpan? FlushInterval { get; set; }
+    public int? MaxRetries { get; set; }
+    public TimeSpan? RetryDelay { get; set; }
+    public int? QueueCapacity { get; set; }
+    public DistillOverflowPolicy? OverflowPolicy { get; set; }
+    public LogLevel? MinimumLevel { get; set; }
+    public Func<CreateChannelRequest>? ChannelFactory { get; set; }
+}
+
+/// Context provided to the delivery-failure callback.
+public sealed class DeliveryFailureContext
+{
+    public required string Channel { get; init; }
+    public required int EventCount { get; init; }
+    public required int Attempts { get; init; }
+    public required Exception Exception { get; init; }
+}
+
+/// Context provided to the delivery-success callback.
+public sealed class DeliverySuccessContext
+{
+    public required string Channel { get; init; }
+    public required int EventCount { get; init; }
+    public required IngestResponse Response { get; init; }
+}
+
+/// Determines what happens when the provider's bounded queue is full.
 public enum DistillOverflowPolicy
 {
     /// Discards the incoming event and keeps events already buffered.

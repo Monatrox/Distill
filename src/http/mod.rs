@@ -60,6 +60,13 @@ use uuid::Uuid;
 
 /// Defines the rolling period for the process-wide request allowance.
 const REQUEST_RATE_WINDOW: Duration = Duration::from_mins(1);
+/// Length of the window over which failed authentications accumulate.
+const AUTH_THROTTLE_WINDOW: Duration = Duration::from_mins(1);
+/// Failed authentications within the window that trigger throttled responses.
+///
+/// The threshold is coarse and process-wide per listener; it bounds brute-force
+/// attempts on the static API keys without tracking client identities.
+const AUTH_THROTTLE_MAX_FAILURES: usize = 10;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,6 +76,65 @@ pub struct AppState {
     admin_api_key: Arc<String>,
     http_limits: config::HttpLimits,
     request_controls: RequestControls,
+    ingest_auth_window: Arc<FailedAuthWindow>,
+    admin_auth_window: Arc<FailedAuthWindow>,
+}
+
+/// Key and throttling state shared with the authentication middleware.
+pub(super) struct AuthGuard {
+    pub(super) key: String,
+    pub(super) failures: Arc<FailedAuthWindow>,
+}
+
+/// Tracks consecutive failed authentication attempts within a rolling window.
+#[derive(Debug, Default)]
+pub(super) struct FailedAuthWindow {
+    failures: Mutex<VecDeque<Instant>>,
+}
+
+impl FailedAuthWindow {
+    /// Rejects the attempt when too many failures occurred in the window.
+    fn check(&self) -> Result<(), DistillError> {
+        let mut failures = self
+            .failures
+            .lock()
+            .expect("authentication throttle mutex must not be poisoned");
+        let now = Instant::now();
+        while failures
+            .front()
+            .is_some_and(|failed| now.duration_since(*failed) >= AUTH_THROTTLE_WINDOW)
+        {
+            failures.pop_front();
+        }
+        if failures.len() >= AUTH_THROTTLE_MAX_FAILURES {
+            return Err(DistillError::RequestThrottled);
+        }
+        Ok(())
+    }
+
+    /// Records a failed attempt.
+    fn record_failure(&self) {
+        let mut failures = self
+            .failures
+            .lock()
+            .expect("authentication throttle mutex must not be poisoned");
+        let now = Instant::now();
+        while failures
+            .front()
+            .is_some_and(|failed| now.duration_since(*failed) >= AUTH_THROTTLE_WINDOW)
+        {
+            failures.pop_front();
+        }
+        failures.push_back(now);
+    }
+
+    /// Clears the failure history after a successful authentication.
+    fn reset(&self) {
+        self.failures
+            .lock()
+            .expect("authentication throttle mutex must not be poisoned")
+            .clear();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +164,8 @@ impl AppState {
             admin_api_key: Arc::new(settings.admin_api_key),
             request_controls: RequestControls::new(&http_limits),
             http_limits,
+            ingest_auth_window: Arc::new(FailedAuthWindow::default()),
+            admin_auth_window: Arc::new(FailedAuthWindow::default()),
         })
     }
 
@@ -121,7 +189,10 @@ pub fn public_router(state: AppState) -> Router {
             .route("/ingest", post(ingest))
             .route("/v1/logs", post(otlp_logs))
             .route("/channels/{channel_id}/events", post(post_event)),
-        Arc::clone(&state.ingest_api_key),
+        Arc::new(AuthGuard {
+            key: (*state.ingest_api_key).clone(),
+            failures: Arc::clone(&state.ingest_auth_window),
+        }),
         &state.http_limits,
     );
     build_router(
@@ -147,7 +218,10 @@ pub fn admin_router(state: AppState) -> Router {
             .route("/channels/{channel_id}/flush", post(flush_channel))
             .route("/channels/{channel_id}/archive", post(archive_channel))
             .route("/channels/{channel_id}/clone", post(clone_channel)),
-        Arc::clone(&state.admin_api_key),
+        Arc::new(AuthGuard {
+            key: (*state.admin_api_key).clone(),
+            failures: Arc::clone(&state.admin_auth_window),
+        }),
         &state.http_limits,
     );
     build_router(authenticated.merge(swagger_ui()), state)
@@ -166,7 +240,7 @@ fn build_router(router: Router<AppState>, state: AppState) -> Router {
 
 fn authenticated_routes(
     router: Router<AppState>,
-    expected_key: Arc<String>,
+    guard: Arc<AuthGuard>,
     limits: &config::HttpLimits,
 ) -> Router<AppState> {
     let mut router = router;
@@ -179,7 +253,7 @@ fn authenticated_routes(
             timeout,
         ));
     }
-    router.layer(middleware::from_fn_with_state(expected_key, authenticate))
+    router.layer(middleware::from_fn_with_state(guard, authenticate))
 }
 
 impl RequestControls {

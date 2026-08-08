@@ -5,6 +5,7 @@
 use crate::{
     core::errors::DistillError,
     domain::{ChannelDefinition, SinkConfig, SinkDefinition},
+    persistence::SinkAllowlist,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,12 @@ use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
 /// The contract advances only on breaking changes; new endpoints and additive
 /// fields extend the current version without adding a new entry here.
 pub const SUPPORTED_API_VERSIONS: [&str; 1] = ["1"];
+
+/// Default maximum number of concurrently registered channels.
+///
+/// Each channel spawns an actor and registers `RabbitMQ` topology; the cap
+/// bounds those resources. Operators may raise it with `DISTILL_MAX_CHANNELS`.
+const DEFAULT_MAX_CHANNELS: usize = 500;
 
 #[derive(Clone)]
 pub struct Settings {
@@ -27,6 +34,8 @@ pub struct Settings {
     pub default_sink_connection_string: Option<String>,
     pub exchange_name_prefix: String,
     pub api_default_version: String,
+    pub max_channels: usize,
+    pub sink_allowlist: SinkAllowlist,
 }
 
 impl fmt::Debug for Settings {
@@ -48,6 +57,8 @@ impl fmt::Debug for Settings {
             )
             .field("exchange_name_prefix", &self.exchange_name_prefix)
             .field("api_default_version", &self.api_default_version)
+            .field("max_channels", &self.max_channels)
+            .field("sink_allowlist", &self.sink_allowlist)
             .finish()
     }
 }
@@ -90,6 +101,13 @@ impl Settings {
         let api_default_version =
             env::var("DISTILL_API_DEFAULT_VERSION").unwrap_or_else(|_| "1".to_string());
         validate_default_api_version(&api_default_version)?;
+        let max_channels = env::var("DISTILL_MAX_CHANNELS")
+            .unwrap_or_else(|_| DEFAULT_MAX_CHANNELS.to_string())
+            .parse()
+            .context("DISTILL_MAX_CHANNELS must be a non-negative integer")?;
+        let sink_allowlist =
+            SinkAllowlist::parse(&env::var("DISTILL_SINK_ALLOWLIST").unwrap_or_default())
+                .map_err(|error| anyhow::anyhow!("DISTILL_SINK_ALLOWLIST is invalid: {error}"))?;
 
         Ok(Self {
             http: HttpSettings {
@@ -105,6 +123,8 @@ impl Settings {
             default_sink_connection_string,
             exchange_name_prefix,
             api_default_version,
+            max_channels,
+            sink_allowlist,
         })
     }
 }

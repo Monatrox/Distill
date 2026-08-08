@@ -31,6 +31,7 @@ pub(super) struct CreateChannelRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CreateChannelRequestWire {
     #[serde(alias = "channel_id")]
     pub(super) name: String,

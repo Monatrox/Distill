@@ -20,8 +20,11 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 mod http;
 mod mysql;
+mod policy;
 mod postgres;
 mod sql_server;
+
+pub use policy::SinkAllowlist;
 
 use http::HttpSink;
 use mysql::MySqlSink;
@@ -35,7 +38,13 @@ pub trait Sink: Send + Sync {
 }
 
 /// Creates a configured sink for one channel.
-pub async fn build_sink(config: &crate::domain::SinkConfig) -> Result<Arc<dyn Sink>, DistillError> {
+///
+/// The sink allowlist governs the destinations HTTP sinks may reach; other
+/// drivers ignore it.
+pub async fn build_sink(
+    config: &crate::domain::SinkConfig,
+    sink_allowlist: &SinkAllowlist,
+) -> Result<Arc<dyn Sink>, DistillError> {
     match config.driver.as_str() {
         "postgres" => Ok(Arc::new(
             PostgresSink::connect(&config.connection_string).await?,
@@ -46,7 +55,7 @@ pub async fn build_sink(config: &crate::domain::SinkConfig) -> Result<Arc<dyn Si
         "sqlserver" | "mssql" => Ok(Arc::new(
             SqlServerSink::connect(&config.connection_string).await?,
         )),
-        "http" => Ok(Arc::new(HttpSink::connect(config)?)),
+        "http" => Ok(Arc::new(HttpSink::connect(config, sink_allowlist)?)),
         driver => Err(DistillError::InvalidConfiguration(format!(
             "unsupported sink driver: {driver}"
         ))),

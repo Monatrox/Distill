@@ -2,7 +2,8 @@
 
 // Rust guideline compliant 2026-02-21
 use super::{
-    AggregatedLog, DistillError, HTTP_REQUEST_TIMEOUT, LogEvent, Serialize, Sink, async_trait,
+    AggregatedLog, DistillError, HTTP_REQUEST_TIMEOUT, LogEvent, Serialize, Sink, SinkAllowlist,
+    async_trait,
 };
 
 #[derive(Clone, Debug)]
@@ -12,7 +13,12 @@ pub struct HttpSink {
 }
 
 impl HttpSink {
-    pub fn connect(config: &crate::domain::SinkConfig) -> Result<Self, DistillError> {
+    pub fn connect(
+        config: &crate::domain::SinkConfig,
+        sink_allowlist: &SinkAllowlist,
+    ) -> Result<Self, DistillError> {
+        super::policy::validate_sink_url(&config.connection_string, sink_allowlist)
+            .map_err(DistillError::InvalidConfiguration)?;
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &config.headers {
             let name = reqwest::header::HeaderName::try_from(name).map_err(|error| {
@@ -26,11 +32,9 @@ impl HttpSink {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(HTTP_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| DistillError::InvalidConfiguration(error.to_string()))?;
-        reqwest::Url::parse(&config.connection_string).map_err(|error| {
-            DistillError::InvalidConfiguration(format!("invalid HTTP sink URL: {error}"))
-        })?;
         Ok(Self {
             client,
             endpoint: config.connection_string.clone(),

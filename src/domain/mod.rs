@@ -70,6 +70,31 @@ pub const DEFAULT_TTL_SECONDS: u64 = 3_600;
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 1_024;
 pub const DEFAULT_ALLOWED_LATENESS_MS: u64 = 5_000;
 
+/// Maximum per-channel buffer size in bytes.
+///
+/// Half the default process memory budget so a single channel cannot crowd out
+/// the other channels' buffers.
+pub const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum per-channel actor mailbox capacity.
+///
+/// The actor mailbox is an mpsc channel whose capacity is reserved on spawn;
+/// this cap bounds that allocation while staying far above the default.
+pub const MAX_MAILBOX_CAPACITY: usize = 65_536;
+/// Maximum buffered-event age before a forced flush, in seconds.
+///
+/// Bound the TTL so a misconfiguration cannot suppress flushes indefinitely.
+pub const MAX_TTL_SECONDS: u64 = 86_400;
+/// Maximum configured retention period, in hours.
+///
+/// 900 days is a generous hard ceiling for on-demand logging without
+/// accepting values that are clearly mistakes.
+pub const MAX_RETENTION_HOURS: u32 = 21_600;
+/// Maximum channel identifier length.
+///
+/// Channel IDs are embedded in `RabbitMQ` exchange and routing-key names; the
+/// bound prevents oversized broker topology names.
+pub const MAX_CHANNEL_ID_LENGTH: usize = 128;
+
 pub(crate) const fn default_buffer_bytes() -> usize {
     DEFAULT_BUFFER_BYTES
 }

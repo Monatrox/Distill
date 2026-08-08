@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS1591;NU1902</NoWarn>
+    <PackageId>Distill.Aspire</PackageId>
+    <Description>Aspire integration for Distill structured logging.</Description>
+    <PackageTags>distill aspire logging observability</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\..\..\..\Rider\DistillTesting\DistillTesting.ServiceDefaults\DistillTesting.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
+    <ProjectReference Include="..\Distill.Extensions.Logging\Distill.Extensions.Logging.csproj" />
+    <PackageReference Include="Aspire.Hosting" Version="8.2.2" />
+  </ItemGroup>
+</Project>

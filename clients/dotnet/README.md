@@ -30,8 +30,8 @@ await client.CreateChannelAsync(new CreateChannelRequest
     RetentionHours = 720
 });
 
-// To disable a preset aggregator and persist every event, use:
-// DisableAggregator = true
+// To disable a preset aggregator and persist every event, set Aggregator to null:
+// Aggregator = null
 
 IngestResponse? response = await client.WriteAsync(
     "orders.production",

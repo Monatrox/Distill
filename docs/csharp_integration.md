@@ -1,17 +1,18 @@
 # C#/.NET Integration Guide
 
-This guide describes how a .NET operator integrates an application or library with Distill.
+This guide covers all three ways to integrate a .NET application with Distill.
 
-It targets .NET 8 or later and assumes the operator has:
+It targets **.NET 8 or later** and assumes you have:
 
 - an HTTP address for the Distill service;
 - the Distill API key;
-- a sink provisioned separately with the Distill CLI or deployment system; and
-- source access when a generated Protobuf client, schema registration, or operational customization is required.
+- a sink provisioned with the Distill CLI or deployment system.
+
+---
 
 ## 1. Integration model
 
-The C# application is an ingest client. It does not connect to RabbitMQ or write Distill's tables directly.
+The C# application is an ingest client. It sends events over HTTP and never connects to RabbitMQ or writes the sink database directly.
 
 ```text
 C# application
@@ -26,295 +27,360 @@ RabbitMQ
 Configured Distill sink
 ```
 
-RabbitMQ is transport, buffering, retry, and dead-letter infrastructure. The configured Distill sink may be PostgreSQL, MySQL, SQL Server, or HTTP. The C# process should treat a successful HTTP response as “durably handed to Distill,” not as proof that a record is already queryable in the sink.
+A successful HTTP response means "durably handed to Distill," not that the record is already queryable in the sink.
 
-## 2. Deployment and sink administration
+---
 
-For a local, self-contained Distill environment:
+## 2. Choosing an integration path
 
-```powershell
-docker compose up --build
+| Layer | Package | When to use |
+|---|---|---|
+| **Direct client** | `Distill.Client` | You need full control over channel lifecycle and event payloads. Zero external dependencies. |
+| **ILogger provider** | `Distill.Extensions.Logging` | You want drop-in integration with `Microsoft.Extensions.Logging`. Handles batching, retries, and channel routing. |
+| **Aspire integration** | `Distill.Aspire` | You're building an Aspire distributed application. Wires the client, logger, and health check from configuration automatically. |
+
+---
+
+## 3. Distill.Client — direct HTTP API
+
+The `Distill.Client` package is a lightweight, dependency-free wrapper over the Distill REST API.
+
+### 3.1 Installation
+
+Reference from your project:
+
+```xml
+<PackageReference Include="Distill.Client" Version="1.0.0" />
 ```
 
-The Compose deployment starts Distill and RabbitMQ. Sink administration is a deployment concern and should be performed before the application starts sending logs. The C# application should not receive or store the sink connection string.
-
-Configure the Distill process with:
-
-```text
-RABBITMQ_URI=amqp://user:password@rabbitmq.example.com:5672/%2f
-DISTILL_API_KEY=<secret>
-DISTILL_BIND_ADDRESS=0.0.0.0:8080
-DISTILL_SINKS_CONFIG_PATH=/etc/distill/sinks.json
-```
-
-For PostgreSQL, provision a named sink with the CLI:
-
-```powershell
-$env:DISTILL_POSTGRES_URL = "postgresql://distill:password@postgres:5432/logs?sslmode=require"
-distill sink create postgres-primary `
-  --driver postgres `
-  --connection-string-env DISTILL_POSTGRES_URL `
-  --file sinks.json `
-  --default
-```
-
-For an HTTP sink, keep the endpoint in the manifest and the bearer token in the Distill process environment:
-
-```powershell
-$env:DISTILL_COLLECTOR_TOKEN = "replace-with-a-secret"
-distill sink create custom-http `
-  --driver http `
-  --url https://collector.example.com/distill `
-  --bearer-token-env DISTILL_COLLECTOR_TOKEN `
-  --file sinks.json `
-  --default
-```
-
-`RABBITMQ_URI` is the service's broker connection. `DISTILL_SINKS_CONFIG_PATH` points to the named sink manifest. The manifest contains secret references, not database passwords or bearer tokens. `rabbitmq_config.connection_string` remains part of the advanced channel contract for self-description, while the current broker connection is process-level.
-
-When PostgreSQL is provisioned by .NET Aspire, ensure the connection string is reachable from the Distill process. If Distill runs in Docker and PostgreSQL runs on the host, `localhost` in the Aspire connection string points to the container itself; use a host-reachable address such as `host.docker.internal` or attach both services to a shared Docker network. If both run under Compose, use the Compose service name, such as `postgres`.
-
-Never place a sink connection string, bearer token, or API key in source control, event payloads, metadata, or ordinary application logs. Use the Distill CLI, a secret manager, or container secrets. The C# application only needs the Distill base URL and API key.
-
-## 3. Create a channel
-
-Channels must exist before ingestion. The channel identifier must contain only lowercase ASCII letters, digits, `.`, `-`, or `_`.
+### 3.2 Create a client
 
 ```csharp
 using Distill.Client;
 
+// Factory — creates a new HttpClient internally
 var distill = DistillClient.Create(
     new Uri("http://localhost:8080/"),
     apiKey);
 
+// Constructor injection — useful with IHttpClientFactory or DI
+var distill = new DistillClient(
+    httpClient,   // must have BaseAddress set
+    apiKey);
+```
+
+### 3.3 Channel management
+
+Channels must exist before ingestion. The channel identifier must contain only lowercase ASCII letters, digits, `.`, `-`, or `_`:
+
+```csharp
 var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
     Preset = "raw_events",
     SinkId = "postgres-primary",
-    DisableAggregator = true
+    Aggregator = null   // null = disable preset aggregator; omit = use preset default
 });
 ```
 
-`SinkId` may be omitted when `postgres-primary` is the configured default. The application never receives the PostgreSQL connection string. A successful simplified creation returns the sanitized channel configuration. Use `CreateOrReplaceChannelAsync` only when an operator needs to supply the complete advanced definition.
+Other channel operations:
 
-Common failures are:
+```csharp
+// Advanced channel definition (raw object — caller must know the server schema)
+await distill.CreateOrReplaceChannelAsync("orders.production", advancedDefinition);
+
+// Dry-run validation
+var validation = await distill.ValidateChannelAsync(request);
+
+// Read effective config
+var config = await distill.GetChannelAsync("orders.production");
+
+// Pause / resume / flush / archive / clone
+await distill.PauseChannelAsync("orders.production");
+await distill.ResumeChannelAsync("orders.production");
+await distill.FlushChannelAsync("orders.production");
+await distill.ArchiveChannelAsync("orders.production");
+await distill.CloneChannelAsync("source-channel", "target-channel");
+```
+
+`SinkId` may be omitted when the default sink is configured. The application never receives the sink connection string.
+
+### 3.4 Write an event
+
+```csharp
+IngestResponse? response = await distill.WriteAsync(
+    "orders.production",
+    new SimpleEvent
+    {
+        Severity = "error",
+        Message = "Payment authorization failed",
+        Payload = new { order_id = "ord-123", provider = "stripe" },
+        Attributes = new Dictionary<string, object?>
+        {
+            ["retryable"] = true,
+            ["attempt"] = 2
+        }
+    });
+```
+
+### 3.5 Batch ingest
+
+```csharp
+IngestResponse? response = await distill.IngestAsync(new[]
+{
+    new DistillEvent
+    {
+        EventId = Guid.NewGuid(),
+        Timestamp = DateTimeOffset.UtcNow,
+        ChannelId = "orders.production",
+        SeverityLevel = "info",
+        Payload = new { order_id = "ord-123", operation = "created" },
+        Metadata = new Dictionary<string, string>
+        {
+            ["service"] = "checkout-api",
+            ["correlation_id"] = Activity.Current?.Id ?? "unknown"
+        }
+    }
+});
+```
+
+Use stable `EventId` values so Distill's idempotent sink write can absorb retries.
+
+### 3.6 Test routing
+
+```csharp
+EventTestResponse? test = await distill.TestEventAsync(
+    "orders.production",
+    eventToTest);
+```
+
+### 3.7 Error handling
+
+```csharp
+try
+{
+    await distill.IngestAsync(events);
+}
+catch (DistillApiException ex)
+{
+    Console.WriteLine($"Status: {ex.StatusCode}");
+    Console.WriteLine($"Error code: {ex.ErrorCode}");
+    Console.WriteLine($"Body: {ex.ResponseBody}");
+}
+```
 
 | Status | Meaning |
 |---|---|
 | `400` | Invalid request or schema payload |
-| `404` | The requested channel does not exist for a channel-specific operation |
+| `404` | The requested channel does not exist |
 | `422` | Invalid channel definition |
 | `503` | Distill or its external delivery path is unavailable |
 
-The channel `severity_threshold` controls additional raw persistence. When an aggregator is configured, every event contributes to the aggregate; events at or above the threshold are also persisted individually. With no aggregator, every event is persisted immediately and must not be treated as discardable.
+Retry `503` and transport failures. Do not retry `400`, `404`, or `422` without correcting the request.
 
-Supported v1 aggregators include:
+---
 
-```json
-{ "function": "average", "granularity": "overall" }
+## 4. Distill.Extensions.Logging — ILogger provider
+
+Drop in the `Microsoft.Extensions.Logging` provider and send structured logs through Distill without changing your existing `ILogger` code.
+
+### 4.1 Installation
+
+```xml
+<PackageReference Include="Distill.Extensions.Logging" Version="1.0.0" />
 ```
 
-This computes the average numeric value from `payload.value` across the active overall window. `count` with `overall` computes the total number of events in that window. `average_duration_between_events` computes the average interval, in seconds, between chronologically adjacent event timestamps; it does not require a numeric `payload.value`. For `per_n_events` or `per_t_time`, add `parameter` with the event count or duration in seconds, respectively.
-
-For example, an average event interval channel can be created with:
-
-```json
-{
-  "function": "average_duration_between_events",
-  "granularity": "per_n_events",
-  "parameter": 100
-}
-```
-
-The first event in a window establishes the starting timestamp but does not form an interval. Thus, 100 events produce 99 intervals. Conditional counting is not yet part of the v1 contract; its predicate syntax and security/performance behavior will be designed separately.
-
-Add `"rolling": true` to any supported aggregator when each emitted window should merge into one expanding aggregate record:
-
-```json
-{
-  "function": "count",
-  "granularity": "per_t_time",
-  "parameter": 60,
-  "rolling": true
-}
-```
-
-Rolling aggregates retain the first `window_start`, advance `window_end`, and merge their values and counts. Numeric averages are merged using their counts; sums, minimums, maximums, and counts are merged directly. Rolling duration averages preserve custom metadata including `first_event_timestamp`, `last_event_timestamp`, `interval_count`, and `interval_sum_seconds`, allowing the interval crossing two adjacent windows to be included.
-
-Rolling aggregate identity is stable across Distill restarts, so the same channel and aggregator configuration continues the existing record. Reconfiguring the aggregator creates a new series when its identity changes. Custom metadata is present on every aggregate record but is normally empty unless the aggregation requires it.
-
-### Aggregation setup scenarios
-
-The following fragments are the `aggregator` property of a channel definition sent to `PUT /channels/{channel_id}`. Keep the other required channel properties from the channel-creation example unchanged.
-
-`overall` maintains one running window and is flushed when the channel TTL expires, when the channel is flushed or replaced, or when the bounded buffer requires a flush. With the default `ttl_seconds` of `3600`, “overall” means all inputs received during that active window, not an immutable lifetime statistic.
-
-#### Persist every event without aggregation
-
-Use this when every event, including low-severity events, must be stored individually:
-
-```json
-"aggregator": null
-```
-
-No `payload.value` is required. Severity still determines the route when an aggregator exists, but with `null` every event uses the direct persistence path.
-
-#### Numeric average
-
-Numeric average reads `payload.value` as a finite JSON number.
-
-```json
-"aggregator": {
-  "function": "average",
-  "granularity": "overall"
-}
-```
-
-Windowed variants:
-
-```json
-"aggregator": {
-  "function": "average",
-  "granularity": "per_n_events",
-  "parameter": 100
-}
-```
-
-```json
-"aggregator": {
-  "function": "average",
-  "granularity": "per_t_time",
-  "parameter": 60
-}
-```
-
-The first example averages all numeric values in the active overall window. The second flushes after 100 aggregated events. The third flushes after 60 seconds from the first event in the window.
-
-#### Average duration between events
-
-Use event timestamps rather than `payload.value`:
-
-```json
-"aggregator": {
-  "function": "average_duration_between_events",
-  "granularity": "overall"
-}
-```
-
-The implementation sorts timestamps chronologically before calculating adjacent intervals, so producers do not need to deliver events in timestamp order. The result is seconds as a floating-point value. For `per_n_events`, the first event does not form an interval; `N` events produce `N - 1` intervals.
-
-#### Total event count
-
-Use `count` when the count of all events in each aggregation window is needed:
-
-```json
-"aggregator": {
-  "function": "count",
-  "granularity": "overall"
-}
-```
-
-Windowed count variants use the same granularity settings:
-
-```json
-"aggregator": {
-  "function": "count",
-  "granularity": "per_n_events",
-  "parameter": 1000
-}
-```
-
-```json
-"aggregator": {
-  "function": "count",
-  "granularity": "per_t_time",
-  "parameter": 300
-}
-```
-
-Count ignores the event payload and counts every event routed to the aggregator. Conditional count—such as counting only events where `payload.status == "failed"`—is not implemented yet.
-
-#### Sum, minimum, and maximum
-
-These functions also require a finite numeric `payload.value`:
-
-```json
-"aggregator": { "function": "sum", "granularity": "overall" }
-```
-
-```json
-"aggregator": { "function": "min", "granularity": "per_t_time", "parameter": 60 }
-```
-
-```json
-"aggregator": { "function": "max", "granularity": "per_n_events", "parameter": 100 }
-```
-
-`sum` totals values, `min` records the smallest value, and `max` records the largest value in each window. All three support `overall`, `per_n_events`, and `per_t_time` with the same `parameter` rules.
-
-#### Severity and aggregation together
-
-Aggregation includes every event in the channel. For example, with `severity_threshold: "warning"` and a numeric average aggregator:
-
-- `warning`, `error`, and `critical` events are persisted individually and contribute to the average;
-- `trace`, `debug`, and `info` events must contain a numeric `payload.value` and contribute to the average;
-- if no aggregator is configured, all severities are persisted individually.
-
-If a low-severity event lacks the required numeric value for `average`, `sum`, `min`, or `max`, Distill rejects that event rather than silently treating it as zero.
-
-## 4. JSON ingestion
-
-The simplest integration uses `POST /ingest` with an array of events.
+### 4.2 Registration
 
 ```csharp
-var events = new[]
-{
-    new
-    {
-        event_id = Guid.NewGuid(),
-        timestamp = DateTimeOffset.UtcNow,
-        channel_id = "orders.production",
-        severity_level = "info",
-        payload = new
-        {
-            order_id = "ord-123",
-            operation = "created",
-            latency_ms = 42
-        },
-        metadata = new Dictionary<string, string>
-        {
-            ["service"] = "checkout-api",
-            ["host"] = Environment.MachineName,
-            ["correlation_id"] = Activity.Current?.Id ?? "unknown"
-        }
-    }
-};
+using Distill.Client;
+using Distill.Extensions.Logging;
 
-using var request = new HttpRequestMessage(HttpMethod.Post, "/ingest")
-{
-    Content = JsonContent.Create(events)
-};
-request.Headers.Add("X-API-Key", apiKey);
+var distill = DistillClient.Create(
+    new Uri("http://localhost:8080/"),
+    Environment.GetEnvironmentVariable("DISTILL_API_KEY")!);
 
-using var response = await client.SendAsync(request);
-var body = await response.Content.ReadAsStringAsync();
-response.EnsureSuccessStatusCode();
-// body: { "accepted": 1 }
+builder.Logging.AddDistill(distill, options =>
+{
+    options.DefaultChannel = "application.production";
+    options.MinimumLevel = LogLevel.Information;
+});
 ```
 
-Required event fields:
+Now all `ILogger` calls are forwarded to Distill:
+```csharp
+logger.LogInformation("Order {OrderId} created", orderId);
+logger.LogError(exception, "Payment failed for order {OrderId}", orderId);
+```
 
-- `timestamp`: an ISO-8601 UTC timestamp. Every event requires one, regardless of ordering mode.
-- `channel_id`: an existing valid channel.
-- `severity_level`: `unknown`, `trace`, `debug`, `info`, `warning`, `error`, or `critical`.
-- `payload`: any JSON value. Objects are recommended for queryable structured logs.
+Structured state, scopes, categories, event IDs, and exception details are preserved as Distill payload and metadata.
 
-`event_id` is optional, but a producer should always provide a stable UUID. Distill uses it for idempotent sink writes when RabbitMQ redelivers a message. `metadata` is optional and is a string-to-string map.
+### 4.3 Channel routing
 
-## 5. Protobuf ingestion
+Route logger categories to different Distill channels:
 
-The endpoint accepts `application/protobuf` or `application/x-protobuf`. The wire contract is:
+```csharp
+options.ChannelResolver = category =>
+    category.StartsWith("Microsoft.", StringComparison.Ordinal)
+        ? "platform.production"
+        : "application.production";
+```
+
+When the resolver returns null or whitespace, the provider falls back to `DefaultChannel` and invokes `ChannelResolutionFailed`:
+
+```csharp
+options.ChannelResolutionFailed =
+    (category, reason) => Console.Error.WriteLine($"'{category}': {reason}");
+```
+
+### 4.4 Per-channel configuration
+
+Override batching, retry, and overflow behavior per channel:
+
+```csharp
+options.ChannelOptions["errors.critical"] = new PerChannelOptions
+{
+    BatchSize = 1,
+    FlushInterval = TimeSpan.Zero,
+    OverflowPolicy = DistillOverflowPolicy.Block
+};
+
+options.ChannelOptions["telemetry.trace"] = new PerChannelOptions
+{
+    QueueCapacity = 500,
+    OverflowPolicy = DistillOverflowPolicy.DropOldest
+};
+```
+
+Fields in `PerChannelOptions` are all nullable; when null, the global value from `DistillLoggerOptions` is used.
+
+### 4.5 Category-level log levels
+
+Set different minimum levels for namespace prefixes:
+
+```csharp
+options.CategoryLevels["Microsoft"] = LogLevel.Warning;
+options.CategoryLevels["Microsoft.AspNetCore"] = LogLevel.Error;
+options.CategoryLevels["MyApp.Services"] = LogLevel.Debug;
+```
+
+Resolution walks the dotted path: `"Microsoft.AspNetCore.Hosting"` checks
+`"Microsoft.AspNetCore.Hosting"` → `"Microsoft.AspNetCore"` → `"Microsoft"`
+before falling back to `MinimumLevel`.
+
+### 4.6 Delivery callbacks
+
+Observe delivery outcomes per channel:
+
+```csharp
+options.DeliverySuccess = context =>
+{
+    Console.WriteLine($"Delivered {context.EventCount} events to {context.Channel}"
+        + $" (accepted: {context.Response.Accepted})");
+};
+
+options.DeliveryFailure = context =>
+{
+    Console.Error.WriteLine(
+        $"Failed to deliver {context.EventCount} events to {context.Channel}"
+        + $" after {context.Attempts} attempts: {context.Exception.Message}");
+};
+```
+
+### 4.7 Auto-channel creation
+
+The provider validates channels at startup and can create missing channels automatically:
+
+```csharp
+// Global factory — receives the channel ID
+options.ChannelFactory = channelId => new CreateChannelRequest
+{
+    Name = channelId,
+    Preset = "raw_events"
+};
+
+// Per-channel factory — overrides the global one for specific channels
+options.ChannelOptions["errors.critical"].ChannelFactory = () => new CreateChannelRequest
+{
+    Name = "errors.critical",
+    Preset = "errors_only"
+};
+
+// Observe provisioning failures
+options.ChannelProvisioningFailure =
+    (channelId, ex) => Console.Error.WriteLine($"Failed to provision '{channelId}': {ex.Message}");
+```
+
+### 4.8 Batching and retries
+
+Configure globally or per channel:
+
+```csharp
+// Global defaults
+options.BatchSize = 100;           // events per batch
+options.FlushInterval = TimeSpan.FromSeconds(1);  // max wait before partial batch
+options.MaxRetries = 3;            // retry attempts before DeliveryFailure
+options.RetryDelay = TimeSpan.FromSeconds(1);
+options.QueueCapacity = 8192;      // per-channel queue depth before overflow
+options.OverflowPolicy = DistillOverflowPolicy.DropNewest;
+```
+
+Each channel has its own bounded queue. A debug flood on one channel cannot starve critical-error delivery on another because each channel's overflow policy is enforced independently.
+
+The worker drains batches from each channel's queue. After the batch is sent, the `DeliverySuccess` or `DeliveryFailure` callback fires.
+
+### 4.9 Graceful shutdown
+
+The provider implements `IAsyncDisposable`. During shutdown it completes all channel writers, flushes remaining records, then cancels the background worker:
+
+```csharp
+await provider.DisposeAsync();
+```
+
+For synchronous `IDisposable` compatibility, `Dispose()` delegates to `DisposeAsync().AsTask().GetAwaiter().GetResult()`.
+
+---
+
+## 5. Distill.Aspire — Aspire integration
+
+The `Distill.Aspire` package provides hosting extensions for the AppHost and a
+client extension that wires the Distill client, logging provider, and health
+check from configuration.
+
+For full API details see `clients/dotnet/Distill.Aspire/README.md`. The essential
+patterns are:
+
+**External Distill instance:**
+```csharp
+var distill = builder.AddDistill("distill",
+    endpoint: new Uri("http://localhost:8080"),
+    apiKey: "your-api-key");
+```
+
+**Container-mode with auto-build and a PostgreSQL sink:**
+```csharp
+var postgres = builder.AddPostgres("pg").AddDatabase("distill");
+
+var distill = builder.AddDistill("distill", apiKey: "dev-key")
+    .WithLocalBuild()          // builds distil:latest from repo Dockerfile
+    .WithSink(postgres);       // single sink → becomes default
+```
+
+**Consumer project:**
+```csharp
+builder.AddDistillClient("distill");  // reads ConnectionStrings__distill
+```
+
+`AddDistillClient` registers `DistillClient` as a singleton, adds the
+`ILogger` provider, and registers a health check. Configuration is read
+from `Distill__Endpoint` / `ConnectionStrings__distill` with a fallback
+to `http://localhost:8080`, and `Distill__ApiKey` for the API key.
+
+---
+
+## 6. Protobuf ingestion
+
+When you need wire efficiency, the ingestion endpoint also accepts `application/protobuf` or `application/x-protobuf`:
 
 ```protobuf
 syntax = "proto3";
@@ -333,9 +399,9 @@ message ProtoLogEvent {
 }
 ```
 
-Severity values are `0=unknown`, `1=trace`, `2=debug`, `3=info`, `4=warning`, `5=error`, and `6=critical`. The `payload` bytes should contain UTF-8 JSON when schema validation is configured; otherwise Distill preserves non-JSON bytes as base64 in its JSON representation.
+Severity values: `0=unknown`, `1=trace`, `2=debug`, `3=info`, `4=warning`, `5=error`, `6=critical`. The `payload` bytes should contain UTF-8 JSON when schema validation is configured; otherwise Distill preserves non-JSON bytes as base64.
 
-Generate C# types with `Google.Protobuf` and `Grpc.Tools`, serialize `IngestRequest`, and send the bytes:
+Generate C# types with `Google.Protobuf` and `Grpc.Tools`:
 
 ```xml
 <PackageReference Include="Google.Protobuf" Version="3.*" />
@@ -350,7 +416,7 @@ request.Events.Add(new ProtoLogEvent
     TimestampMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
     ChannelId = "orders.production",
     SeverityLevel = 3,
-    Payload = ByteString.CopyFromUtf8("{\"order_id\":\"ord-123\",\"operation\":\"created\"}")
+    Payload = ByteString.CopyFromUtf8("{\"order_id\":\"ord-123\"}")
 });
 
 using var content = new ByteArrayContent(request.ToByteArray());
@@ -362,9 +428,49 @@ using var response = await client.SendAsync(message);
 response.EnsureSuccessStatusCode();
 ```
 
-## 6. Runtime schema validation
+---
 
-If a channel has `message_schema`, Distill validates the payload against the registered Protobuf descriptor. An operator with source access should generate a serialized `FileDescriptorSet`, base64-encode it, and register:
+## 7. Aggregation
+
+### 7.1 Disabling aggregation
+
+Set `Aggregator` to `null` to persist every event:
+
+```csharp
+var channel = await distill.CreateChannelAsync(new CreateChannelRequest
+{
+    Name = "orders.production",
+    Preset = "raw_events",
+    Aggregator = null
+});
+```
+
+### 7.2 Aggregator configuration
+
+Supported v1 aggregators:
+
+| function | description | requires `payload.value` |
+|---|---|---|
+| `average` | Numeric average | yes |
+| `sum` | Numeric total | yes |
+| `min` | Minimum numeric value | yes |
+| `max` | Maximum numeric value | yes |
+| `count` | Event count | no |
+| `average_duration_between_events` | Average interval between adjacent timestamps | no |
+
+Granularity options: `overall`, `per_n_events` (with `parameter`), `per_t_time` (with `parameter` in seconds).
+
+Add `"rolling": true` to merge windows into one expanding aggregate record.
+
+### 7.3 Aggregation and severity together
+
+Events at or above `severity_threshold` are persisted individually AND contribute to the aggregate. Events below the threshold only contribute to the aggregate. If no aggregator is set, all events are persisted regardless of severity.
+
+---
+
+## 8. Runtime schema validation
+
+If a channel has a registered `message_schema`, Distill validates the payload against the Protobuf descriptor:
 
 ```csharp
 var schema = new
@@ -375,24 +481,25 @@ var schema = new
 };
 
 using var response = await client.PostAsJsonAsync(
-    "/channels/orders.production/schema",
-    schema);
+    "/channels/orders.production/schema", schema);
 response.EnsureSuccessStatusCode(); // 204
 ```
 
-The descriptor's fully-qualified message name and version must match the payload contract used by the producer. A schema mismatch returns `400`; do not retry malformed payloads indefinitely. Fix the producer or register the correct descriptor.
+A schema mismatch returns `400`. Fix the producer or register the correct descriptor.
 
-## 7. Delivery, retries, and producer behavior
+---
+
+## 9. Delivery semantics
 
 The HTTP response reports admission to Distill's delivery path:
 
 1. Distill validates the event and channel.
-2. The channel actor either buffers it for aggregation or publishes it to RabbitMQ.
+2. The channel actor buffers or publishes to RabbitMQ.
 3. RabbitMQ confirms the durable publication.
-4. Distill returns a successful response.
+4. Distill returns success.
 5. The internal consumer writes to the configured sink and acknowledges only after success.
 
-Sink outages therefore may cause a backlog after an HTTP request has succeeded. The consumer retries transient failures with bounded backoff. Exhausted messages go to the `distill.dead-letter` exchange and durable dead-letter queue for operator investigation. Because writes are idempotent, the C# producer may safely retry an HTTP request using the same `event_id` after a timeout, although the response may have been lost after successful admission.
+Sink outages may create a backlog after the HTTP request succeeds. The consumer retries transient failures with bounded backoff. Exhausted messages go to the dead-letter exchange. Because writes are idempotent, the C# producer may safely retry using the same `event_id` after a timeout.
 
 Recommended producer policy:
 
@@ -400,79 +507,33 @@ Recommended producer policy:
 - use UTC timestamps from `DateTimeOffset.UtcNow`;
 - retry only transport failures and `503` responses;
 - do not retry `400`, `404`, or `422` without correcting the request;
-- use bounded client-side retry with jitter and an application circuit breaker;
-- monitor `/health` and `/metrics` separately from application success rates;
-- avoid logging full payloads when payloads contain secrets or personal data.
+- use bounded client-side retry with jitter;
+- avoid logging payloads that contain secrets or personal data.
 
-## 8. A reusable .NET client shape
+---
 
-For a library integration, wrap `HttpClient` with `IHttpClientFactory` and expose a small typed API:
-
-```csharp
-public sealed record DistillEvent(
-    Guid EventId,
-    DateTimeOffset Timestamp,
-    string ChannelId,
-    string SeverityLevel,
-    object Payload,
-    IReadOnlyDictionary<string, string>? Metadata = null);
-
-public sealed class DistillClient(HttpClient httpClient)
-{
-    public async Task IngestAsync(
-        IReadOnlyCollection<DistillEvent> events,
-        CancellationToken cancellationToken = default)
-    {
-        using var response = await httpClient.PostAsJsonAsync(
-            "/ingest", events, cancellationToken);
-
-        if ((int)response.StatusCode == 503)
-        {
-            throw new HttpRequestException(
-                "Distill delivery is temporarily unavailable.", null,
-                response.StatusCode);
-        }
-
-        response.EnsureSuccessStatusCode();
-    }
-}
-```
-
-Register it with an API key supplied by configuration:
-
-```csharp
-services.AddHttpClient<DistillClient>((serviceProvider, client) =>
-{
-    var configuration = serviceProvider.GetRequiredService<IConfiguration>();
-    client.BaseAddress = new Uri(configuration["Distill:BaseUrl"]!);
-    client.DefaultRequestHeaders.Add("X-API-Key", configuration["Distill:ApiKey"]!);
-});
-```
-
-Do not create a new `HttpClient` per event. Batch related events when practical, while keeping request sizes bounded and preserving stable IDs.
-
-## 9. Operational checklist
+## 10. Operational checklist
 
 Before enabling production logging, verify:
 
 - Distill can reach RabbitMQ and the configured sink.
-- The channel was created successfully with the intended threshold and aggregator.
-- The channel's `sink_id` is the intended named sink, or it intentionally uses the configured default.
-- The API key is stored as a secret and transmitted only over TLS in production.
+- The channel was created with the intended threshold and aggregator.
+- The channel's `sink_id` is the intended named sink.
+- The API key is stored as a secret and transmitted only over TLS.
 - `/health` is monitored.
-- `/metrics` is scraped, especially received, persisted, aggregate, and error counters.
+- `/metrics` is scraped (received, persisted, aggregate, error counters).
 - RabbitMQ durable queues and the dead-letter queue have disk/retention monitoring.
-- The selected sink's uniqueness constraints on `event_id` and `aggregate_id` remain intact.
-- A test event can be traced from the C# client to the selected sink or downstream HTTP adapter.
+- A test event can be traced from the C# client to the selected sink.
 
-## 10. Source-level extension points
+---
 
-With full source access, the most relevant extension points are:
+## 11. Source-level extension points
+
+With full source access:
 
 - add a typed generated C# contract package matching `src/proto.rs`;
 - add an authenticated TLS deployment policy at the HTTP ingress;
-- extend the sink registry for additional drivers while preserving named-sink references;
-- add an explicit channel status endpoint exposing delivery health;
+- extend the sink registry for additional drivers;
 - add integration tests covering `HttpClient`, RabbitMQ, PostgreSQL, retries, and dead-letter recovery.
 
-The C# integration should remain at the HTTP boundary. Directly consuming Distill's internal RabbitMQ queue or writing its PostgreSQL tables would bypass validation, routing, retry, and idempotency guarantees.
+The C# integration should remain at the HTTP boundary. Directly consuming Distill's internal RabbitMQ queue or writing its PostgreSQL tables bypasses validation, routing, retry, and idempotency guarantees.

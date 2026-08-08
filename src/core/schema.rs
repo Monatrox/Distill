@@ -16,6 +16,12 @@ pub struct SchemaRegistry {
 /// Caps descriptor memory so schema registration cannot exhaust the process budget.
 const MAX_SCHEMA_CACHE_BYTES: usize = 100 * 1024 * 1024;
 
+/// Caps a single decoded descriptor set.
+///
+/// One MiB is far above any realistic message schema while preventing a single
+/// registration from allocating unbounded memory during base64 decoding.
+const MAX_SCHEMA_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 struct RegisteredSchema {
     descriptor: MessageDescriptor,
@@ -40,6 +46,11 @@ impl SchemaRegistry {
         let bytes = STANDARD
             .decode(&definition.descriptor_set_base64)
             .map_err(|error| DistillError::InvalidConfiguration(error.to_string()))?;
+        if bytes.len() > MAX_SCHEMA_DESCRIPTOR_BYTES {
+            return Err(DistillError::InvalidConfiguration(format!(
+                "schema descriptor exceeds the {MAX_SCHEMA_DESCRIPTOR_BYTES} byte limit"
+            )));
+        }
         let pool = DescriptorPool::decode(bytes.as_slice())
             .map_err(|error| DistillError::InvalidConfiguration(error.to_string()))?;
         let descriptor = pool

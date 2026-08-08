@@ -38,7 +38,11 @@ public sealed class DistillClient
         return new DistillClient(new HttpClient { BaseAddress = baseAddress }, apiKey);
     }
 
-    /// Creates or replaces a channel using the complete advanced channel definition.
+    /// Creates or replaces a channel using a raw definition object.
+    ///
+    /// This is the advanced PUT endpoint for callers who know the full server schema.
+    /// Most applications should prefer <see cref="CreateChannelAsync(CreateChannelRequest, CancellationToken)"/>
+    /// with a typed <see cref="CreateChannelRequest"/>.
     public async Task CreateOrReplaceChannelAsync(
         string channelId,
         object definition,
@@ -60,14 +64,7 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var requestBody = JsonSerializer.SerializeToNode(request, JsonOptions)?.AsObject()
-            ?? throw new InvalidOperationException("The channel request could not be serialized.");
-        if (request.DisableAggregator)
-        {
-            requestBody["aggregator"] = null;
-        }
-
-        return SendAsync<ChannelConfigResponse>(HttpMethod.Post, "channels", requestBody, cancellationToken);
+        return SendAsync<ChannelConfigResponse>(HttpMethod.Post, "channels", request, cancellationToken);
     }
 
     /// Validates and resolves a simplified channel request without registering it.

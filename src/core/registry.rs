@@ -19,7 +19,7 @@ use crate::{
     },
     domain::{ChannelDefinition, LogEvent, MessageSchemaDefinition},
     infra::config::{self, Settings},
-    persistence::{Sink, build_sink},
+    persistence::{Sink, SinkAllowlist, build_sink},
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,8 @@ pub(crate) struct ChannelRegistry {
     pub(crate) default_sink_connection_string: Option<String>,
     pub(crate) exchange_name_prefix: String,
     pub(crate) default_sink_id: Option<String>,
+    max_channels: usize,
+    sink_allowlist: SinkAllowlist,
 }
 
 impl ChannelRegistry {
@@ -98,7 +100,7 @@ impl ChannelRegistry {
             default_sink_id = sink_file.default_sink_id;
             for definition in sink_file.sinks {
                 let sink_config = config::resolve_sink(&definition)?;
-                let sink = build_sink(&sink_config).await?;
+                let sink = build_sink(&sink_config, &settings.sink_allowlist).await?;
                 sinks.write().await.insert(definition.sink_id, sink);
             }
         }
@@ -116,6 +118,8 @@ impl ChannelRegistry {
             default_sink_connection_string: settings.default_sink_connection_string.clone(),
             exchange_name_prefix: settings.exchange_name_prefix.clone(),
             default_sink_id,
+            max_channels: settings.max_channels,
+            sink_allowlist: settings.sink_allowlist.clone(),
         };
         if let Some(path) = &settings.config_path {
             let contents = tokio::fs::read_to_string(path).await.with_context(|| {
@@ -148,6 +152,18 @@ impl ChannelRegistry {
             .validate()
             .map_err(DistillError::InvalidConfiguration)?;
         let channel_id = definition.channel_id.clone();
+        {
+            let channels = self.channels.read().await;
+            if self.max_channels > 0
+                && !channels.contains_key(&channel_id)
+                && channels.len() >= self.max_channels
+            {
+                return Err(DistillError::InvalidConfiguration(format!(
+                    "maximum channel count ({}) reached; raise DISTILL_MAX_CHANNELS to allow more",
+                    self.max_channels
+                )));
+            }
+        }
         if let Some(schema) = definition.message_schema.clone() {
             self.schemas.register(&channel_id, schema).await?;
         } else {
@@ -165,7 +181,7 @@ impl ChannelRegistry {
                     ))
                 })?
         } else {
-            build_sink(&definition.sink_config).await?
+            build_sink(&definition.sink_config, &self.sink_allowlist).await?
         };
         let old = self.channels.read().await.get(&channel_id).cloned();
         if let Some(previous) = old {

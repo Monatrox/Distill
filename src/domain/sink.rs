@@ -38,6 +38,14 @@ impl SinkConfig {
         if self.connection_string.is_empty() {
             return Err("sink connection_string must not be empty".to_string());
         }
+        if self.driver == "http" {
+            let scheme = self.connection_string.split(':').next().unwrap_or_default();
+            if !matches!(scheme, "http" | "https") {
+                return Err(
+                    "http sink connection_string must use the http or https scheme".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 }

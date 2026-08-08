@@ -2,7 +2,8 @@
 
 // Rust guideline compliant 2026-02-21
 use super::{
-    ConstantTimeEq, DistillError, HeaderMap, IntoResponse, Next, Request, Response, State,
+    AuthGuard, ConstantTimeEq, DistillError, HeaderMap, IntoResponse, Next, Request, Response,
+    State,
 };
 use std::sync::Arc;
 
@@ -18,13 +19,20 @@ fn authorize_with_key(headers: &HeaderMap, expected: &str) -> Result<(), Distill
 }
 
 pub(super) async fn authenticate(
-    State(expected): State<Arc<String>>,
+    State(guard): State<Arc<AuthGuard>>,
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Response {
-    if let Err(error) = authorize_with_key(&headers, expected.as_str()) {
+    if let Err(error) = guard.failures.check() {
         return error.into_response();
+    }
+    match authorize_with_key(&headers, &guard.key) {
+        Ok(()) => guard.failures.reset(),
+        Err(error) => {
+            guard.failures.record_failure();
+            return error.into_response();
+        }
     }
     next.run(request).await
 }
@@ -33,6 +41,7 @@ pub(super) async fn authenticate(
 mod tests {
     use super::{authenticate, authorize_with_key};
     use crate::core::errors::DistillError;
+    use crate::http::{AUTH_THROTTLE_MAX_FAILURES, AuthGuard, FailedAuthWindow};
     use axum::{
         Router,
         body::{Body, Bytes},
@@ -46,6 +55,13 @@ mod tests {
     };
     use tower::ServiceExt;
     use tower_http::limit::RequestBodyLimitLayer;
+
+    fn guard(key: &str) -> Arc<AuthGuard> {
+        Arc::new(AuthGuard {
+            key: key.to_string(),
+            failures: Arc::new(FailedAuthWindow::default()),
+        })
+    }
 
     fn api_key_headers(key: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -87,7 +103,7 @@ mod tests {
                 }),
             )
             .route_layer(axum::middleware::from_fn_with_state(
-                Arc::new("expected".to_string()),
+                guard("expected"),
                 authenticate,
             ));
         let request = Request::builder()
@@ -111,7 +127,7 @@ mod tests {
             .route("/", post(|_: Bytes| async { StatusCode::NO_CONTENT }))
             .layer(RequestBodyLimitLayer::new(1))
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new("expected".to_string()),
+                guard("expected"),
                 authenticate,
             ));
         let request = Request::builder()
@@ -126,5 +142,66 @@ mod tests {
             .expect("test router should respond");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_trigger_throttling() {
+        let app = Router::new()
+            .route("/", post(|_: Bytes| async { StatusCode::NO_CONTENT }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                guard("expected"),
+                authenticate,
+            ));
+        for _ in 0..AUTH_THROTTLE_MAX_FAILURES {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("X-API-Key", "wrong")
+                .body(Body::empty())
+                .expect("test request should build");
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("test router should respond");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("X-API-Key", "wrong")
+            .body(Body::empty())
+            .expect("test request should build");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("test router should respond");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn successful_authentication_resets_failures() {
+        let guard = guard("expected");
+        for _ in 0..(AUTH_THROTTLE_MAX_FAILURES - 1) {
+            guard.failures.record_failure();
+        }
+        let app = Router::new()
+            .route("/", post(|_: Bytes| async { StatusCode::NO_CONTENT }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&guard),
+                authenticate,
+            ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("X-API-Key", "expected")
+            .body(Body::empty())
+            .expect("test request should build");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("test router should respond");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(guard.failures.check().is_ok());
     }
 }

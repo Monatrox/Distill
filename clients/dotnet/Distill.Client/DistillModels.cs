@@ -20,12 +20,9 @@ public sealed record CreateChannelRequest
     public string? SeverityThreshold { get; init; }
 
     /// Gets or initializes an optional aggregation override. Set this to null to disable a preset aggregator.
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     [JsonPropertyName("aggregator")]
     public AggregatorSpec? Aggregator { get; init; }
-
-    /// Gets or initializes whether a preset aggregator should be explicitly disabled.
-    [JsonIgnore]
-    public bool DisableAggregator { get; init; }
 
     /// Gets or initializes the named sink used by this channel.
     [JsonPropertyName("sink_id")]
