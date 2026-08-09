@@ -36,6 +36,8 @@ pub struct ChannelDefinition {
     pub ordering: OrderingMode,
     #[serde(default = "default_allowed_lateness_ms")]
     pub allowed_lateness_ms: u64,
+    #[serde(default)]
+    pub channel_uom: Option<String>,
 }
 
 impl ChannelDefinition {
@@ -132,6 +134,7 @@ mod tests {
             mailbox_capacity,
             ordering: OrderingMode::default(),
             allowed_lateness_ms: 5_000,
+            channel_uom: None,
         }
     }
 

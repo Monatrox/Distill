@@ -7,6 +7,7 @@ use super::{
     ErrorEnvelope, EventTestResponse, Json, MessageSchemaDefinition, Path, PublicChannelConfig,
     RouteDecision, SimpleEventRequest, State, StatusCode, classify,
 };
+use tracing::error;
 
 /// Creates a channel from a simple request or preset.
 #[utoipa::path(
@@ -25,8 +26,11 @@ pub(super) async fn post_channel(
     Json(request): Json<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<ChannelConfigResponse>), DistillError> {
     let definition = state.build_channel_definition(&request)?;
-    state.registry.register_channel(definition).await?;
     let channel_id = request.name.clone();
+    if let Err(error) = state.registry.register_channel(definition).await {
+        log_registration_failure(&channel_id, &error);
+        return Err(error);
+    }
     let record = state.registry.channel_record(&channel_id).await?;
     let response = ChannelConfigResponse::from_record(&record);
     Ok((StatusCode::CREATED, Json(response)))
@@ -82,7 +86,10 @@ pub(super) async fn put_channel(
             "path channel_id must match the request body".to_string(),
         ));
     }
-    state.registry.register_channel(definition).await?;
+    if let Err(error) = state.registry.register_channel(definition).await {
+        log_registration_failure(&channel_id, &error);
+        return Err(error);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -283,10 +290,24 @@ pub(super) async fn clone_channel(
         state.registry.exchange_name_prefix, definition.channel_id
     );
     definition.rabbitmq_config.routing_key_prefix = format!("{}.", definition.channel_id);
-    state.registry.register_channel(definition).await?;
-    let record = state.registry.channel_record(&request.channel_id).await?;
+    let target_channel_id = request.channel_id.clone();
+    if let Err(error) = state.registry.register_channel(definition).await {
+        log_registration_failure(&target_channel_id, &error);
+        return Err(error);
+    }
+    let record = state.registry.channel_record(&target_channel_id).await?;
     Ok((
         StatusCode::CREATED,
         Json(ChannelConfigResponse::from_record(&record)),
     ))
+}
+
+fn log_registration_failure(channel_id: &str, error: &DistillError) {
+    error!(
+        event.name = "distill.channel.registration_failed",
+        channel.id = %channel_id,
+        error.code = %error.error_code(),
+        error = %error,
+        "channel registration failed"
+    );
 }

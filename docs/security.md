@@ -11,12 +11,10 @@ This document describes the security boundaries currently implemented by Distill
 
 Distill runs two HTTP listeners:
 
-- The public listener handles ingestion and metrics.
-- The administrative listener handles channel creation, replacement, schema, lifecycle, validation, and test operations.
+- The public listener handles ingestion, metrics, and administrative operations (channel creation, lifecycle, schema, validation, and test operations).
+- The administrative listener handles the same administrative operations on a loopback-only port for local access.
 
-The administrative bind address must be loopback-only. Non-loopback values are rejected during startup. The administrative port is not published by the supplied Compose stack.
-
-The loopback restriction applies to the Distill process network namespace. A reverse proxy, host-level port forward, or service-mesh rule can still expose it if an operator explicitly configures one.
+Administrative operations are guarded by the admin API key on both listeners. The loopback admin listener is retained for direct process access and is never exposed externally.
 
 ### Separate credentials by privilege
 

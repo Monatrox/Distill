@@ -183,7 +183,7 @@ impl AppState {
 }
 
 pub fn public_router(state: AppState) -> Router {
-    let authenticated = authenticated_routes(
+    let ingest_routes = authenticated_routes(
         Router::new()
             .route("/metrics", get(metrics))
             .route("/ingest", post(ingest))
@@ -195,10 +195,30 @@ pub fn public_router(state: AppState) -> Router {
         }),
         &state.http_limits,
     );
+    let admin_routes = authenticated_routes(
+        Router::new()
+            .route("/channels", post(post_channel))
+            .route("/channels/validate", post(validate_channel))
+            .route("/channels/{channel_id}", put(put_channel))
+            .route("/channels/{channel_id}/test", post(test_event))
+            .route("/channels/{channel_id}/config", get(get_channel))
+            .route("/channels/{channel_id}/schema", post(post_schema))
+            .route("/channels/{channel_id}/pause", post(pause_channel))
+            .route("/channels/{channel_id}/resume", post(resume_channel))
+            .route("/channels/{channel_id}/flush", post(flush_channel))
+            .route("/channels/{channel_id}/archive", post(archive_channel))
+            .route("/channels/{channel_id}/clone", post(clone_channel)),
+        Arc::new(AuthGuard {
+            key: (*state.admin_api_key).clone(),
+            failures: Arc::clone(&state.admin_auth_window),
+        }),
+        &state.http_limits,
+    );
     build_router(
         Router::new()
             .route("/health", get(health))
-            .merge(authenticated),
+            .merge(ingest_routes)
+            .merge(admin_routes),
         state,
     )
 }

@@ -5,10 +5,9 @@ namespace Distill.Aspire;
 
 /// Checks that the Distill endpoint is reachable.
 ///
-/// Any HTTP response (including API-level errors like 404 or 400) is treated
-/// as healthy — it proves the server is reachable and responding. Only
-/// transport-level failures (connection refused, DNS resolution failure,
-/// timeout) produce an unhealthy result.
+/// A missing probe channel is treated as healthy because it proves the request
+/// reached Distill. Authentication and service-unavailable responses are
+/// unhealthy because they indicate a configuration or dependency problem.
 public class DistillHealthCheck : IHealthCheck
 {
     private readonly DistillClient client;
@@ -29,10 +28,15 @@ public class DistillHealthCheck : IHealthCheck
             await client.GetChannelAsync("application", cancellationToken);
             return HealthCheckResult.Healthy();
         }
-        catch (DistillApiException)
+        catch (DistillApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            // Any API-level response means the endpoint is reachable.
-            return HealthCheckResult.Healthy();
+            return HealthCheckResult.Healthy("Distill is reachable; the probe channel is not registered.");
+        }
+        catch (DistillApiException ex)
+        {
+            return HealthCheckResult.Unhealthy(
+                $"Distill returned HTTP {(int)ex.StatusCode} ({ex.ErrorCode ?? "UNKNOWN_ERROR"}).",
+                ex);
         }
         catch (Exception ex)
         {

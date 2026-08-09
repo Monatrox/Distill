@@ -81,6 +81,7 @@ mod tests {
             mailbox_capacity: 8,
             ordering: OrderingMode::FirstComeFirstServed,
             allowed_lateness_ms: 5_000,
+            channel_uom: None,
         }
     }
 

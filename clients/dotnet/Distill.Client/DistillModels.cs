@@ -59,6 +59,10 @@ public sealed record CreateChannelRequest
     /// Gets or initializes an optional allowed lateness period in milliseconds.
     [JsonPropertyName("allowed_lateness_ms")]
     public long? AllowedLatenessMilliseconds { get; init; }
+
+    /// Gets or initializes an optional unit of measure for channel values.
+    [JsonPropertyName("channel_uom")]
+    public string? ChannelUom { get; init; }
 }
 
 /// Configures a channel aggregator.
@@ -247,6 +251,10 @@ public sealed record EffectiveChannelConfig
     /// Gets whether a runtime schema is configured.
     [JsonPropertyName("schema_configured")]
     public bool SchemaConfigured { get; init; }
+
+    /// Gets the unit of measure for channel values.
+    [JsonPropertyName("channel_uom")]
+    public string? ChannelUom { get; init; }
 }
 
 /// Reports how a sample event would be handled.

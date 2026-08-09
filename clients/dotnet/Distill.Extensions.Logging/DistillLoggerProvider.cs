@@ -280,13 +280,28 @@ public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalSco
                 continue;
             }
 
-            try
+            // Retry aggressively on 503 (ServiceUnavailable). Distill returns this
+            // when its backend connections (PostgreSQL, RabbitMQ) are not yet ready.
+            var maxAttempts = 10;
+            var attempt = 0;
+            while (attempt < maxAttempts)
             {
-                await client.CreateChannelAsync(request, ct);
-            }
-            catch (Exception ex)
-            {
-                options.ChannelProvisioningFailure?.Invoke(channelId, ex);
+                attempt++;
+                try
+                {
+                    await client.CreateChannelAsync(request, ct);
+                    break; // Success
+                }
+                catch (DistillApiException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < maxAttempts)
+                {
+                    Console.WriteLine($"[DistillLogger] Channel '{channelId}' not yet available (503), retrying ({attempt}/{maxAttempts})...");
+                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
+                }
+                catch (Exception ex)
+                {
+                    options.ChannelProvisioningFailure?.Invoke(channelId, ex);
+                    break; // Non-retryable error
+                }
             }
         }
     }

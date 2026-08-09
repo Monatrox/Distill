@@ -1,6 +1,7 @@
 services:
   rabbitmq:
     image: rabbitmq:3.13-management
+    restart: unless-stopped
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -10,17 +11,37 @@ services:
       timeout: 5s
       retries: 12
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: distill
+      POSTGRES_PASSWORD: distill-dev
+      POSTGRES_DB: logs
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U distill -d logs"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   distill:
     build: .
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
+      RUST_LOG: distill=info,tower_http=debug
       RABBITMQ_URI: amqp://guest:guest@rabbitmq:5672/%2f
-      DISTILL_INGEST_API_KEY: change-me-ingest-in-development
-      DISTILL_ADMIN_API_KEY: change-me-admin-in-development
+      DISTILL_INGEST_API_KEY: dev-key
+      DISTILL_ADMIN_API_KEY: dev-key-admin
       DISTILL_BIND_ADDRESS: 0.0.0.0:8080
       DISTILL_ADMIN_BIND_ADDRESS: 127.0.0.1:8081
+      DISTILL_DEFAULT_SINK_CONNECTION_STRING: postgresql://distill:distill-dev@postgres:5432/logs
       DISTILL_REQUEST_BODY_LIMIT_BYTES: 2097152
       DISTILL_REQUEST_TIMEOUT_SECONDS: 30
       DISTILL_MAX_CONCURRENT_REQUESTS: 128
@@ -41,5 +62,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  postgres_data:
   caddy_data:
   caddy_config:

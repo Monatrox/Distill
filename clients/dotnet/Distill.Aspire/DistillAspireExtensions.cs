@@ -8,16 +8,19 @@ namespace Distill.Aspire;
 public static class DistillResourceBuilderExtensions
 {
     private const int DefaultHttpPort = 8080;
+    private const string RabbitMqImage = "rabbitmq:3.13-management";
+    private const int RabbitMqAmqpPort = 5672;
 
-    /// Adds a Distill resource that launches a container.
+    /// Adds a Distill resource that launches a container with its RabbitMQ dependency.
+    ///
+    /// The integration automatically provisions a RabbitMQ container as a managed
+    /// child resource, wires the <c>RABBITMQ_URI</c> environment variable, and
+    /// ensures Distill starts after RabbitMQ is running. Both containers appear
+    /// in the Aspire dashboard with full log and health visibility.
     ///
     /// Consuming projects reference this resource via <c>.WithReference(distill)</c>
     /// and wire the client with <c>AddDistillClient()</c>. The endpoint is resolved
     /// automatically through Aspire's service discovery.
-    ///
-    /// To use a custom container image, call <c>.WithImage(...)</c> after this method.
-    /// When no image is configured, the integration defaults to a locally-built
-    /// <c>distill:latest</c> image (build it with <c>docker build -t distill:latest .</c>).
     ///
     /// Register sinks via <c>.WithSink(...)</c> before consuming projects reference this resource.
     public static IResourceBuilder<DistillResource> AddDistill(
@@ -29,16 +32,30 @@ public static class DistillResourceBuilderExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         var resource = new DistillResource(name);
-        return builder.AddResource(resource)
+
+        // Create the RabbitMQ container as a managed child resource.
+        var rabbitMq = builder.AddContainer($"{name}-rabbitmq", RabbitMqImage)
+            .WithEndpoint(targetPort: RabbitMqAmqpPort, name: "amqp");
+
+        var amqpEndpoint = rabbitMq.GetEndpoint("amqp");
+        var rabbitMqUri = ReferenceExpression.Create(
+            $"amqp://guest:guest@{amqpEndpoint.Property(EndpointProperty.Host)}:{amqpEndpoint.Property(EndpointProperty.Port)}/%2f");
+
+        var distill = builder.AddResource(resource)
             .WithImage(DistillDefaults.ImageName, DistillDefaults.ImageTag)
             .WithHttpEndpoint(DefaultHttpPort, DefaultHttpPort, "http")
-            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey));
+            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri))
+            .WaitFor(rabbitMq);
+
+        return distill;
     }
 
     /// Adds a Distill resource configured for an externally-running Distill instance.
     ///
-    /// No container is launched. The resource sets <c>Distill__Endpoint</c> and
+    /// No containers are launched. The resource sets <c>Distill__Endpoint</c> and
     /// <c>Distill__ApiKey</c> on consuming projects that use <c>.WithReference(distill)</c>.
+    /// Sinks registered via <c>.WithSink(...)</c> are passed as environment variables
+    /// and work in both container and external-endpoint modes.
     public static IResourceBuilder<DistillResource> AddDistill(
         this IDistributedApplicationBuilder builder,
         string name,
@@ -55,7 +72,7 @@ public static class DistillResourceBuilderExtensions
         };
 
         return builder.AddResource(resource)
-            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey));
+            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri: null));
     }
 
     /// Registers a single sink from a connection-string resource (PostgreSQL, etc.)
@@ -69,8 +86,14 @@ public static class DistillResourceBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(sinkResource);
 
+        var connectionExpression = GetSinkConnectionExpression(sinkResource.Resource);
         builder.Resource.Annotations.Add(new DistillSinkAnnotation(
-            name, driver, sinkResource.Resource.ConnectionStringExpression, IsDefault: true));
+            name, driver, connectionExpression, IsDefault: true));
+
+        // Set the connection string using the direct ReferenceExpression overload
+        // so the DCP resolves it properly at deployment time.
+        builder.WithEnvironment("DISTILL_DEFAULT_SINK_CONNECTION_STRING", connectionExpression);
+
         return builder;
     }
 
@@ -85,11 +108,25 @@ public static class DistillResourceBuilderExtensions
         ArgumentNullException.ThrowIfNull(sinks);
         ArgumentException.ThrowIfNullOrWhiteSpace(driver);
         ArgumentException.ThrowIfNullOrWhiteSpace(defaultSinkName);
+        if (!sinks.ContainsKey(defaultSinkName))
+        {
+            throw new ArgumentException(
+                $"The default sink '{defaultSinkName}' is not present in the sink collection.",
+                nameof(defaultSinkName));
+        }
 
         foreach (var (name, resource) in sinks)
         {
+            var connectionExpression = GetSinkConnectionExpression(resource.Resource);
             builder.Resource.Annotations.Add(new DistillSinkAnnotation(
-                name, driver, resource.Resource.ConnectionStringExpression, name == defaultSinkName));
+                name, driver, connectionExpression, name == defaultSinkName));
+
+            if (name == defaultSinkName)
+            {
+                builder.WithEnvironment(
+                    "DISTILL_DEFAULT_SINK_CONNECTION_STRING",
+                    connectionExpression);
+            }
         }
 
         return builder;
@@ -124,7 +161,6 @@ public static class DistillResourceBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(sinks);
-        ArgumentException.ThrowIfNullOrWhiteSpace(defaultSinkName);
 
         foreach (var (name, spec) in sinks)
         {
@@ -184,7 +220,6 @@ public static class DistillResourceBuilderExtensions
             using var build = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Failed to start docker build. Is Docker installed and running?");
 
-            // Read output in the background to prevent deadlocks
             var output = build.StandardOutput.ReadToEndAsync();
             var errors = build.StandardError.ReadToEndAsync();
 
@@ -252,47 +287,73 @@ public static class DistillResourceBuilderExtensions
     }
 
     private static Action<EnvironmentCallbackContext> ApplyDefaultEnvironment(
-        DistillResource resource, string? apiKey)
+        DistillResource resource,
+        string? apiKey,
+        ReferenceExpression? rabbitMqUri)
     {
         return context =>
         {
+            var env = context.EnvironmentVariables;
+
             if (!string.IsNullOrEmpty(apiKey))
             {
-                context.EnvironmentVariables["DISTILL_INGEST_API_KEY"] = apiKey;
-                context.EnvironmentVariables["DISTILL_ADMIN_API_KEY"] = apiKey;
+                env["DISTILL_INGEST_API_KEY"] = apiKey;
+                env["DISTILL_ADMIN_API_KEY"] = $"{apiKey}-admin";
             }
 
-            context.EnvironmentVariables["DISTILL_BIND_ADDRESS"] = $"0.0.0.0:{DefaultHttpPort}";
-            context.EnvironmentVariables["DISTILL_REQUEST_BODY_LIMIT_BYTES"] = "2097152";
-            context.EnvironmentVariables["DISTILL_REQUEST_TIMEOUT_SECONDS"] = "30";
+            env["DISTILL_BIND_ADDRESS"] = $"0.0.0.0:{DefaultHttpPort}";
+            env["DISTILL_REQUEST_BODY_LIMIT_BYTES"] = "2097152";
+            env["DISTILL_REQUEST_TIMEOUT_SECONDS"] = "30";
 
-            // Forward sink configurations as environment variables
+            if (rabbitMqUri is not null)
+            {
+                env["RABBITMQ_URI"] = rabbitMqUri;
+            }
+
             foreach (var sink in resource.Annotations.OfType<DistillSinkAnnotation>())
             {
                 string prefix = $"DISTILL_SINK__{sink.Name.ToUpperInvariant()}";
-                context.EnvironmentVariables[$"{prefix}__DRIVER"] = sink.Driver;
+                env[$"{prefix}__DRIVER"] = sink.Driver;
 
                 if (sink.ConnectionString is not null)
                 {
-                    context.EnvironmentVariables[$"{prefix}__CONNECTION_STRING"] = sink.ConnectionString;
+                    env[$"{prefix}__CONNECTION_STRING"] = sink.ConnectionString;
                 }
 
                 if (sink.Url is not null)
                 {
-                    context.EnvironmentVariables[$"{prefix}__URL"] = sink.Url.ToString();
+                    env[$"{prefix}__URL"] = sink.Url.ToString();
                 }
 
                 if (sink.BearerToken is not null)
                 {
-                    context.EnvironmentVariables[$"{prefix}__BEARER_TOKEN"] = sink.BearerToken;
+                    env[$"{prefix}__BEARER_TOKEN"] = sink.BearerToken;
                 }
 
                 if (sink.IsDefault)
                 {
-                    context.EnvironmentVariables["DISTILL_DEFAULT_SINK"] = sink.Name;
+                    env["DISTILL_DEFAULT_SINK"] = sink.Name;
                 }
             }
         };
+    }
+
+    private static ReferenceExpression GetSinkConnectionExpression(
+        IResourceWithConnectionString resource)
+    {
+        // Aspire's PostgreSQL resource exposes both an ADO.NET connection string
+        // and a URI. Distill's sqlx PostgreSQL driver requires the URI form.
+        foreach (var property in resource.GetConnectionProperties())
+        {
+            if (string.Equals(property.Key, "Uri", StringComparison.OrdinalIgnoreCase))
+            {
+                return property.Value;
+            }
+        }
+
+        // Keep custom IResourceWithConnectionString implementations working when
+        // they do not expose a URI-specific connection property.
+        return resource.ConnectionStringExpression;
     }
 }
 

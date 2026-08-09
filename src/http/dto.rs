@@ -26,6 +26,8 @@ pub(super) struct CreateChannelRequest {
     pub(super) mailbox_capacity: Option<usize>,
     pub(super) ordering: Option<OrderingMode>,
     pub(super) allowed_lateness_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) channel_uom: Option<String>,
     #[schema(ignore = true)]
     pub(super) aggregator_present: bool,
 }
@@ -63,6 +65,8 @@ pub(super) struct CreateChannelRequestWire {
     pub(super) ordering: Option<OrderingMode>,
     #[serde(default)]
     pub(super) allowed_lateness_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) channel_uom: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for CreateChannelRequest {
@@ -92,6 +96,7 @@ impl<'de> Deserialize<'de> for CreateChannelRequest {
             mailbox_capacity: wire.mailbox_capacity,
             ordering: wire.ordering,
             allowed_lateness_ms: wire.allowed_lateness_ms,
+            channel_uom: wire.channel_uom,
             aggregator_present,
         })
     }
@@ -173,6 +178,7 @@ impl CreateChannelRequest {
             allowed_lateness_ms: self
                 .allowed_lateness_ms
                 .unwrap_or(preset.allowed_lateness_ms),
+            channel_uom: self.channel_uom.clone(),
         })
     }
 }
@@ -364,6 +370,7 @@ pub(super) struct PublicChannelConfig {
     pub(super) mailbox_capacity: usize,
     pub(super) ordering: OrderingMode,
     pub(super) allowed_lateness_ms: u64,
+    pub(super) channel_uom: Option<String>,
     pub(super) schema_configured: bool,
 }
 
@@ -395,6 +402,7 @@ impl PublicChannelConfig {
             mailbox_capacity: definition.mailbox_capacity,
             ordering: definition.ordering,
             allowed_lateness_ms: definition.allowed_lateness_ms,
+            channel_uom: definition.channel_uom.clone(),
             schema_configured: definition.message_schema.is_some(),
         }
     }

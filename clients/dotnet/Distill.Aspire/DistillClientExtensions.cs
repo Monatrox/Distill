@@ -13,8 +13,8 @@ public static class DistillClientExtensions
 {
     /// Adds a Distill client and logging provider to the application.
     ///
-    /// Reads the Distill URI from configuration key <c>Distill__Endpoint</c>
-    /// (or <c>ConnectionStrings__{connectionName}</c> as a fallback), and the
+    /// Reads the Distill URI from <c>ConnectionStrings__{connectionName}</c>
+    /// (or <c>Distill__Endpoint</c> as a fallback), and the
     /// API key from configuration key <c>Distill__ApiKey</c>. Falls back to
     /// <c>http://localhost:8080</c> with an empty API key.
     ///
@@ -29,10 +29,22 @@ public static class DistillClientExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionName);
 
-        Uri endpoint = ResolveEndpoint(builder.Configuration, connectionName);
-        string apiKey = builder.Configuration.GetValue<string>(DistillResource.ApiKeyConfigKey) ?? string.Empty;
+        (Uri endpoint, string endpointSource) = ResolveEndpoint(builder.Configuration, connectionName);
+        string apiKey = builder.Configuration["Distill:ApiKey"]
+            ?? builder.Configuration["Distill__ApiKey"]
+            ?? string.Empty;
+        string? adminApiKey = builder.Configuration["Distill:AdminApiKey"]
+            ?? builder.Configuration["Distill__AdminApiKey"];
 
-        var client = DistillClient.Create(endpoint, apiKey);
+        string? adminEndpoint = builder.Configuration["Distill:AdminEndpoint"]
+            ?? builder.Configuration["Distill__AdminEndpoint"];
+        Console.WriteLine($"[Distill.Aspire] endpoint={DescribeUri(endpoint)} source={endpointSource}");
+        Console.WriteLine($"[Distill.Aspire] adminEndpoint={DescribeEndpoint(adminEndpoint)}");
+        Console.WriteLine(
+            $"[Distill.Aspire] ingestKeyConfigured={!string.IsNullOrWhiteSpace(apiKey)} "
+            + $"adminKeyConfigured={!string.IsNullOrWhiteSpace(adminApiKey)}");
+
+        var client = DistillClient.Create(endpoint, apiKey, adminApiKey, adminEndpoint);
         builder.Services.AddSingleton(client);
         builder.Logging.AddDistill(client, configureOptions);
         builder.Services.AddHealthChecks().AddCheck<DistillHealthCheck>("distill");
@@ -40,20 +52,71 @@ public static class DistillClientExtensions
         return builder;
     }
 
-    private static Uri ResolveEndpoint(IConfiguration configuration, string connectionName)
+    private static (Uri Endpoint, string Source) ResolveEndpoint(
+        IConfiguration configuration,
+        string connectionName)
     {
-        Uri? endpoint = configuration.GetValue<Uri>(DistillResource.EndpointConfigKey);
-        if (endpoint is not null)
-        {
-            return endpoint;
-        }
-
+        // Aspire references are emitted as ConnectionStrings__{name}. Prefer that
+        // value so a stale appsettings.json endpoint cannot bypass service discovery.
         string? connectionString = configuration.GetConnectionString(connectionName);
-        if (!string.IsNullOrWhiteSpace(connectionString) && Uri.TryCreate(connectionString, UriKind.Absolute, out Uri? parsed))
+        if (!string.IsNullOrWhiteSpace(connectionString))
         {
-            return parsed;
+            if (TryCreateHttpUri(connectionString, out Uri? connectionEndpoint))
+            {
+                return (connectionEndpoint!, $"ConnectionStrings:{connectionName}");
+            }
+
+            throw new InvalidOperationException(
+                $"ConnectionStrings:{connectionName} must be an absolute HTTP or HTTPS URI.");
         }
 
-        return new Uri("http://localhost:8080");
+        var endpointValue = configuration["Distill:Endpoint"]
+            ?? configuration["Distill__Endpoint"];
+        if (!string.IsNullOrWhiteSpace(endpointValue))
+        {
+            if (TryCreateHttpUri(endpointValue, out Uri? endpoint))
+            {
+                return (endpoint!, "Distill:Endpoint");
+            }
+
+            throw new InvalidOperationException(
+                "Distill:Endpoint must be an absolute HTTP or HTTPS URI.");
+        }
+
+        return (new Uri("http://localhost:8080"), "fallback");
+    }
+
+    private static bool TryCreateHttpUri(string value, out Uri? uri)
+    {
+        if (Uri.TryCreate(value, UriKind.Absolute, out uri)
+            && (uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        uri = null;
+        return false;
+    }
+
+    private static string DescribeEndpoint(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? "<same-as-ingest>"
+            : Uri.TryCreate(value, UriKind.Absolute, out Uri? uri)
+                ? DescribeUri(uri)
+                : "<invalid>";
+    }
+
+    private static string DescribeUri(Uri uri)
+    {
+        var safeUri = new UriBuilder(uri)
+        {
+            UserName = string.Empty,
+            Password = string.Empty,
+            Query = string.Empty,
+            Fragment = string.Empty
+        }.Uri;
+        return safeUri.AbsoluteUri.TrimEnd('/');
     }
 }

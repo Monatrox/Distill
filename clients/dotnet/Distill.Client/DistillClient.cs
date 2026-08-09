@@ -5,30 +5,79 @@ using System.Text.Json.Serialization;
 
 namespace Distill.Client;
 
-/// Provides a lightweight, dependency-free client for Distill’s HTTP API.
+/// Provides a lightweight, dependency-free client for Distill's HTTP API.
 public sealed class DistillClient
 {
+    private const int MaxDiagnosticBodyLength = 2_048;
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNameCaseInsensitive = true
     };
 
+    private static readonly bool DiagnosticsEnabled = IsDiagnosticsEnabled();
+
     private readonly HttpClient httpClient;
+    private readonly HttpClient? _adminClient;
+    private readonly string? _adminApiKey;
+    private readonly string _ingestApiKey;
 
     /// Initializes a client using an existing HTTP client.
     ///
     /// The supplied client remains owned by the caller. Its base address must point to Distill.
-    public DistillClient(HttpClient httpClient, string apiKey)
+    /// When <paramref name="adminApiKey"/> is provided, administration operations (channel
+    /// management) use it while ingestion uses <paramref name="apiKey"/>. When omitted,
+    /// both use the same key. The <paramref name="adminEndpoint"/> specifies the base URL
+    /// for admin operations (defaults to the same base as the public endpoint).
+    public DistillClient(HttpClient httpClient, string apiKey, string? adminApiKey = null, string? adminEndpoint = null)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
 
         this.httpClient = httpClient;
-        if (!this.httpClient.DefaultRequestHeaders.Contains("X-API-Key"))
+        _ingestApiKey = apiKey;
+
+        if (!string.IsNullOrWhiteSpace(adminApiKey) && !string.Equals(adminApiKey, apiKey, StringComparison.Ordinal))
         {
-            this.httpClient.DefaultRequestHeaders.Add("X-API-Key", apiKey);
+            _adminApiKey = adminApiKey;
         }
+
+        // Create a separate HttpClient for admin operations if a different endpoint is specified.
+        if (!string.IsNullOrWhiteSpace(adminEndpoint))
+        {
+            if (!Uri.TryCreate(adminEndpoint, UriKind.Absolute, out Uri? parsedAdminEndpoint)
+                || !IsHttpUri(parsedAdminEndpoint))
+            {
+                throw new ArgumentException(
+                    "The admin endpoint must be an absolute HTTP or HTTPS URI.",
+                    nameof(adminEndpoint));
+            }
+
+            _adminClient = new HttpClient { BaseAddress = parsedAdminEndpoint };
+        }
+
+        if (_adminApiKey is null && _adminClient is null)
+        {
+            // Single-key mode: set the key on default headers.
+            if (!this.httpClient.DefaultRequestHeaders.Contains("X-API-Key"))
+            {
+                this.httpClient.DefaultRequestHeaders.Add("X-API-Key", apiKey);
+            }
+        }
+
+        DebugLog(
+            $"configured ingestEndpoint={DescribeUri(httpClient.BaseAddress)} "
+            + $"adminEndpoint={DescribeUri(_adminClient?.BaseAddress)} "
+            + $"ingestKeyConfigured=true adminKeyConfigured={_adminApiKey is not null} "
+            + $"mode={(_adminApiKey is null && _adminClient is null ? "single" : "split")}");
+    }
+
+    /// Creates a client with a new HTTP client configured for the given Distill address.
+    public static DistillClient Create(Uri baseAddress, string apiKey, string? adminApiKey = null, string? adminEndpoint = null)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        return new DistillClient(new HttpClient { BaseAddress = baseAddress }, apiKey, adminApiKey, adminEndpoint);
     }
 
     /// Creates a client with a new HTTP client configured for the given Distill address.
@@ -50,12 +99,11 @@ public sealed class DistillClient
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channelId);
         ArgumentNullException.ThrowIfNull(definition);
-        using HttpResponseMessage response = await httpClient.PutAsJsonAsync(
+        await SendAsync<object?>(
+            HttpMethod.Put,
             $"channels/{Uri.EscapeDataString(channelId)}",
             definition,
-            JsonOptions,
             cancellationToken);
-        await EnsureSuccessAsync(response, cancellationToken);
     }
 
     /// Creates a channel from a preset and optional overrides.
@@ -177,22 +225,61 @@ public sealed class DistillClient
             request.Content = JsonContent.Create(content, options: JsonOptions);
         }
 
-        using HttpResponseMessage response = await httpClient.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken);
-        await EnsureSuccessAsync(response, cancellationToken);
-        if (response.StatusCode == HttpStatusCode.NoContent)
+        var isAdmin = IsAdminRoute(requestUri);
+        var route = isAdmin ? "admin" : "ingest";
+        HttpClient client = httpClient;
+
+        // When split authentication or an admin endpoint is active, select the
+        // key and client per route. In particular, /channels/{id}/events is an
+        // ingestion route even though it shares the /channels prefix.
+        if (_adminApiKey is not null || _adminClient is not null)
         {
-            return default;
+            var apiKey = isAdmin ? _adminApiKey ?? _ingestApiKey : _ingestApiKey;
+            request.Headers.TryAddWithoutValidation("X-API-Key", apiKey);
+            client = isAdmin && _adminClient is not null ? _adminClient : httpClient;
         }
 
-        return await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+        var target = DescribeTarget(client, request.RequestUri);
+        DebugLog($"request method={method.Method} target={target} route={route}");
+
+        try
+        {
+            using HttpResponseMessage response = await client.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+            DebugLog(
+                $"response method={method.Method} target={target} route={route} "
+                + $"status={(int)response.StatusCode} contentType={response.Content.Headers.ContentType?.MediaType ?? "<none>"} "
+                + $"server={GetHeaderValue(response, "Server")}");
+
+            await EnsureSuccessAsync(response, cancellationToken, method, target, route);
+            if (response.StatusCode == HttpStatusCode.NoContent)
+            {
+                return default;
+            }
+
+            return await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)
+        {
+            if (!(ex is TaskCanceledException && cancellationToken.IsCancellationRequested))
+            {
+                DebugLog(
+                    $"transport failure method={method.Method} target={target} route={route} "
+                    + $"exception={ex.GetType().Name}: {ex.Message}");
+            }
+
+            throw;
+        }
     }
 
     private static async Task EnsureSuccessAsync(
         HttpResponseMessage response,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        HttpMethod method,
+        string target,
+        string route)
     {
         if (response.IsSuccessStatusCode)
         {
@@ -200,6 +287,9 @@ public sealed class DistillClient
         }
 
         string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        DebugLog(
+            $"error body method={method.Method} target={target} route={route} "
+            + $"body={TruncateForDiagnostics(body)}");
         string? errorCode = null;
         try
         {
@@ -215,5 +305,81 @@ public sealed class DistillClient
         }
 
         throw new DistillApiException(response.StatusCode, errorCode, body);
+    }
+
+    private static bool IsAdminRoute(string requestUri)
+    {
+        var path = requestUri;
+        var queryStart = path.IndexOf('?');
+        if (queryStart >= 0)
+        {
+            path = path[..queryStart];
+        }
+
+        path = path.TrimStart('/');
+        return path.Equals("channels", StringComparison.OrdinalIgnoreCase)
+            || (path.StartsWith("channels/", StringComparison.OrdinalIgnoreCase)
+                && !path.EndsWith("/events", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsHttpUri(Uri uri) =>
+        uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+        || uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDiagnosticsEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("DISTILL_CLIENT_DEBUG");
+        return value is not null
+            && (value.Equals("1", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("on", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void DebugLog(string message)
+    {
+        if (DiagnosticsEnabled)
+        {
+            Console.Error.WriteLine($"[DistillClient] {message}");
+        }
+    }
+
+    private static string DescribeTarget(HttpClient client, Uri? requestUri) =>
+        requestUri is null
+            ? "<unknown>"
+            : requestUri.IsAbsoluteUri
+                ? DescribeUri(requestUri)
+                : client.BaseAddress is null
+                    ? requestUri.ToString()
+                    : DescribeUri(new Uri(client.BaseAddress, requestUri));
+
+    private static string DescribeUri(Uri? uri)
+    {
+        if (uri is null)
+        {
+            return "<not-configured>";
+        }
+
+        var safeUri = new UriBuilder(uri)
+        {
+            UserName = string.Empty,
+            Password = string.Empty,
+            Query = string.Empty,
+            Fragment = string.Empty
+        }.Uri;
+        return safeUri.AbsoluteUri.TrimEnd('/');
+    }
+
+    private static string GetHeaderValue(HttpResponseMessage response, string headerName) =>
+        response.Headers.TryGetValues(headerName, out var values)
+            ? string.Join(",", values)
+            : "<none>";
+
+    private static string TruncateForDiagnostics(string value)
+    {
+        var normalized = value.Replace("\r", "\\r").Replace("\n", "\\n");
+        return normalized.Length <= MaxDiagnosticBodyLength
+            ? normalized
+            : normalized[..MaxDiagnosticBodyLength] + "…";
     }
 }
