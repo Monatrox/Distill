@@ -11,7 +11,7 @@
 This consolidated planning document captures the complete design specification for building a Rust-based hot-path logging aggregator with:
 - **Dynamic channel creation** without redeployment
 - **Per-channel autonomy** (thresholds, destinations, aggregation rules)
-- **Intelligent rolling aggregates** with configurable ordering modes
+- **PostgreSQL-backed rolling aggregates** with configurable ordering modes
 - **Memory-safe buffering** with safe owner-local queues, bounded per-channel buffers, and a process-wide v1 budget
 
 ### All Decisions Confirmed ✅
@@ -43,7 +43,7 @@ A dynamic, hot-path logging aggregator built in Rust where different log categor
 **Internal Components:**
 1. **Hot Path Engine** - Rust core processing messages at minimum latency
 2. **Channel Manager** - Dynamically creates/manages bounded per-channel actors on one Tokio runtime
-3. **Aggregation Engine** - Computes rolling aggregates for events that do not require raw persistence
+3. **Aggregation Engine** - Computes aggregates for events that do not require raw persistence; rolling mode requires PostgreSQL
 4. **Schema Registry** - Generates and validates Protobuf schemas on-the-fly
 
 ### Key Design Principles
@@ -168,7 +168,7 @@ Rolling average formula: `(old_avg × old_count + avg(new_events) × new_count) 
 
 The v1 aggregation functions are `average`, `average_duration_between_events`, `max`, `min`, `sum`, and `count`. `average` with `overall` granularity computes the numeric average of every input in the active overall window. `count` with `overall` granularity computes the total event count in that window. Conditional count is intentionally deferred until a predicate representation and evaluation policy are selected.
 
-Aggregators may set `rolling: true` to merge successive flush windows into one expanding aggregate record. Rolling records retain their original `window_start`, advance `window_end`, and use stable aggregate-series identifiers so state survives service restarts. Duration aggregates use custom metadata for interval totals and first/last event timestamps, including the interval crossing adjacent windows. A changed aggregator identity starts a new rolling series.
+PostgreSQL-backed aggregators may set `rolling: true` to merge successive flush windows into one expanding aggregate record. Other v1 sinks reject rolling mode. Rolling records retain their original `window_start`, advance `window_end`, and use stable aggregate-series identifiers so state survives service restarts. Duration aggregates use custom metadata for interval totals and first/last event timestamps, including the interval crossing adjacent windows. A changed aggregator identity starts a new rolling series.
 
 ---
 

@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Net;
 using System.Threading.Channels;
 using Distill.Client;
 using Microsoft.Extensions.Logging;
@@ -160,14 +159,6 @@ public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalSco
     {
         try
         {
-            await ValidateAndCreateChannelsAsync();
-        }
-        catch
-        {
-        }
-
-        try
-        {
             var signalReader = wakeSignal.Reader;
             while (await signalReader.WaitToReadAsync(shutdown.Token))
             {
@@ -227,80 +218,6 @@ public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalSco
                 }
                 catch
                 {
-                }
-            }
-        }
-    }
-
-    private async Task ValidateAndCreateChannelsAsync()
-    {
-        var channels = new HashSet<string>(StringComparer.Ordinal) { options.DefaultChannel };
-
-        if (options.ChannelOptions is not null)
-        {
-            foreach (var key in options.ChannelOptions.Keys)
-            {
-                channels.Add(key);
-            }
-        }
-
-        foreach (var channelId in channels)
-        {
-            CancellationToken ct = shutdown.Token;
-
-            try
-            {
-                var config = await client.GetChannelAsync(channelId, ct);
-                if (config is not null)
-                {
-                    continue;
-                }
-            }
-            catch (DistillApiException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-            }
-            catch
-            {
-                continue;
-            }
-
-            var channelOpts = options.GetChannelOptions(channelId);
-            CreateChannelRequest? request = null;
-            if (channelOpts.ChannelFactory is not null)
-            {
-                request = channelOpts.ChannelFactory();
-            }
-            else if (options.ChannelFactory is not null)
-            {
-                request = options.ChannelFactory(channelId);
-            }
-
-            if (request is null)
-            {
-                continue;
-            }
-
-            // Retry aggressively on 503 (ServiceUnavailable). Distill returns this
-            // when its backend connections (PostgreSQL, RabbitMQ) are not yet ready.
-            var maxAttempts = 10;
-            var attempt = 0;
-            while (attempt < maxAttempts)
-            {
-                attempt++;
-                try
-                {
-                    await client.CreateChannelAsync(request, ct);
-                    break; // Success
-                }
-                catch (DistillApiException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < maxAttempts)
-                {
-                    Console.WriteLine($"[DistillLogger] Channel '{channelId}' not yet available (503), retrying ({attempt}/{maxAttempts})...");
-                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
-                }
-                catch (Exception ex)
-                {
-                    options.ChannelProvisioningFailure?.Invoke(channelId, ex);
-                    break; // Non-retryable error
                 }
             }
         }

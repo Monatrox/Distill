@@ -39,9 +39,6 @@ public sealed class DistillLoggerOptions
     /// Gets or sets category-specific minimum log levels.
     public Dictionary<string, LogLevel> CategoryLevels { get; set; } = new(StringComparer.Ordinal);
 
-    /// Gets or sets a factory that creates a channel definition for a given channel name.
-    public Func<string, CreateChannelRequest>? ChannelFactory { get; set; }
-
     /// Gets or sets a callback invoked after a batch exhausts its retry attempts.
     public Action<DeliveryFailureContext>? DeliveryFailure { get; set; }
 
@@ -50,9 +47,6 @@ public sealed class DistillLoggerOptions
 
     /// Gets or sets a callback invoked when the channel resolver returns null or whitespace.
     public Action<string, string>? ChannelResolutionFailed { get; set; }
-
-    /// Gets or sets a callback invoked when automatic channel provisioning fails.
-    public Action<string, Exception>? ChannelProvisioningFailure { get; set; }
 
     internal void Validate()
     {
@@ -128,7 +122,6 @@ public sealed class PerChannelOptions
     public int? QueueCapacity { get; set; }
     public DistillOverflowPolicy? OverflowPolicy { get; set; }
     public LogLevel? MinimumLevel { get; set; }
-    public Func<CreateChannelRequest>? ChannelFactory { get; set; }
 }
 
 /// Context provided to the delivery-failure callback.

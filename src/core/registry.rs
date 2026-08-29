@@ -56,6 +56,7 @@ pub(crate) struct ChannelRecord {
 pub(crate) struct ChannelRegistry {
     channels: Arc<RwLock<HashMap<String, ChannelRecord>>>,
     sinks: Arc<RwLock<HashMap<String, Arc<dyn Sink>>>>,
+    sink_drivers: HashMap<String, String>,
     schemas: SchemaRegistry,
     consumer: Arc<RabbitConsumer>,
     rabbit: RabbitPublisher,
@@ -91,6 +92,7 @@ impl ChannelRegistry {
             .await?,
         );
         let sinks = Arc::new(RwLock::new(HashMap::new()));
+        let mut sink_drivers = HashMap::new();
         let mut default_sink_id = None;
         if let Some(path) = &settings.sinks_config_path {
             let contents = tokio::fs::read_to_string(path)
@@ -100,8 +102,10 @@ impl ChannelRegistry {
             default_sink_id = sink_file.default_sink_id;
             for definition in sink_file.sinks {
                 let sink_config = config::resolve_sink(&definition)?;
+                let sink_id = definition.sink_id;
                 let sink = build_sink(&sink_config, &settings.sink_allowlist).await?;
-                sinks.write().await.insert(definition.sink_id, sink);
+                sink_drivers.insert(sink_id.clone(), sink_config.driver);
+                sinks.write().await.insert(sink_id, sink);
             }
         }
         for (sink_id, sink_config) in &settings.environment_sinks {
@@ -109,6 +113,7 @@ impl ChannelRegistry {
                 anyhow::bail!("sink '{sink_id}' is configured more than once");
             }
             let sink = build_sink(sink_config, &settings.sink_allowlist).await?;
+            sink_drivers.insert(sink_id.clone(), sink_config.driver.clone());
             sinks.write().await.insert(sink_id.clone(), sink);
         }
         if settings.environment_default_sink_id.is_some() {
@@ -122,6 +127,7 @@ impl ChannelRegistry {
         let registry = Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             sinks,
+            sink_drivers,
             schemas: SchemaRegistry::default(),
             consumer,
             rabbit,
@@ -176,6 +182,18 @@ impl ChannelRegistry {
             .validate()
             .map_err(DistillError::InvalidConfiguration)?;
         let channel_id = definition.channel_id.clone();
+        let sink_driver = if let Some(sink_id) = &definition.sink_id {
+            self.sink_drivers.get(sink_id).ok_or_else(|| {
+                DistillError::InvalidConfiguration(format!(
+                    "channel '{channel_id}' references undefined sink '{sink_id}'"
+                ))
+            })?
+        } else {
+            &definition.sink_config.driver
+        };
+        definition
+            .validate_for_sink(sink_driver)
+            .map_err(DistillError::InvalidConfiguration)?;
         {
             let channels = self.channels.read().await;
             if self.max_channels > 0

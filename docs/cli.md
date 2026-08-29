@@ -169,8 +169,7 @@ Channels should reference a sink by name, or omit the reference to use `default_
         "exchange_name": "distill.orders.production",
         "routing_key_prefix": "orders."
       },
-      "aggregator": null,
-      "retention_hours": 720
+      "aggregator": null
     }
   ]
 }

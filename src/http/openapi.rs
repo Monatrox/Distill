@@ -6,16 +6,19 @@
 
 // Rust guideline compliant 2026-02-21
 
+use super::dto::{
+    ChannelConfigResponse, ChannelPreset, ChannelValidationResponse, CloneChannelRequest,
+    CreateChannelRequest, EventTestResponse, IngestItemError, IngestResponse, PublicChannelConfig,
+    SimpleEventRequest,
+};
 use super::{
+    ChannelLifecycle,
     channels::{
         __path_archive_channel, __path_clone_channel, __path_flush_channel, __path_get_channel,
         __path_pause_channel, __path_post_channel, __path_post_schema, __path_put_channel,
         __path_resume_channel, __path_test_event, __path_validate_channel,
     },
-    ingest::{
-        __path_health, __path_ingest, __path_metrics, __path_otlp_logs, __path_post_event,
-    },
-    ChannelLifecycle,
+    ingest::{__path_health, __path_ingest, __path_metrics, __path_otlp_logs, __path_post_event},
 };
 use crate::{
     core::errors::{ErrorCode, ErrorEnvelope},
@@ -23,11 +26,6 @@ use crate::{
         AggregationFunction, AggregatorSpec, ChannelDefinition, Granularity, LogEvent,
         MessageSchemaDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig,
     },
-};
-use super::dto::{
-    ChannelConfigResponse, ChannelPreset, ChannelValidationResponse, CloneChannelRequest,
-    CreateChannelRequest, EventTestResponse, IngestItemError, IngestResponse,
-    PublicChannelConfig, SimpleEventRequest,
 };
 use utoipa::OpenApi;
 
@@ -91,7 +89,8 @@ pub(super) struct ApiDocumentation;
 
 /// Builds the Swagger UI router exposing the contract at `/openapi.json`.
 pub(super) fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
-    utoipa_swagger_ui::SwaggerUi::new("/swagger-ui").url("/openapi.json", ApiDocumentation::openapi())
+    utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
+        .url("/openapi.json", ApiDocumentation::openapi())
 }
 
 #[cfg(test)]

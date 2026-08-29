@@ -113,8 +113,8 @@ pub struct ChannelDefinition {
     pub message_schema: MessageSchemaDef,
     
     // Optional metadata
-    pub retention_hours: Option<u32>,     // TTL for aggregated data
-    pub compression_enabled: bool,        // gzip/compress on persist
+    pub retention_hours: Option<u32>,     // unsupported in v1; rejected when set
+    pub compression_enabled: bool,        // unsupported in v1; rejected when true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,7 +122,7 @@ pub struct AggregatorSpec {
     pub function: AggregationFunction,    // average, average_duration_between_events, max, min, sum, count
     pub granularity: GranularityType,     // per_N_events, per_T_time, overall
     pub params: AggregatorParams,         // N count, T duration, etc.
-    pub rolling: bool,                    // merge windows into one expanding aggregate record
+    pub rolling: bool,                    // PostgreSQL only: merge windows into one expanding aggregate record
 }
 
 #[derive(Protobuf)]

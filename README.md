@@ -27,7 +27,7 @@ Distill lets you decide, channel by channel, what deserves a permanent seat at t
 
 - Keep every error and critical event for investigation.
 - Preserve warnings while turning routine activity into compact counts.
-- Track latency, size, temperature, or throughput with rolling averages.
+- Track latency, size, temperature, or throughput with PostgreSQL-backed rolling averages.
 - Measure the minimum, maximum, sum, or average of a numeric property.
 - Calculate the average time between events.
 - Store everything for an audit stream when completeness matters more than compression.
@@ -225,8 +225,6 @@ $channel = @'
     "parameter": 60,
     "rolling": false
   },
-  "retention_hours": 720,
-  "compression_enabled": false,
   "buffer_bytes": 52428800,
   "ttl_seconds": 3600,
   "mailbox_capacity": 1024,
@@ -258,8 +256,7 @@ Then create a channel with only its intent and any overrides you need:
 ```powershell
 $request = '{
   "name": "checkout.latency",
-  "preset": "metrics",
-  "retention_hours": 720
+  "preset": "metrics"
 }'
 
 Invoke-RestMethod `
@@ -270,7 +267,7 @@ Invoke-RestMethod `
   -Body $request
 ```
 
-Available presets are `raw_events`, `errors_only`, `metrics`, `audit`, and `count`. Presets are starting points, not restrictions: send `severity_threshold`, `aggregator`, buffering, ordering, retention, or other supported properties to override them. Set `"aggregator": null` explicitly when a preset’s aggregation should be disabled.
+Available presets are `raw_events`, `errors_only`, `metrics`, `audit`, and `count`. Presets are starting points, not restrictions: send `severity_threshold`, `aggregator`, buffering, ordering, or other supported properties to override them. Set `"aggregator": null` explicitly when a preset’s aggregation should be disabled. Startup configuration is supported v1 workflow; runtime channel changes are ephemeral and disappear after restart.
 
 Use `POST /channels/validate` with the same request shape to resolve and validate a channel without registering it.
 
@@ -536,8 +533,6 @@ Startup configuration uses this shape:
       },
       "sink_id": "postgres-primary",
       "aggregator": null,
-      "retention_hours": 2160,
-      "compression_enabled": false,
       "buffer_bytes": 52428800,
       "ttl_seconds": 3600,
       "mailbox_capacity": 1024,

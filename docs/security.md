@@ -52,7 +52,7 @@ DNS is resolved when the sink is built (channel registration). Allowlisted hostn
 
 ### Channel resource settings have hard upper bounds
 
-Channel definitions enforce hard maximums: `buffer_bytes` at 256 MiB, `mailbox_capacity` at 65,536, `ttl_seconds` at 24 hours, `retention_hours` at 900 days, channel identifiers at 128 characters, and decoded schema descriptors at 1 MiB. The total registered channel count defaults to 500 and is configurable with `DISTILL_MAX_CHANNELS` (use 0 to disable).
+Channel definitions enforce hard maximums: `buffer_bytes` at 256 MiB, `mailbox_capacity` at 65,536, `ttl_seconds` at 24 hours, channel identifiers at 128 characters, and decoded schema descriptors at 1 MiB. `retention_hours` and enabled `compression_enabled` are unsupported in v1 and rejected. The total registered channel count defaults to 500 and is configurable with `DISTILL_MAX_CHANNELS` (use 0 to disable).
 
 ### Request resource controls are bounded by default
 

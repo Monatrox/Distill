@@ -77,9 +77,9 @@ impl DistillError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::InvalidRequest(_) | Self::SchemaValidation(_) | Self::UnsupportedApiVersion(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::InvalidRequest(_)
+            | Self::SchemaValidation(_)
+            | Self::UnsupportedApiVersion(_) => StatusCode::BAD_REQUEST,
             Self::ChannelNotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidConfiguration(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BufferFull(_) | Self::Persistence(_) => StatusCode::SERVICE_UNAVAILABLE,

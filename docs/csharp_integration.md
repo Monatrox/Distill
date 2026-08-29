@@ -287,29 +287,9 @@ options.DeliveryFailure = context =>
 };
 ```
 
-### 4.7 Auto-channel creation
+### 4.7 Channel provisioning
 
-The provider validates channels at startup and can create missing channels automatically:
-
-```csharp
-// Global factory — receives the channel ID
-options.ChannelFactory = channelId => new CreateChannelRequest
-{
-    Name = channelId,
-    Preset = "raw_events"
-};
-
-// Per-channel factory — overrides the global one for specific channels
-options.ChannelOptions["errors.critical"].ChannelFactory = () => new CreateChannelRequest
-{
-    Name = "errors.critical",
-    Preset = "errors_only"
-};
-
-// Observe provisioning failures
-options.ChannelProvisioningFailure =
-    (channelId, ex) => Console.Error.WriteLine($"Failed to provision '{channelId}': {ex.Message}");
-```
+Provision channels through Aspire or startup configuration. The logging provider uses ingest credentials only and never probes or creates channels.
 
 ### 4.8 Batching and retries
 
@@ -460,7 +440,7 @@ Supported v1 aggregators:
 
 Granularity options: `overall`, `per_n_events` (with `parameter`), `per_t_time` (with `parameter` in seconds).
 
-Add `"rolling": true` to merge windows into one expanding aggregate record.
+Add `"rolling": true` only for PostgreSQL sinks to merge windows into one expanding aggregate record. Other v1 sinks reject rolling aggregates.
 
 ### 7.3 Aggregation and severity together
 

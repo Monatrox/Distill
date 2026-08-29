@@ -63,12 +63,12 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Minimal resolution:**
 
-1. For v1, make Aspire/startup configuration the source of truth and provision all channels at startup.
-2. Disable or clearly mark runtime mutation as ephemeral unless a durable control-plane store is added.
-3. Restore channel definitions and sink mappings before starting RabbitMQ consumption.
+1. For v1, document Aspire/startup configuration as supported channel provisioning workflow.
+2. Keep runtime channel mutation, but clearly mark it ephemeral unless a durable control-plane store is added.
+3. Restore startup channel definitions and sink mappings before starting RabbitMQ consumption.
 4. Add restart tests with queued messages and lifecycle changes.
 
-**Done when:** Restart restores every supported channel before queued delivery resumes.
+**Done when:** Restart restores every startup-configured channel before queued delivery resumes; runtime channel and lifecycle mutations are documented as ephemeral.
 
 ### 4. RabbitMQ consumer does not recover after connection failure
 
@@ -127,7 +127,7 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 2. Document HTTP aggregate delivery as non-rolling window records for v1.
 3. Later, define an explicit HTTP rolling upsert/merge contract and port PostgreSQL merge semantics to other database drivers.
 
-**Done when:** Every advertised driver/mode passes the same rolling-aggregate contract tests, and HTTP receivers can distinguish retries from later aggregate revisions.
+**Done when:** Rolling aggregates are rejected for every non-PostgreSQL sink, and PostgreSQL rolling-aggregate contract tests pass.
 
 ### 8. Retention and compression settings have no behavior
 
@@ -610,3 +610,16 @@ Production-ready v1 should not ship until all items below pass:
 - [ ] NuGet packages pack, install, and run from a clean local feed.
 - [ ] Rust and .NET tests, formatting, linting, vulnerability scans, package builds, image build, and end-to-end test pass in CI.
 - [ ] Documentation describes only implemented and tested v1 behavior.
+
+## Implementation order
+
+Work in this order to avoid implementing behavior that v1 later removes:
+
+1. **Lock v1 surface first** — blockers 3, 7, 8, and 22. Startup/Aspire is supported channel provisioning workflow; runtime channel mutations remain documented as ephemeral; PostgreSQL-only rolling aggregates; reject retention/compression; no logger self-provisioning. *In progress: scope and validation complete; startup recovery testing remains.*
+2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types.
+3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, replay.
+4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; transactional replacement; explicit migrations.
+5. **Ship golden path** — blockers 13, 15, 16, and 32. Versioned image, RabbitMQ persistence/credentials, Aspire sample plus end-to-end test, Azure publish docs.
+6. **Release guardrails and docs** — blockers 33–39. Run blocker 37 now; package metadata/pack fix; CI gates; contract checks; remove stale claims.
+
+Build tests with each phase. Phase 5 golden-path test becomes release gate in phase 6.

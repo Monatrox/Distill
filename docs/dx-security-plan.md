@@ -22,7 +22,7 @@ Constants in `src/domain/mod.rs:73`:
 | `buffer_bytes` | 256 MiB | Half the 512 MiB process budget |
 | `mailbox_capacity` | 65,536 | Bounds mpsc channel allocation |
 | `ttl_seconds` | 86,400 (24h) | Prevents never-flush configurations |
-| `retention_hours` | 21,600 (900 days) | Generous ceiling for on-demand logging |
+| `retention_hours` | Unsupported in v1 | Rejected until retention jobs/policies exist |
 | `channel_id` | 128 chars | Bounds broker topology names |
 
 Enforced in `ChannelDefinition::validate()` (`src/domain/channel.rs:44`). Global channel count defaults to 500, configurable via `DISTILL_MAX_CHANNELS` (0 = disabled), checked in `ChannelRegistry::register_channel()` (`src/core/registry.rs:150`). Schema descriptor limit: 1 MiB decoded in `SchemaRegistry::register()` (`src/core/schema.rs:44`).

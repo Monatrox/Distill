@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{
-    AggregatorSpec, MAX_BUFFER_BYTES, MAX_CHANNEL_ID_LENGTH, MAX_MAILBOX_CAPACITY,
-    MAX_RETENTION_HOURS, MAX_TTL_SECONDS, OrderingMode, SeverityLevel, SinkConfig,
-    default_allowed_lateness_ms, default_buffer_bytes, default_mailbox_capacity,
-    default_ttl_seconds,
+    AggregatorSpec, MAX_BUFFER_BYTES, MAX_CHANNEL_ID_LENGTH, MAX_MAILBOX_CAPACITY, MAX_TTL_SECONDS,
+    OrderingMode, SeverityLevel, SinkConfig, default_allowed_lateness_ms, default_buffer_bytes,
+    default_mailbox_capacity, default_ttl_seconds,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -71,19 +70,29 @@ impl ChannelDefinition {
         if self.ttl_seconds > MAX_TTL_SECONDS {
             return Err(format!("ttl_seconds must not exceed {MAX_TTL_SECONDS}"));
         }
-        if self
-            .retention_hours
-            .is_some_and(|hours| hours > MAX_RETENTION_HOURS)
-        {
-            return Err(format!(
-                "retention_hours must not exceed {MAX_RETENTION_HOURS}"
-            ));
+        if self.retention_hours.is_some() {
+            return Err("retention_hours is not supported in v1".to_string());
+        }
+        if self.compression_enabled {
+            return Err("compression_enabled is not supported in v1".to_string());
         }
         if self.sink_id.is_none() {
-            self.sink_config.validate()
-        } else {
-            Ok(())
+            self.sink_config.validate()?;
+            self.validate_for_sink(&self.sink_config.driver)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_sink(&self, sink_driver: &str) -> Result<(), String> {
+        if self
+            .aggregator
+            .as_ref()
+            .is_some_and(|aggregator| aggregator.rolling)
+            && sink_driver != "postgres"
+        {
+            return Err("rolling aggregates require a PostgreSQL sink in v1".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -104,7 +113,10 @@ pub struct MessageSchemaDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig};
+    use super::{
+        AggregatorSpec, ChannelDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig,
+    };
+    use crate::domain::{AggregationFunction, Granularity};
 
     fn definition(
         buffer_bytes: usize,
@@ -162,15 +174,30 @@ mod tests {
     }
 
     #[test]
-    fn bounds_reject_excessive_channel_identifier_and_retention() {
-        let mut long = definition(1_024, 1_024, 3_600);
-        long.channel_id = "a".repeat(super::MAX_CHANNEL_ID_LENGTH + 1);
-        assert!(long.validate().is_err());
+    fn unsupported_v1_features_are_rejected() {
+        let mut definition = definition(1_024, 1_024, 3_600);
+        definition.retention_hours = Some(1);
+        assert!(definition.validate().is_err());
 
-        let mut retention = definition(1_024, 1_024, 3_600);
-        retention.retention_hours = Some(super::MAX_RETENTION_HOURS + 1);
-        assert!(retention.validate().is_err());
-        retention.retention_hours = Some(super::MAX_RETENTION_HOURS);
-        assert!(retention.validate().is_ok());
+        definition.retention_hours = None;
+        definition.compression_enabled = true;
+        assert!(definition.validate().is_err());
+
+        definition.compression_enabled = false;
+        definition.aggregator = Some(AggregatorSpec {
+            function: AggregationFunction::Count,
+            granularity: Granularity::Overall,
+            parameter: None,
+            rolling: true,
+        });
+        assert!(definition.validate_for_sink("postgres").is_ok());
+        assert!(definition.validate_for_sink("http").is_err());
+    }
+
+    #[test]
+    fn bounds_reject_excessive_channel_identifier() {
+        let mut definition = definition(1_024, 1_024, 3_600);
+        definition.channel_id = "a".repeat(super::MAX_CHANNEL_ID_LENGTH + 1);
+        assert!(definition.validate().is_err());
     }
 }

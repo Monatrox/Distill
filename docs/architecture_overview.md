@@ -19,7 +19,7 @@ A dynamic, hot-path logging aggregator built in Rust where different log categor
 
 1. **Hot Path Engine** - Rust core processing messages at minimum latency
 2. **Channel Manager** - Dynamically creates/manages bounded channel actors and their state
-3. **Aggregation Engine** - Computes rolling aggregates for all events in configured channels
+3. **Aggregation Engine** - Computes aggregates for configured channels; rolling mode requires PostgreSQL
 4. **Schema Registry** - Loads, caches, and validates runtime Protobuf descriptors
 
 ---

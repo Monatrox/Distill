@@ -661,7 +661,6 @@ For example:
 {
   "name": "orders.production",
   "preset": "raw-events",
-  "retention_hours": 720,
   "buffer_bytes": 104857600
 }
 ```
