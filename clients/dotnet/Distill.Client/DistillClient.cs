@@ -106,6 +106,12 @@ public sealed class DistillClient
             cancellationToken);
     }
 
+    /// Checks whether Distill has an active sink-backed channel.
+    public async Task CheckHealthAsync(CancellationToken cancellationToken = default)
+    {
+        _ = await SendAsync<object?>(HttpMethod.Get, "health", content: null, cancellationToken);
+    }
+
     /// Creates a channel from a preset and optional overrides.
     public Task<ChannelConfigResponse?> CreateChannelAsync(
         CreateChannelRequest request,
@@ -254,7 +260,8 @@ public sealed class DistillClient
                 + $"server={GetHeaderValue(response, "Server")}");
 
             await EnsureSuccessAsync(response, cancellationToken, method, target, route);
-            if (response.StatusCode == HttpStatusCode.NoContent)
+            if (response.StatusCode == HttpStatusCode.NoContent
+                || response.Content.Headers.ContentLength == 0)
             {
                 return default;
             }

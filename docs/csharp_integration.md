@@ -362,7 +362,7 @@ var distill = builder.AddDistill("distill",
 var postgres = builder.AddPostgres("pg").AddDatabase("distill");
 
 var distill = builder.AddDistill("distill", apiKey: "dev-key")
-    .WithLocalBuild()          // builds distil:latest from repo Dockerfile
+    .WithLocalBuild()          // Aspire builds distill:latest with Docker or Podman
     .WithSink(postgres);       // single sink → becomes default
 ```
 

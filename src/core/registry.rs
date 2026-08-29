@@ -104,6 +104,21 @@ impl ChannelRegistry {
                 sinks.write().await.insert(definition.sink_id, sink);
             }
         }
+        for (sink_id, sink_config) in &settings.environment_sinks {
+            if sinks.read().await.contains_key(sink_id) {
+                anyhow::bail!("sink '{sink_id}' is configured more than once");
+            }
+            let sink = build_sink(sink_config, &settings.sink_allowlist).await?;
+            sinks.write().await.insert(sink_id.clone(), sink);
+        }
+        if settings.environment_default_sink_id.is_some() {
+            default_sink_id = settings.environment_default_sink_id.clone();
+        }
+        if let Some(sink_id) = &default_sink_id
+            && !sinks.read().await.contains_key(sink_id)
+        {
+            anyhow::bail!("default sink '{sink_id}' is not configured");
+        }
         let registry = Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             sinks,
@@ -132,6 +147,15 @@ impl ChannelRegistry {
             }
         }
         Ok(registry)
+    }
+
+    /// Returns whether an active, sink-backed channel can accept events.
+    pub(crate) async fn is_ready(&self) -> bool {
+        self.channels
+            .read()
+            .await
+            .values()
+            .any(|record| record.lifecycle == ChannelLifecycle::Active)
     }
 
     /// Returns a shared handle to the process metrics counters.

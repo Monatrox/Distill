@@ -9,7 +9,13 @@ use crate::{
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fmt,
+    net::SocketAddr,
+    path::PathBuf,
+    time::Duration,
+};
 
 /// API versions that requests may pin via the `X-API-VERSION` header.
 ///
@@ -23,6 +29,8 @@ pub const SUPPORTED_API_VERSIONS: [&str; 1] = ["1"];
 /// bounds those resources. Operators may raise it with `DISTILL_MAX_CHANNELS`.
 const DEFAULT_MAX_CHANNELS: usize = 500;
 
+type EnvironmentSinks = Vec<(String, SinkConfig)>;
+
 #[derive(Clone)]
 pub struct Settings {
     pub http: HttpSettings,
@@ -31,6 +39,8 @@ pub struct Settings {
     pub admin_api_key: String,
     pub config_path: Option<PathBuf>,
     pub sinks_config_path: Option<PathBuf>,
+    pub(crate) environment_sinks: EnvironmentSinks,
+    pub(crate) environment_default_sink_id: Option<String>,
     pub default_sink_connection_string: Option<String>,
     pub exchange_name_prefix: String,
     pub api_default_version: String,
@@ -48,6 +58,11 @@ impl fmt::Debug for Settings {
             .field("admin_api_key", &"[REDACTED]")
             .field("config_path", &self.config_path)
             .field("sinks_config_path", &self.sinks_config_path)
+            .field("environment_sink_count", &self.environment_sinks.len())
+            .field(
+                "environment_default_sink_id",
+                &self.environment_default_sink_id,
+            )
             .field(
                 "default_sink_connection_string",
                 &self
@@ -108,6 +123,8 @@ impl Settings {
         let sink_allowlist =
             SinkAllowlist::parse(&env::var("DISTILL_SINK_ALLOWLIST").unwrap_or_default())
                 .map_err(|error| anyhow::anyhow!("DISTILL_SINK_ALLOWLIST is invalid: {error}"))?;
+        let (environment_sinks, environment_default_sink_id) =
+            parse_environment_sinks(env::vars())?;
 
         Ok(Self {
             http: HttpSettings {
@@ -120,6 +137,8 @@ impl Settings {
             admin_api_key,
             config_path: env::var_os("DISTILL_CONFIG_PATH").map(PathBuf::from),
             sinks_config_path: env::var_os("DISTILL_SINKS_CONFIG_PATH").map(PathBuf::from),
+            environment_sinks,
+            environment_default_sink_id,
             default_sink_connection_string,
             exchange_name_prefix,
             api_default_version,
@@ -127,6 +146,85 @@ impl Settings {
             sink_allowlist,
         })
     }
+}
+
+#[derive(Default)]
+struct EnvironmentSink {
+    driver: Option<String>,
+    connection_string: Option<String>,
+    url: Option<String>,
+    bearer_token: Option<String>,
+}
+
+fn parse_environment_sinks<I>(variables: I) -> anyhow::Result<(EnvironmentSinks, Option<String>)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut definitions = BTreeMap::<String, EnvironmentSink>::new();
+    let mut default_sink_id = None;
+    for (name, value) in variables {
+        if name == "DISTILL_DEFAULT_SINK" {
+            if value.is_empty() {
+                anyhow::bail!("DISTILL_DEFAULT_SINK must not be empty");
+            }
+            default_sink_id = Some(value.to_ascii_lowercase());
+            continue;
+        }
+        let Some((sink_id, property)) = name
+            .strip_prefix("DISTILL_SINK__")
+            .and_then(|value| value.split_once("__"))
+        else {
+            continue;
+        };
+        if sink_id.is_empty() {
+            anyhow::bail!("DISTILL_SINK__{{NAME}}__* requires a sink name");
+        }
+        let definition = definitions.entry(sink_id.to_ascii_lowercase()).or_default();
+        match property {
+            "DRIVER" => definition.driver = Some(value),
+            "CONNECTION_STRING" => definition.connection_string = Some(value),
+            "URL" => definition.url = Some(value),
+            "BEARER_TOKEN" => definition.bearer_token = Some(value),
+            _ => anyhow::bail!("unsupported environment sink property: {property}"),
+        }
+    }
+
+    definitions
+        .into_iter()
+        .map(|(sink_id, definition)| {
+            let driver = definition
+                .driver
+                .ok_or_else(|| anyhow::anyhow!("environment sink '{sink_id}' requires DRIVER"))?;
+            let connection_string = match (definition.connection_string, definition.url) {
+                (Some(connection_string), None) | (None, Some(connection_string)) => {
+                    connection_string
+                }
+                (None, None) => {
+                    anyhow::bail!("environment sink '{sink_id}' requires CONNECTION_STRING or URL")
+                }
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "environment sink '{sink_id}' cannot set both CONNECTION_STRING and URL"
+                ),
+            };
+            if driver != "http" && definition.bearer_token.is_some() {
+                anyhow::bail!("environment sink '{sink_id}' only supports BEARER_TOKEN for http");
+            }
+            let mut headers = HashMap::new();
+            if let Some(token) = definition.bearer_token {
+                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            }
+            let config = SinkConfig {
+                driver,
+                connection_string,
+                headers,
+            };
+            config.validate().map_err(|error| {
+                anyhow::anyhow!("environment sink '{sink_id}' is invalid: {error}")
+            })?;
+            Ok((sink_id, config))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|sinks| (sinks, default_sink_id))
 }
 
 fn validate_default_api_version(value: &str) -> anyhow::Result<()> {
@@ -291,7 +389,10 @@ pub fn resolve_sink(definition: &SinkDefinition) -> Result<SinkConfig, DistillEr
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_admin_bind_address, validate_api_keys, validate_default_api_version};
+    use super::{
+        parse_admin_bind_address, parse_environment_sinks, validate_api_keys,
+        validate_default_api_version,
+    };
 
     #[test]
     fn administrative_listener_requires_loopback() {
@@ -311,5 +412,30 @@ mod tests {
         assert!(validate_default_api_version("1").is_ok());
         assert!(validate_default_api_version("2").is_err());
         assert!(validate_default_api_version("").is_err());
+    }
+
+    #[test]
+    fn parses_aspire_sink_environment() {
+        let (sinks, default_sink_id) = parse_environment_sinks(
+            [
+                ("DISTILL_SINK__PRIMARY__DRIVER", "postgres"),
+                (
+                    "DISTILL_SINK__PRIMARY__CONNECTION_STRING",
+                    "postgresql://distill:secret@postgres/logs",
+                ),
+                ("DISTILL_DEFAULT_SINK", "primary"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+        .expect("Aspire sink environment should parse");
+
+        assert_eq!(default_sink_id.as_deref(), Some("primary"));
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].0, "primary");
+        assert_eq!(sinks[0].1.driver, "postgres");
+        assert_eq!(
+            sinks[0].1.connection_string,
+            "postgresql://distill:secret@postgres/logs"
+        );
     }
 }

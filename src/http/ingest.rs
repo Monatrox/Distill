@@ -12,10 +12,17 @@ use super::{
     get,
     path = "/health",
     tag = "operations",
-    responses((status = 200, description = "The service is healthy"))
+    responses(
+        (status = 200, description = "An active sink-backed channel can accept events"),
+        (status = 503, description = "No active sink-backed channel is configured")
+    )
 )]
-pub(super) async fn health() -> impl IntoResponse {
-    StatusCode::OK
+pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    if state.registry.is_ready().await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Returns Prometheus-formatted process metrics.

@@ -10,7 +10,7 @@ namespace Distill.Aspire;
 ///
 /// When no endpoint is provided (via <c>AddDistill(name, apiKey)</c>), the resource can
 /// launch a Distill container if <c>.WithImage(...)</c> is configured. Sinks registered
-/// via <c>.WithSink(...)</c> are passed as environment variables and work in both modes.
+/// via <c>.WithSink(...)</c> configure that container at startup.
 public class DistillResource : ContainerResource, IResourceWithConnectionString
 {
     internal const string EndpointConfigKey = "Distill__Endpoint";

@@ -3,11 +3,9 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace Distill.Aspire;
 
-/// Checks that the Distill endpoint is reachable.
+/// Checks that Distill is ready to accept events.
 ///
-/// A missing probe channel is treated as healthy because it proves the request
-/// reached Distill. Authentication and service-unavailable responses are
-/// unhealthy because they indicate a configuration or dependency problem.
+/// Distill is healthy only after an active channel has connected to its sink.
 public class DistillHealthCheck : IHealthCheck
 {
     private readonly DistillClient client;
@@ -18,19 +16,15 @@ public class DistillHealthCheck : IHealthCheck
         this.client = client ?? throw new ArgumentNullException(nameof(client));
     }
 
-    /// Probes the Distill endpoint and reports reachability.
+    /// Probes Distill readiness.
     public async Task<HealthCheckResult> CheckHealthAsync(
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            await client.GetChannelAsync("application", cancellationToken);
+            await client.CheckHealthAsync(cancellationToken);
             return HealthCheckResult.Healthy();
-        }
-        catch (DistillApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return HealthCheckResult.Healthy("Distill is reachable; the probe channel is not registered.");
         }
         catch (DistillApiException ex)
         {

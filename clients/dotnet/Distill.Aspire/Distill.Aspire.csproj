@@ -12,7 +12,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\..\..\..\Rider\DistillTesting\DistillTesting.ServiceDefaults\DistillTesting.ServiceDefaults.csproj" />
     <ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
     <ProjectReference Include="..\Distill.Extensions.Logging\Distill.Extensions.Logging.csproj" />
     <PackageReference Include="Aspire.Hosting" Version="13.4.6" />

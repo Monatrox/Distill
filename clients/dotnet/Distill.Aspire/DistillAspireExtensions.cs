@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 
@@ -54,8 +53,7 @@ public static class DistillResourceBuilderExtensions
     ///
     /// No containers are launched. The resource sets <c>Distill__Endpoint</c> and
     /// <c>Distill__ApiKey</c> on consuming projects that use <c>.WithReference(distill)</c>.
-    /// Sinks registered via <c>.WithSink(...)</c> are passed as environment variables
-    /// and work in both container and external-endpoint modes.
+    /// Configure sinks on externally managed Distill instances through their deployment.
     public static IResourceBuilder<DistillResource> AddDistill(
         this IDistributedApplicationBuilder builder,
         string name,
@@ -75,8 +73,7 @@ public static class DistillResourceBuilderExtensions
             .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri: null));
     }
 
-    /// Registers a single sink from a connection-string resource (PostgreSQL, etc.)
-    /// and marks it as the default.
+    /// Registers a startup sink from a connection-string resource and marks it as default.
     public static IResourceBuilder<DistillResource> WithSink(
         this IResourceBuilder<DistillResource> builder,
         IResourceBuilder<IResourceWithConnectionString> sinkResource,
@@ -90,14 +87,10 @@ public static class DistillResourceBuilderExtensions
         builder.Resource.Annotations.Add(new DistillSinkAnnotation(
             name, driver, connectionExpression, IsDefault: true));
 
-        // Set the connection string using the direct ReferenceExpression overload
-        // so the DCP resolves it properly at deployment time.
-        builder.WithEnvironment("DISTILL_DEFAULT_SINK_CONNECTION_STRING", connectionExpression);
-
-        return builder;
+        return builder.WaitFor(sinkResource);
     }
 
-    /// Registers multiple sinks from connection-string resources with an explicit default.
+    /// Registers startup sinks from connection-string resources with an explicit default.
     public static IResourceBuilder<DistillResource> WithSink(
         this IResourceBuilder<DistillResource> builder,
         IReadOnlyDictionary<string, IResourceBuilder<IResourceWithConnectionString>> sinks,
@@ -121,12 +114,7 @@ public static class DistillResourceBuilderExtensions
             builder.Resource.Annotations.Add(new DistillSinkAnnotation(
                 name, driver, connectionExpression, name == defaultSinkName));
 
-            if (name == defaultSinkName)
-            {
-                builder.WithEnvironment(
-                    "DISTILL_DEFAULT_SINK_CONNECTION_STRING",
-                    connectionExpression);
-            }
+            builder.WaitFor(resource);
         }
 
         return builder;
@@ -181,10 +169,8 @@ public static class DistillResourceBuilderExtensions
 
     /// Builds the Distill container image from the local Dockerfile.
     ///
-    /// Searches upward from the current directory for a file named <c>Dockerfile</c>.
-    /// If the image <c>distill:latest</c> does not exist locally, runs <c>docker build</c>
-    /// synchronously at configuration time. Docker build caching makes re-builds fast;
-    /// only the first invocation compiles the Rust binary.
+    /// Aspire builds and runs the image with its detected Docker or Podman runtime.
+    /// Set <c>ASPIRE_CONTAINER_RUNTIME</c> to <c>docker</c> or <c>podman</c> to override detection.
     ///
     /// Provide explicit paths to override the search:
     /// <code>
@@ -197,74 +183,13 @@ public static class DistillResourceBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        dockerfilePath ??= FindDockerfile()
+        dockerfilePath = Path.GetFullPath(dockerfilePath ?? FindDockerfile()
             ?? throw new FileNotFoundException(
                 "Could not locate the Distill Dockerfile. Specify the path explicitly:\n" +
-                ".WithLocalBuild(dockerfile: \"path/to/Dockerfile\", context: \"path/to/context\")");
+                ".WithLocalBuild(dockerfile: \"path/to/Dockerfile\", context: \"path/to/context\")"));
+        contextPath = Path.GetFullPath(contextPath ?? Path.GetDirectoryName(dockerfilePath)!);
 
-        contextPath ??= Path.GetDirectoryName(Path.GetFullPath(dockerfilePath))!;
-
-        var imageName = $"{DistillDefaults.ImageName}:{DistillDefaults.ImageTag}";
-
-        if (!ImageExistsLocally(imageName))
-        {
-            Console.WriteLine($"Building Distill container image ({imageName}) from {dockerfilePath}...");
-
-            var startInfo = new ProcessStartInfo("docker", $"build -t {imageName} -f \"{dockerfilePath}\" \"{contextPath}\"")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-
-            using var build = Process.Start(startInfo)
-                ?? throw new InvalidOperationException("Failed to start docker build. Is Docker installed and running?");
-
-            var output = build.StandardOutput.ReadToEndAsync();
-            var errors = build.StandardError.ReadToEndAsync();
-
-            if (!build.WaitForExit(600_000))
-            {
-                build.Kill(true);
-                throw new TimeoutException(
-                    "Docker build timed out after 10 minutes. The Rust compilation may have stalled.\n" +
-                    "Build manually with: docker build -t distill:latest -f \"{dockerfilePath}\" \"{contextPath}\"");
-            }
-
-            if (build.ExitCode != 0)
-            {
-                throw new InvalidOperationException(
-                    $"Docker build failed (exit code {build.ExitCode}).\n" +
-                    $"Output:\n{output.Result}\n{errors.Result}");
-            }
-
-            Console.WriteLine("Distill container image built successfully.");
-        }
-
-        return builder;
-    }
-
-    private static bool ImageExistsLocally(string imageName)
-    {
-        try
-        {
-            var startInfo = new ProcessStartInfo("docker", $"image inspect {imageName}")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-
-            using var inspect = Process.Start(startInfo);
-            if (inspect is null)
-                return false;
-
-            return inspect.WaitForExit(10_000) && inspect.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
+        return builder.WithDockerfile(contextPath, dockerfilePath);
     }
 
     private static string? FindDockerfile()

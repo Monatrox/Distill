@@ -152,26 +152,32 @@ Your application owns the event shape:
 
 ## Quick start
 
-### 1. Start Distill and RabbitMQ
+### 1. Start unconfigured Distill and RabbitMQ
 
 Requirements:
 
-- Docker and Docker Compose;
+- Docker with Compose, or Podman 5.0+ with a Compose provider;
 - PostgreSQL, MySQL, SQL Server, or an HTTP receiver for the configured sink.
 
-Start the local service:
+Start the local service with either runtime:
 
 ```powershell
 docker compose up --build
+# or
+podman compose up --build
 ```
+
+Both runtimes use the same `Dockerfile` and `docker-compose.yml`; no application changes are required.
 
 Compose publishes Distill through Caddy at `https://localhost`; it is the only publicly exposed Distill service. Caddy uses a local development certificate for `localhost`, so trust its local CA or use an HTTP client’s development-only certificate bypass. Set `DISTILL_PUBLIC_HOST` to a real DNS name for automatic ACME certificates in a production deployment. Administrative routes are not published, and RabbitMQ’s ports are bound to host loopback only.
 
 The Compose file uses separate development keys for ingestion and administration. Replace both before using the service outside a local test environment.
 
+Compose intentionally includes no database or default sink. It remains unready and rejects logs until a sink-backed channel is configured.
+
 ### 2. Configure a sink with the CLI
 
-The CLI writes a sink manifest without storing database credentials in it. Set the secret in the environment used by the Distill process:
+The CLI writes a sink manifest without storing database credentials in it. Create it before starting Distill, or mount it and restart Distill after configuration. Set the secret in the environment used by the Distill process:
 
 ```powershell
 $env:DISTILL_POSTGRES_URL = "postgresql://distill:password@host.docker.internal:5432/logs"
@@ -182,11 +188,7 @@ distill sink create postgres-primary `
   --default
 ```
 
-Point the service at the manifest:
-
-```powershell
-$env:DISTILL_SINKS_CONFIG_PATH = "./sinks.json"
-```
+Set `DISTILL_SINKS_CONFIG_PATH` and mount the manifest plus its secret into the Distill container before startup. Changing either requires a restart.
 
 For an advanced/custom integration, use the HTTP sink and keep its bearer token outside the manifest:
 
@@ -556,10 +558,12 @@ Run the Rust test suite:
 cargo test
 ```
 
-Build the production container:
+Build the production container with either runtime:
 
 ```powershell
 docker build -t distill .
+# or
+podman build -t distill .
 ```
 
 The container listens on port `8080` and runs as an unprivileged `distill` user.

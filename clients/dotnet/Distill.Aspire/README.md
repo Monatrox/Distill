@@ -25,9 +25,16 @@ Override with `.WithImage(...)` for a custom image.
 #### Automatic local build (recommended for development)
 
 `.WithLocalBuild()` finds the repo's `Dockerfile` by walking up from the
-current directory, checks if `distill:latest` exists locally, and runs
-`docker build` if it doesn't. The first build compiles the Rust binary;
-subsequent builds are fast thanks to Docker layer caching.
+current directory and delegates its build to Aspire. Aspire detects a running
+Docker or Podman runtime, keeping image build and container execution on the
+same engine.
+
+Podman 5.0 or newer is required. Detection needs no Distill-specific setup.
+When both runtimes are available, force one before starting the AppHost:
+
+```powershell
+$env:ASPIRE_CONTAINER_RUNTIME = "podman" # or "docker"
+```
 
 ```csharp
 var distill = builder.AddDistill("distill", apiKey: "dev-key")
@@ -55,8 +62,19 @@ var distill = builder.AddDistill("distill", apiKey: "dev-key");
 var postgres = builder.AddPostgres("pg").AddDatabase("distill");
 
 var distill = builder.AddDistill("distill", apiKey: "dev-key")
-    .WithSink(postgres);  // single sink → becomes default
+    .WithSink(postgres, name: "primary");  // waits for PostgreSQL; primary becomes default
 ```
+
+For an existing PostgreSQL server, keep its connection string in AppHost configuration or a secret provider:
+
+```csharp
+var postgres = builder.AddConnectionString("distill-postgres");
+
+var distill = builder.AddDistill("distill", apiKey: "dev-key")
+    .WithSink(postgres, name: "primary");
+```
+
+Set `ConnectionStrings__distill-postgres` through user secrets or deployment secret configuration. Do not hardcode it in `AppHost.cs`.
 
 For multiple named sinks:
 
@@ -68,6 +86,10 @@ var distill = builder.AddDistill("distill", apiKey: "dev-key")
         ["analytics"] = analyticsDb,
     }, driver: "postgres", defaultSinkName: "primary");
 ```
+
+`WithSink` passes the connection expression only to the Distill container at startup. The value is never sent to consuming applications. Distill connects it before becoming ready; logs remain rejected until an active channel references the sink.
+
+`WithSink` configures container-mode Distill. For an externally managed Distill instance, use its deployment sink manifest and secret store instead.
 
 ### Register a custom sink (HTTP, etc.)
 
@@ -130,11 +152,11 @@ The extension reads configuration directly from environment variables or `appset
 
 ## Health check
 
-`DistillHealthCheck` probes the Distill endpoint by calling `GetChannelAsync("application")`. Any HTTP response (including 404) is treated as healthy. Transport failures produce an unhealthy result. The check is visible in the Aspire dashboard.
+`DistillHealthCheck` calls `/health`. It is healthy only when Distill has an active channel backed by a connected sink. The check is visible in the Aspire dashboard.
 
 ## Sink environment variables
 
-When sinks are registered via `.WithSink(...)`, the integration sets the following environment variables on the Distill container:
+When sinks are registered via `.WithSink(...)`, the integration sets the following startup-only environment variables on the Distill container:
 
 - `DISTILL_SINK__{NAME}__DRIVER` — sink driver type
 - `DISTILL_SINK__{NAME}__CONNECTION_STRING` — connection string (for database sinks)
