@@ -14,13 +14,15 @@ public static class DistillClientExtensions
     /// Adds a Distill client and logging provider to the application.
     ///
     /// Reads the Distill URI from <c>ConnectionStrings__{connectionName}</c>
-    /// (or <c>Distill__Endpoint</c> as a fallback), and the
-    /// API key from configuration key <c>Distill__ApiKey</c>. Falls back to
-    /// <c>http://localhost:8080</c> with an empty API key.
+    /// (or <c>Distill__Endpoint</c> as a fallback), the ingest key from
+    /// <c>Distill__ApiKey</c>, and optional startup-provisioning credentials from
+    /// <c>Distill__AdminApiKey</c> and <c>Distill__AdminEndpoint</c>. Falls back to
+    /// <c>http://localhost:8080</c> with an empty ingest key.
     ///
     /// Registers <see cref="DistillClient"/> as a singleton, wires the
     /// Distill logging provider, and adds a health check for the Aspire
-    /// dashboard.
+    /// dashboard. Applications may resolve the client after <c>Build()</c> and call
+    /// <see cref="DistillClient.EnsureChannelAsync"/> before serving traffic.
     public static IHostApplicationBuilder AddDistillClient(
         this IHostApplicationBuilder builder,
         string connectionName = "distill",

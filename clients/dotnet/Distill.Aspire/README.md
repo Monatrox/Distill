@@ -129,13 +129,31 @@ builder.AddDistillClient("distill", options =>
 
 This registers `DistillClient` as a singleton, adds the Distill `ILogger` provider, and registers a health check for the Aspire dashboard.
 
-When using `.WithReference(distill)`, Aspire sets `ConnectionStrings__distill` to the Distill endpoint automatically. The API key should be set on the consumer project via `WithEnvironment`:
+When using `.WithReference(distill)`, Aspire sets `ConnectionStrings__distill` to the Distill endpoint automatically. Set the ingest key on every consumer. Applications that explicitly provision their own finite channel set also need the admin key during startup:
 
 ```csharp
 var myService = builder.AddProject<Projects.MyService>("my-service")
     .WithReference(distill)
-    .WithEnvironment("Distill__ApiKey", "dev-key");
+    .WithEnvironment("Distill__ApiKey", "dev-key")
+    .WithEnvironment("Distill__AdminApiKey", "dev-key-admin");
 ```
+
+In the consuming application's `Program.cs`, provision channels after `Build()` and before serving traffic:
+
+```csharp
+var app = builder.Build();
+var distill = app.Services.GetRequiredService<DistillClient>();
+
+await distill.EnsureChannelAsync(new CreateChannelRequest
+{
+    Name = "production.errors",
+    Preset = "raw_events"
+});
+
+app.Run();
+```
+
+Provisioning is explicit and fail-fast. `DistillLoggerProvider` remains an ingest-only transport and never creates channels from arbitrary logger categories.
 
 ### Standalone usage (without Aspire hosting)
 
@@ -145,7 +163,8 @@ The extension reads configuration directly from environment variables or `appset
 {
   "Distill": {
     "Endpoint": "http://localhost:8080",
-    "ApiKey": "change-me"
+    "ApiKey": "change-me-ingest",
+    "AdminApiKey": "change-me-admin"
   }
 }
 ```

@@ -10,7 +10,7 @@ Completed across three phases:
 |------|----------------|
 | 2.1 Per-channel config | `PerChannelOptions` record + `Dictionary<string, PerChannelOptions>` on `DistillLoggerOptions`; `GetChannelOptions()` helper with fallback |
 | 2.2 Per-channel backpressure | Each channel gets its own `Channel<QueuedLog>`; `wakeSignal` (`Channel<byte>` capacity-1) notifies worker to check all channels; no noisy-neighbor starvation |
-| 2.3 Channel provisioning | Removed from provider: Aspire/startup configuration provisions channels; logging clients retain ingest-only permissions |
+| 2.3 Channel provisioning | Removed from provider worker; applications explicitly call `DistillClient.EnsureChannelAsync` for a finite channel set during startup, while normal logging remains ingest-only |
 | 2.4 Channel-aware `DeliveryFailure` | `DeliveryFailureContext` with `Channel`, `EventCount`, `Attempts`, `Exception` |
 | 2.5 Category-level log levels | `Dictionary<string, LogLevel>` with dotted-path namespace walk; `GetCategoryLevel()` in `IsEnabled` |
 | 2.6 Defensive resolver | `ResolveChannel()` with try/catch, fallback to `DefaultChannel`, `ChannelResolutionFailed` callback |
@@ -43,7 +43,7 @@ Completed across three phases:
 | `Distill.Aspire/DistillSinkSpecification.cs` | `DistillSinkSpecification` record — Name, Driver, ConnectionString, Url, BearerToken, IsDefault |
 | `Distill.Aspire/DistillAspireExtensions.cs` | Two `AddDistill` overloads + four `WithSink` overloads + `DistillSinkAnnotation` internal + `DistillDefaults` |
 | `Distill.Aspire/DistillClientExtensions.cs` | `AddDistillClient()` on `IHostApplicationBuilder` |
-| `Distill.Aspire/DistillHealthCheck.cs` | Probes `GetChannelAsync("application")`; any HTTP response = healthy |
+| `Distill.Aspire/DistillHealthCheck.cs` | Probes the server health endpoint |
 | `Distill.Aspire/README.md` | Usage docs with all modes |
 
 ## Breaking changes

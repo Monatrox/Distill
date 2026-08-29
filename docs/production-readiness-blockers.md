@@ -9,7 +9,7 @@ Keep the first supported path narrow:
 - PostgreSQL and custom HTTP/API endpoint sinks;
 - one default sink per Distill resource for the initial golden path;
 - one Aspire-managed RabbitMQ resource;
-- channels provisioned by Aspire rather than application logging code;
+- finite channels explicitly provisioned by the owning application during startup;
 - `Distill.Client` and `Distill.Extensions.Logging`;
 - published, version-pinned NuGet packages and container image.
 
@@ -63,9 +63,9 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Minimal resolution:**
 
-1. For v1, document Aspire/startup configuration as supported channel provisioning workflow.
-2. Keep runtime channel mutation, but clearly mark it ephemeral unless a durable control-plane store is added.
-3. Restore startup channel definitions and sink mappings before starting RabbitMQ consumption.
+1. Document explicit application startup declarations as the supported channel provisioning workflow.
+2. Keep runtime channel mutation, but clearly mark it ephemeral until a durable control-plane store is added.
+3. Persist ensured definitions or otherwise restore channel definitions and sink mappings before RabbitMQ resumes backlog consumption.
 4. Add restart tests with queued messages and lifecycle changes.
 
 **Done when:** Restart restores every startup-configured channel before queued delivery resumes; runtime channel and lifecycle mutations are documented as ephemeral.
@@ -187,11 +187,12 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 **Minimal resolution:**
 
 1. Create Aspire secret parameter resources for ingest and admin keys.
-2. Inject both into Distill; inject only ingest key into consuming applications.
-3. Make missing key configuration impossible or generate development-only values explicitly.
-4. Keep admin credentials out of application logging processes.
+2. Inject both into Distill and inject the ingest key into consuming applications.
+3. Inject the admin key only into applications that explicitly opt into startup channel provisioning.
+4. Make missing key configuration impossible or generate development-only values explicitly.
+5. Do not expose admin credentials to `DistillLoggerProvider`; only the startup provisioning call should use them.
 
-**Done when:** `.WithReference(distill)` supplies endpoint and ingest credentials without plaintext duplication.
+**Done when:** `.WithReference(distill)` supplies the endpoint and required credentials without plaintext duplication, and ingest-only consumers never receive the admin key.
 
 ### 11. Management endpoint boundary is contradictory
 
@@ -349,19 +350,22 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Every rejected item is surfaced and no validation error is blindly retried.
 
-### 22. Automatic channel provisioning fails silently and crosses privilege boundaries
+### 22. Channel provisioning must be explicit, fail-fast, and separate from the logger worker
 
-**Evidence:** Startup probing catches broad exceptions, creation supports only statically known channels, and admin credentials/endpoints are not wired by default.
+**Evidence:** The former `DistillLoggerProvider` startup probe caught broad exceptions and continued after provisioning failures. It also mixed admin operations into the logging transport and only inspected `DefaultChannel` plus preconfigured `ChannelOptions`; it was not true first-use provisioning.
 
-**Impact:** Missing channels can cause log loss with little diagnostic information; application processes need excessive privileges to self-provision.
+**Impact:** Missing channels could cause log loss with little diagnostic information. Removing provisioning entirely, however, regresses modular-monolith DX where the application intentionally owns a finite logging contract.
 
 **Minimal resolution:**
 
-1. Move channel provisioning to Aspire/AppHost configuration.
-2. Remove automatic provisioning from the logging provider for production use.
-3. Surface startup validation failures through standard logging/health diagnostics.
+1. Keep implicit provisioning out of `DistillLoggerProvider`.
+2. Provide `DistillClient.EnsureChannelAsync` for explicit application startup provisioning in `Program.cs`.
+3. Require a finite list of definitions, named/default operator-provisioned sinks, and server-enforced channel limits.
+4. Fail application startup when any required channel cannot be ensured.
+5. Use the admin key only for startup provisioning; continue using the ingest key for normal logging.
+6. Document that ensure creates missing channels but does not mutate existing definitions.
 
-**Done when:** Application logger requires ingest permission only and missing channels fail visibly before traffic begins.
+**Done when:** Owning applications can provision their declared channels before serving traffic, failures stop startup, and logger categories cannot implicitly create arbitrary resources.
 
 ### 23. HTTP client ownership and configuration are unclear
 
@@ -594,7 +598,7 @@ Production-ready v1 should not ship until all items below pass:
 
 - [ ] Fresh Aspire AppHost with documented GHCR pull credentials pulls a versioned image and starts without cloning Distill source.
 - [ ] `.WithReference(distill)` supplies service discovery and ingest credentials.
-- [ ] AppHost provisions either PostgreSQL or HTTP sink plus channels without giving application code admin credentials.
+- [ ] AppHost provisions either PostgreSQL or HTTP sink; the owning application explicitly ensures its finite channels before serving traffic.
 - [ ] Structured `ILogger` event reaches PostgreSQL with original timestamp and properties.
 - [ ] Structured event and aggregate reach a reference HTTP receiver with correct record IDs, authentication, retry, and duplicate behavior.
 - [ ] Internal Aspire HTTP receiver works through an exact destination allowlist; arbitrary private destinations remain blocked.

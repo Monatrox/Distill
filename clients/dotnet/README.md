@@ -6,7 +6,7 @@ For drop-in integration with existing `ILogger` applications, see the companion 
 
 It targets .NET 8 and supports:
 
-- simplified channel creation with presets and overrides;
+- simplified channel creation and explicit startup provisioning;
 - full advanced channel definitions;
 - simple channel-bound event writes;
 - batch event ingestion;
@@ -21,13 +21,13 @@ using Distill.Client;
 
 var client = DistillClient.Create(
     new Uri("http://localhost:8080/"),
-    apiKey: "change-me-in-development");
+    apiKey: "change-me-ingest",
+    adminApiKey: "change-me-admin");
 
-await client.CreateChannelAsync(new CreateChannelRequest
+await client.EnsureChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "errors_only",
-    RetentionHours = 720
+    Preset = "raw_events"
 });
 
 // To disable a preset aggregator and persist every event, set Aggregator to null:
@@ -53,6 +53,8 @@ IngestResponse? response = await client.WriteAsync(
 
 Console.WriteLine($"Accepted: {response?.Accepted}");
 ```
+
+`EnsureChannelAsync` is intended for explicit application startup provisioning. It creates a missing channel, leaves an existing channel unchanged, and requires administration credentials. Provisioning errors should fail startup rather than allowing logs to target missing channels.
 
 For high-volume producers, use `IngestAsync` with stable `EventId` values. If a request times out after admission, retrying the same event ID allows Distill’s idempotent sink write to absorb duplicate delivery.
 

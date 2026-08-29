@@ -121,6 +121,26 @@ public sealed class DistillClient
         return SendAsync<ChannelConfigResponse>(HttpMethod.Post, "channels", request, cancellationToken);
     }
 
+    /// Creates a channel when it does not already exist.
+    ///
+    /// Existing channels are returned unchanged. This operation requires administration
+    /// credentials and is intended for explicit application startup provisioning.
+    public async Task<ChannelConfigResponse?> EnsureChannelAsync(
+        CreateChannelRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        try
+        {
+            return await GetChannelAsync(request.Name, cancellationToken)
+                ?? await CreateChannelAsync(request, cancellationToken);
+        }
+        catch (DistillApiException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
+        {
+            return await CreateChannelAsync(request, cancellationToken);
+        }
+    }
+
     /// Validates and resolves a simplified channel request without registering it.
     public Task<ChannelValidationResponse?> ValidateChannelAsync(
         CreateChannelRequest request,

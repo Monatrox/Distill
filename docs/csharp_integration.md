@@ -287,9 +287,49 @@ options.DeliveryFailure = context =>
 };
 ```
 
-### 4.7 Channel provisioning
+### 4.7 Application-owned channel provisioning
 
-Provision channels through Aspire or startup configuration. The logging provider uses ingest credentials only and never probes or creates channels.
+The logging provider only sends events; it never creates channels implicitly. Applications that own a finite channel set can provision it explicitly in `Program.cs` with `EnsureChannelAsync`:
+
+```csharp
+builder.AddDistillClient("distill", options =>
+{
+    options.DefaultChannel = "application.production";
+    options.ChannelResolver = category =>
+        category.StartsWith("Orders.", StringComparison.Ordinal)
+            ? "orders.production"
+            : null!;
+});
+
+var channels = new[]
+{
+    new CreateChannelRequest { Name = "application.production", Preset = "raw_events" },
+    new CreateChannelRequest
+    {
+        Name = "orders.production",
+        Preset = "raw_events",
+        Aggregator = new AggregatorSpec
+        {
+            Function = "count",
+            Granularity = "per_t_time",
+            Parameter = 60
+        }
+    }
+};
+
+var app = builder.Build();
+var distill = app.Services.GetRequiredService<DistillClient>();
+foreach (var channel in channels)
+{
+    await distill.EnsureChannelAsync(channel);
+}
+
+app.Run();
+```
+
+`EnsureChannelAsync` creates missing channels and leaves existing channels unchanged. Provisioning failures fail application startup, preventing the logger from targeting missing channels. The application needs `Distill__AdminApiKey` for this startup step; normal event delivery continues to use `Distill__ApiKey`. Keep definitions finite, reference operator-provisioned sink IDs/defaults, and never place sink credentials in application channel definitions.
+
+This pattern suits modular monoliths where the application owns its logging contract. Aspire-owned provisioning can be added later without coupling provisioning to `DistillLoggerProvider`.
 
 ### 4.8 Batching and retries
 
@@ -354,7 +394,9 @@ builder.AddDistillClient("distill");  // reads ConnectionStrings__distill
 `AddDistillClient` registers `DistillClient` as a singleton, adds the
 `ILogger` provider, and registers a health check. Configuration is read
 from `Distill__Endpoint` / `ConnectionStrings__distill` with a fallback
-to `http://localhost:8080`, and `Distill__ApiKey` for the API key.
+to `http://localhost:8080`, `Distill__ApiKey` for ingestion, and optional
+`Distill__AdminApiKey` / `Distill__AdminEndpoint` for explicit application-owned
+startup provisioning.
 
 ---
 
