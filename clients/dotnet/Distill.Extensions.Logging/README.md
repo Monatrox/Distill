@@ -35,7 +35,7 @@ var app = builder.Build();
 await distill.EnsureChannelAsync(new CreateChannelRequest
 {
     Name = "application.production",
-    Preset = "raw_events"
+    Preset = ChannelPreset.RawEvents
 });
 
 app.Run();

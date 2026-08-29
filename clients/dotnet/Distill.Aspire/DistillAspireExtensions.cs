@@ -7,6 +7,7 @@ namespace Distill.Aspire;
 public static class DistillResourceBuilderExtensions
 {
     private const int DefaultHttpPort = 8080;
+    private const int DefaultAdminPort = 8081;
     private const string RabbitMqImage = "rabbitmq:3.13-management";
     private const int RabbitMqAmqpPort = 5672;
 
@@ -42,7 +43,8 @@ public static class DistillResourceBuilderExtensions
 
         var distill = builder.AddResource(resource)
             .WithImage(DistillDefaults.ImageName, DistillDefaults.ImageTag)
-            .WithHttpEndpoint(DefaultHttpPort, DefaultHttpPort, "http")
+            .WithHttpEndpoint(targetPort: DefaultHttpPort, name: "http")
+            .WithEndpoint(targetPort: DefaultAdminPort, scheme: "http", name: "admin", isExternal: false)
             .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri))
             .WaitFor(rabbitMq);
 
@@ -227,6 +229,8 @@ public static class DistillResourceBuilderExtensions
             }
 
             env["DISTILL_BIND_ADDRESS"] = $"0.0.0.0:{DefaultHttpPort}";
+            env["DISTILL_ADMIN_BIND_ADDRESS"] = $"0.0.0.0:{DefaultAdminPort}";
+            env["DISTILL_ALLOW_ADMIN_NETWORK"] = "true";
             env["DISTILL_REQUEST_BODY_LIMIT_BYTES"] = "2097152";
             env["DISTILL_REQUEST_TIMEOUT_SECONDS"] = "30";
 

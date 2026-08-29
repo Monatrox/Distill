@@ -13,16 +13,19 @@ public sealed record CreateChannelRequest
 
     /// Gets or initializes the preset used before applying overrides.
     [JsonPropertyName("preset")]
-    public string Preset { get; init; } = "raw_events";
+    public ChannelPreset Preset { get; init; } = ChannelPreset.RawEvents;
 
     /// Gets or initializes an optional severity threshold override.
     [JsonPropertyName("severity_threshold")]
-    public string? SeverityThreshold { get; init; }
+    public DistillSeverity? SeverityThreshold { get; init; }
 
-    /// Gets or initializes an optional aggregation override. Set this to null to disable a preset aggregator.
-    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    /// Gets or initializes an optional aggregation override.
     [JsonPropertyName("aggregator")]
     public AggregatorSpec? Aggregator { get; init; }
+
+    /// Gets or initializes whether a preset aggregator is explicitly disabled.
+    [JsonIgnore]
+    public bool DisableAggregation { get; init; }
 
     /// Gets or initializes the named sink used by this channel.
     [JsonPropertyName("sink_id")]
@@ -35,10 +38,6 @@ public sealed record CreateChannelRequest
     [Obsolete("Use SinkId and provision the sink with the Distill CLI.")]
     [JsonPropertyName("sink_config")]
     public SinkConfig? SinkConfig { get; init; }
-
-    /// Gets or initializes an optional retention period in hours.
-    [JsonPropertyName("retention_hours")]
-    public uint? RetentionHours { get; init; }
 
     /// Gets or initializes an optional channel buffer size in bytes.
     [JsonPropertyName("buffer_bytes")]
@@ -54,7 +53,7 @@ public sealed record CreateChannelRequest
 
     /// Gets or initializes an optional ordering mode.
     [JsonPropertyName("ordering")]
-    public string? Ordering { get; init; }
+    public ChannelOrdering? Ordering { get; init; }
 
     /// Gets or initializes an optional allowed lateness period in milliseconds.
     [JsonPropertyName("allowed_lateness_ms")]
@@ -65,16 +64,64 @@ public sealed record CreateChannelRequest
     public string? ChannelUom { get; init; }
 }
 
+/// Identifies a built-in channel preset.
+public enum ChannelPreset
+{
+    RawEvents,
+    ErrorsOnly,
+    Metrics,
+    Audit,
+    Count
+}
+
+/// Identifies a Distill event severity.
+public enum DistillSeverity
+{
+    Unknown,
+    Trace,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical
+}
+
+/// Identifies an aggregate function.
+public enum AggregationFunction
+{
+    Average,
+    AverageDurationBetweenEvents,
+    Max,
+    Min,
+    Sum,
+    Count
+}
+
+/// Identifies an aggregate flush granularity.
+public enum AggregationGranularity
+{
+    PerNEvents,
+    PerTTime,
+    Overall
+}
+
+/// Identifies event ordering behavior within a channel.
+public enum ChannelOrdering
+{
+    FifoRequired,
+    FirstComeFirstServed
+}
+
 /// Configures a channel aggregator.
 public sealed record AggregatorSpec
 {
     /// Gets or initializes the aggregation function.
     [JsonPropertyName("function")]
-    public required string Function { get; init; }
+    public required AggregationFunction Function { get; init; }
 
     /// Gets or initializes the aggregation granularity.
     [JsonPropertyName("granularity")]
-    public required string Granularity { get; init; }
+    public required AggregationGranularity Granularity { get; init; }
 
     /// Gets or initializes the event count or duration parameter.
     [JsonPropertyName("parameter")]
@@ -114,7 +161,7 @@ public sealed record DistillEvent
 
     /// Gets or initializes the Distill severity name.
     [JsonPropertyName("severity_level")]
-    public string SeverityLevel { get; init; } = "info";
+    public DistillSeverity SeverityLevel { get; init; } = DistillSeverity.Info;
 
     /// Gets or initializes the arbitrary application payload.
     [JsonPropertyName("payload")]
@@ -138,7 +185,7 @@ public sealed record SimpleEvent
 
     /// Gets or initializes the severity name.
     [JsonPropertyName("severity")]
-    public string Severity { get; init; } = "info";
+    public DistillSeverity Severity { get; init; } = DistillSeverity.Info;
 
     /// Gets or initializes the human-readable message.
     [JsonPropertyName("message")]

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 
 namespace Distill.Client;
 
@@ -9,11 +10,13 @@ namespace Distill.Client;
 public sealed class DistillClient
 {
     private const int MaxDiagnosticBodyLength = 2_048;
+    private const string ApiVersion = "1";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
     };
 
     private static readonly bool DiagnosticsEnabled = IsDiagnosticsEnabled();
@@ -246,7 +249,14 @@ public sealed class DistillClient
         CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(method, requestUri);
-        if (content is not null)
+        request.Headers.TryAddWithoutValidation("X-API-VERSION", ApiVersion);
+        if (content is CreateChannelRequest channel && channel.DisableAggregation)
+        {
+            var body = JsonSerializer.SerializeToNode(channel, JsonOptions)!.AsObject();
+            body["aggregator"] = null;
+            request.Content = JsonContent.Create(body, options: JsonOptions);
+        }
+        else if (content is not null)
         {
             request.Content = JsonContent.Create(content, options: JsonOptions);
         }

@@ -508,7 +508,8 @@ Distill requires:
 | `DISTILL_INGEST_API_KEY` | Yes | API key for public ingestion endpoints |
 | `DISTILL_ADMIN_API_KEY` | Yes | Separate API key for loopback-only management endpoints; must differ from the ingest key |
 | `DISTILL_BIND_ADDRESS` | No | Public ingestion/metrics bind address; defaults to `127.0.0.1:8080` |
-| `DISTILL_ADMIN_BIND_ADDRESS` | No | Loopback-only administrative bind address; defaults to `127.0.0.1:8081` and rejects non-loopback addresses |
+| `DISTILL_ADMIN_BIND_ADDRESS` | No | Administrative bind address; defaults to loopback `127.0.0.1:8081` |
+| `DISTILL_ALLOW_ADMIN_NETWORK` | No | Set `true` only for a private network endpoint such as Aspire service discovery; permits a non-loopback administrative bind |
 | `DISTILL_REQUEST_BODY_LIMIT_BYTES` | No | Maximum HTTP request body size; defaults to `2097152`, `0` disables |
 | `DISTILL_REQUEST_TIMEOUT_SECONDS` | No | Maximum HTTP request duration; defaults to `30`, `0` disables |
 | `DISTILL_MAX_CONCURRENT_REQUESTS` | No | Maximum simultaneous HTTP requests; defaults to `128`, `0` disables |

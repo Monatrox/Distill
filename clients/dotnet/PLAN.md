@@ -2,7 +2,7 @@
 
 Completed across three phases:
 
-**Phase 1** (SDK simplification): `[JsonIgnore(Condition = Never)]` on `Aggregator` property replaces the `DisableAggregator`/`JsonNode` hack. Users set `Aggregator = null` to disable a preset aggregator. `CreateOrReplaceChannelAsync` doc points users to the typed overload.
+**Phase 1** (SDK simplification): `Aggregator` is omitted when unset, configured when supplied, and explicitly disabled with `DisableAggregation = true`. `CreateOrReplaceChannelAsync` remains raw advanced escape hatch.
 
 **Phase 2** (ILogger extension):
 
@@ -48,7 +48,7 @@ Completed across three phases:
 
 ## Breaking changes
 
-- `DisableAggregator` removed — set `Aggregator = null` instead
+- `DisableAggregation = true` explicitly emits `"aggregator": null`
 - `DeliveryFailure` type changed from `Action<Exception>?` to `Action<DeliveryFailureContext>?`
 - `DistillResource` changed from `Resource` to `ContainerResource` (implements `IResourceWithConnectionString`)
 

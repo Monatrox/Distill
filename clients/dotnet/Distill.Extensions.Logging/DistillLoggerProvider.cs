@@ -307,15 +307,15 @@ public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalSco
         };
     }
 
-    private static string ToSeverity(LogLevel level) => level switch
+    private static DistillSeverity ToSeverity(LogLevel level) => level switch
     {
-        LogLevel.Trace => "trace",
-        LogLevel.Debug => "debug",
-        LogLevel.Information => "info",
-        LogLevel.Warning => "warning",
-        LogLevel.Error => "error",
-        LogLevel.Critical => "critical",
-        _ => "unknown"
+        LogLevel.Trace => DistillSeverity.Trace,
+        LogLevel.Debug => DistillSeverity.Debug,
+        LogLevel.Information => DistillSeverity.Info,
+        LogLevel.Warning => DistillSeverity.Warning,
+        LogLevel.Error => DistillSeverity.Error,
+        LogLevel.Critical => DistillSeverity.Critical,
+        _ => DistillSeverity.Unknown
     };
 
     private sealed record QueuedLog(

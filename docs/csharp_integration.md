@@ -77,9 +77,9 @@ Channels must exist before ingestion. The channel identifier must contain only l
 var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "raw_events",
+    Preset = ChannelPreset.RawEvents,
     SinkId = "postgres-primary",
-    Aggregator = null   // null = disable preset aggregator; omit = use preset default
+    DisableAggregation = true // omit to use preset default
 });
 ```
 
@@ -112,7 +112,7 @@ IngestResponse? response = await distill.WriteAsync(
     "orders.production",
     new SimpleEvent
     {
-        Severity = "error",
+        Severity = DistillSeverity.Error,
         Message = "Payment authorization failed",
         Payload = new { order_id = "ord-123", provider = "stripe" },
         Attributes = new Dictionary<string, object?>
@@ -133,7 +133,7 @@ IngestResponse? response = await distill.IngestAsync(new[]
         EventId = Guid.NewGuid(),
         Timestamp = DateTimeOffset.UtcNow,
         ChannelId = "orders.production",
-        SeverityLevel = "info",
+        SeverityLevel = DistillSeverity.Info,
         Payload = new { order_id = "ord-123", operation = "created" },
         Metadata = new Dictionary<string, string>
         {
@@ -303,15 +303,15 @@ builder.AddDistillClient("distill", options =>
 
 var channels = new[]
 {
-    new CreateChannelRequest { Name = "application.production", Preset = "raw_events" },
+    new CreateChannelRequest { Name = "application.production", Preset = ChannelPreset.RawEvents },
     new CreateChannelRequest
     {
         Name = "orders.production",
-        Preset = "raw_events",
+        Preset = ChannelPreset.RawEvents,
         Aggregator = new AggregatorSpec
         {
-            Function = "count",
-            Granularity = "per_t_time",
+            Function = AggregationFunction.Count,
+            Granularity = AggregationGranularity.PerTTime,
             Parameter = 60
         }
     }
@@ -456,14 +456,14 @@ response.EnsureSuccessStatusCode();
 
 ### 7.1 Disabling aggregation
 
-Set `Aggregator` to `null` to persist every event:
+Set `DisableAggregation` to persist every event instead of using a preset aggregator:
 
 ```csharp
 var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "raw_events",
-    Aggregator = null
+    Preset = ChannelPreset.Metrics,
+    DisableAggregation = true
 });
 ```
 

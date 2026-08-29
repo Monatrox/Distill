@@ -620,7 +620,7 @@ Production-ready v1 should not ship until all items below pass:
 Work in this order to avoid implementing behavior that v1 later removes:
 
 1. **Lock v1 surface first** — blockers 3, 7, 8, and 22. Startup/Aspire is supported channel provisioning workflow; runtime channel mutations remain documented as ephemeral; PostgreSQL-only rolling aggregates; reject retention/compression; no logger self-provisioning. *In progress: scope and validation complete; startup recovery testing remains.*
-2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types.
+2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types. *In progress: public/admin split, dynamic host port, and SDK wire types/version pinning complete; Aspire secrets, HTTP receiver contract, and checked-in OpenAPI remain.*
 3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, replay.
 4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; transactional replacement; explicit migrations.
 5. **Ship golden path** — blockers 13, 15, 16, and 32. Versioned image, RabbitMQ persistence/credentials, Aspire sample plus end-to-end test, Azure publish docs.

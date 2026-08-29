@@ -102,6 +102,7 @@ impl Settings {
         let admin_bind_address = parse_admin_bind_address(
             &env::var("DISTILL_ADMIN_BIND_ADDRESS")
                 .unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
+            env::var("DISTILL_ALLOW_ADMIN_NETWORK").as_deref() == Ok("true"),
         )?;
         let rabbitmq_uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required")?;
         let ingest_api_key =
@@ -237,13 +238,13 @@ fn validate_default_api_version(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_admin_bind_address(value: &str) -> anyhow::Result<SocketAddr> {
+fn parse_admin_bind_address(value: &str, allow_network: bool) -> anyhow::Result<SocketAddr> {
     let address: SocketAddr = value
         .parse()
         .context("DISTILL_ADMIN_BIND_ADDRESS must be a socket address")?;
-    if !address.ip().is_loopback() {
+    if !allow_network && !address.ip().is_loopback() {
         anyhow::bail!(
-            "DISTILL_ADMIN_BIND_ADDRESS must use a loopback address; administrative routes are local-only"
+            "DISTILL_ADMIN_BIND_ADDRESS must use a loopback address unless DISTILL_ALLOW_ADMIN_NETWORK=true"
         );
     }
     Ok(address)
@@ -395,10 +396,11 @@ mod tests {
     };
 
     #[test]
-    fn administrative_listener_requires_loopback() {
-        assert!(parse_admin_bind_address("127.0.0.1:8081").is_ok());
-        assert!(parse_admin_bind_address("[::1]:8081").is_ok());
-        assert!(parse_admin_bind_address("0.0.0.0:8081").is_err());
+    fn administrative_listener_requires_explicit_network_opt_in() {
+        assert!(parse_admin_bind_address("127.0.0.1:8081", false).is_ok());
+        assert!(parse_admin_bind_address("[::1]:8081", false).is_ok());
+        assert!(parse_admin_bind_address("0.0.0.0:8081", false).is_err());
+        assert!(parse_admin_bind_address("0.0.0.0:8081", true).is_ok());
     }
 
     #[test]

@@ -21,23 +21,15 @@ using Distill.Client;
 
 var client = DistillClient.Create(
     new Uri("http://localhost:8080/"),
-    apiKey: "change-me-ingest",
-    adminApiKey: "change-me-admin");
+    apiKey: "change-me-ingest");
 
-await client.EnsureChannelAsync(new CreateChannelRequest
-{
-    Name = "orders.production",
-    Preset = "raw_events"
-});
-
-// To disable a preset aggregator and persist every event, set Aggregator to null:
-// Aggregator = null
+// Provision channels through Aspire or server startup configuration.
 
 IngestResponse? response = await client.WriteAsync(
     "orders.production",
     new SimpleEvent
     {
-        Severity = "error",
+        Severity = DistillSeverity.Error,
         Message = "Payment authorization failed",
         Payload = new
         {
@@ -53,8 +45,6 @@ IngestResponse? response = await client.WriteAsync(
 
 Console.WriteLine($"Accepted: {response?.Accepted}");
 ```
-
-`EnsureChannelAsync` is intended for explicit application startup provisioning. It creates a missing channel, leaves an existing channel unchanged, and requires administration credentials. Provisioning errors should fail startup rather than allowing logs to target missing channels.
 
 For high-volume producers, use `IngestAsync` with stable `EventId` values. If a request times out after admission, retrying the same event ID allows Distill’s idempotent sink write to absorb duplicate delivery.
 

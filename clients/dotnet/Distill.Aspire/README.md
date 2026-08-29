@@ -147,7 +147,7 @@ var distill = app.Services.GetRequiredService<DistillClient>();
 await distill.EnsureChannelAsync(new CreateChannelRequest
 {
     Name = "production.errors",
-    Preset = "raw_events"
+    Preset = ChannelPreset.RawEvents
 });
 
 app.Run();
