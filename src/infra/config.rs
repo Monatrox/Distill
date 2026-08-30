@@ -28,6 +28,8 @@ pub const SUPPORTED_API_VERSIONS: [&str; 1] = ["1"];
 /// Each channel spawns an actor and registers `RabbitMQ` topology; the cap
 /// bounds those resources. Operators may raise it with `DISTILL_MAX_CHANNELS`.
 const DEFAULT_MAX_CHANNELS: usize = 500;
+/// Default time allowed for confirmed aggregate flushing during shutdown.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 
 type EnvironmentSinks = Vec<(String, SinkConfig)>;
 
@@ -46,6 +48,7 @@ pub struct Settings {
     pub api_default_version: String,
     pub max_channels: usize,
     pub sink_allowlist: SinkAllowlist,
+    pub shutdown_timeout: Duration,
 }
 
 impl fmt::Debug for Settings {
@@ -74,6 +77,7 @@ impl fmt::Debug for Settings {
             .field("api_default_version", &self.api_default_version)
             .field("max_channels", &self.max_channels)
             .field("sink_allowlist", &self.sink_allowlist)
+            .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
 }
@@ -121,6 +125,13 @@ impl Settings {
             .unwrap_or_else(|_| DEFAULT_MAX_CHANNELS.to_string())
             .parse()
             .context("DISTILL_MAX_CHANNELS must be a non-negative integer")?;
+        let shutdown_timeout_seconds = env::var("DISTILL_SHUTDOWN_TIMEOUT_SECONDS")
+            .unwrap_or_else(|_| DEFAULT_SHUTDOWN_TIMEOUT_SECONDS.to_string())
+            .parse::<u64>()
+            .context("DISTILL_SHUTDOWN_TIMEOUT_SECONDS must be a positive integer")?;
+        if shutdown_timeout_seconds == 0 {
+            anyhow::bail!("DISTILL_SHUTDOWN_TIMEOUT_SECONDS must be positive");
+        }
         let sink_allowlist =
             SinkAllowlist::parse(&env::var("DISTILL_SINK_ALLOWLIST").unwrap_or_default())
                 .map_err(|error| anyhow::anyhow!("DISTILL_SINK_ALLOWLIST is invalid: {error}"))?;
@@ -145,6 +156,7 @@ impl Settings {
             api_default_version,
             max_channels,
             sink_allowlist,
+            shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
         })
     }
 }

@@ -169,6 +169,18 @@ impl AppState {
         })
     }
 
+    pub async fn shutdown(&self) -> Result<(), DistillError> {
+        self.registry.shutdown().await
+    }
+
+    pub fn stop_admission(&self) {
+        self.registry.stop_admission();
+    }
+
+    pub fn shutdown_timeout(&self) -> std::time::Duration {
+        self.registry.shutdown_timeout()
+    }
+
     fn build_channel_definition(
         &self,
         request: &CreateChannelRequest,

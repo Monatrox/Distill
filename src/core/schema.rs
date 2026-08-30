@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    schemas: Arc<RwLock<HashMap<String, RegisteredSchema>>>,
+    schemas: Arc<RwLock<HashMap<String, PreparedSchema>>>,
 }
 
 /// Caps descriptor memory so schema registration cannot exhaust the process budget.
@@ -23,21 +23,15 @@ const MAX_SCHEMA_CACHE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_SCHEMA_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
-struct RegisteredSchema {
+pub(crate) struct PreparedSchema {
     descriptor: MessageDescriptor,
     encoded_size: usize,
 }
 
 impl SchemaRegistry {
-    pub async fn remove(&self, channel_id: &str) {
-        self.schemas.write().await.remove(channel_id);
-    }
-
-    pub async fn register(
-        &self,
-        channel_id: &str,
-        definition: MessageSchemaDefinition,
-    ) -> Result<(), DistillError> {
+    pub(crate) fn prepare(
+        definition: &MessageSchemaDefinition,
+    ) -> Result<PreparedSchema, DistillError> {
         if definition.message_type.is_empty() || definition.version.is_empty() {
             return Err(DistillError::InvalidConfiguration(
                 "message_type and version are required".to_string(),
@@ -61,15 +55,19 @@ impl SchemaRegistry {
                     definition.message_type
                 ))
             })?;
-        let key = channel_id.to_string();
+        Ok(PreparedSchema {
+            descriptor,
+            encoded_size: bytes.len(),
+        })
+    }
+
+    pub(crate) async fn activate(&self, channel_id: &str, schema: Option<PreparedSchema>) {
         let mut schemas = self.schemas.write().await;
-        schemas.insert(
-            key,
-            RegisteredSchema {
-                descriptor,
-                encoded_size: bytes.len(),
-            },
-        );
+        if let Some(schema) = schema {
+            schemas.insert(channel_id.to_string(), schema);
+        } else {
+            schemas.remove(channel_id);
+        }
         while schemas
             .values()
             .map(|schema| schema.encoded_size)
@@ -81,7 +79,6 @@ impl SchemaRegistry {
             };
             schemas.remove(&key);
         }
-        Ok(())
     }
 
     pub async fn validate_json(

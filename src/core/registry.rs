@@ -23,11 +23,18 @@ use crate::{
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
-use tokio::time::{Duration, sleep};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{info, warn};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 /// Startup connection attempts before the process aborts.
 ///
@@ -68,6 +75,9 @@ pub(crate) struct ChannelRegistry {
     pub(crate) default_sink_id: Option<String>,
     max_channels: usize,
     sink_allowlist: SinkAllowlist,
+    accepting_events: Arc<AtomicBool>,
+    channel_mutation: Arc<Mutex<()>>,
+    shutdown_timeout: Duration,
 }
 
 impl ChannelRegistry {
@@ -141,6 +151,9 @@ impl ChannelRegistry {
             default_sink_id,
             max_channels: settings.max_channels,
             sink_allowlist: settings.sink_allowlist.clone(),
+            accepting_events: Arc::new(AtomicBool::new(true)),
+            channel_mutation: Arc::new(Mutex::new(())),
+            shutdown_timeout: settings.shutdown_timeout,
         };
         if let Some(path) = &settings.config_path {
             let contents = tokio::fs::read_to_string(path).await.with_context(|| {
@@ -164,6 +177,30 @@ impl ChannelRegistry {
             .any(|record| record.lifecycle == ChannelLifecycle::Active)
     }
 
+    /// Flushes all active channel buffers before process shutdown.
+    ///
+    /// # Errors
+    /// Returns an error when a channel cannot hand buffered aggregates to `RabbitMQ`.
+    pub(crate) async fn shutdown(&self) -> Result<(), DistillError> {
+        self.stop_admission();
+        timeout(self.shutdown_timeout, self.consumer.flush_aggregators())
+            .await
+            .map_err(|_| {
+                DistillError::Persistence(format!(
+                    "channel shutdown exceeded {} seconds",
+                    self.shutdown_timeout.as_secs()
+                ))
+            })?
+    }
+
+    pub(crate) fn stop_admission(&self) {
+        self.accepting_events.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
+    }
+
     /// Returns a shared handle to the process metrics counters.
     pub(crate) fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
@@ -178,6 +215,7 @@ impl ChannelRegistry {
         &self,
         definition: ChannelDefinition,
     ) -> Result<(), DistillError> {
+        let _mutation = self.channel_mutation.lock().await;
         definition
             .validate()
             .map_err(DistillError::InvalidConfiguration)?;
@@ -206,11 +244,11 @@ impl ChannelRegistry {
                 )));
             }
         }
-        if let Some(schema) = definition.message_schema.clone() {
-            self.schemas.register(&channel_id, schema).await?;
-        } else {
-            self.schemas.remove(&channel_id).await;
-        }
+        let schema = definition
+            .message_schema
+            .as_ref()
+            .map(SchemaRegistry::prepare)
+            .transpose()?;
         let sink: Arc<dyn Sink> = if let Some(sink_id) = &definition.sink_id {
             self.sinks
                 .read()
@@ -226,19 +264,35 @@ impl ChannelRegistry {
             build_sink(&definition.sink_config, &self.sink_allowlist).await?
         };
         let old = self.channels.read().await.get(&channel_id).cloned();
-        if let Some(previous) = old {
-            previous.handle.flush().await?;
-        }
         self.consumer
             .register_exchange(&definition.rabbitmq_config.exchange_name)
             .await?;
-        self.consumer.register_sink(channel_id.clone(), sink).await;
-        let handle = channel::spawn(
+        let generation = old.as_ref().map(|_| Uuid::new_v4());
+        let proposed_handle = channel::spawn(
             definition.clone(),
+            generation,
             self.rabbit.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.budget),
         );
+        let generation = proposed_handle.generation();
+        let aggregate_enabled = definition.aggregator.is_some();
+        let prepared = self
+            .consumer
+            .prepare_channel(
+                channel_id.clone(),
+                generation,
+                sink,
+                proposed_handle,
+                aggregate_enabled,
+            )
+            .await?;
+        if let Some(previous) = &old {
+            previous.handle.stop_event_actor().await?;
+            previous.handle.flush().await?;
+        }
+        self.schemas.activate(&channel_id, schema).await;
+        let handle = self.consumer.activate_channel(prepared).await;
         self.channels.write().await.insert(
             channel_id.clone(),
             ChannelRecord {
@@ -257,6 +311,11 @@ impl ChannelRegistry {
     /// Returns an error for invalid events, unknown or inactive channels,
     /// schema mismatches, and full channel mailboxes.
     pub(crate) async fn submit_event(&self, event: LogEvent) -> Result<(), DistillError> {
+        if !self.accepting_events.load(Ordering::Acquire) {
+            return Err(DistillError::Persistence(
+                "service is shutting down and no longer accepts events".to_string(),
+            ));
+        }
         event.validate().map_err(DistillError::InvalidRequest)?;
         let record = self
             .channels
@@ -332,12 +391,12 @@ impl ChannelRegistry {
         channel_id: &str,
         definition: MessageSchemaDefinition,
     ) -> Result<(), DistillError> {
+        let _mutation = self.channel_mutation.lock().await;
         if !self.channels.read().await.contains_key(channel_id) {
             return Err(DistillError::ChannelNotFound(channel_id.to_string()));
         }
-        self.schemas
-            .register(channel_id, definition.clone())
-            .await?;
+        let schema = SchemaRegistry::prepare(&definition)?;
+        self.schemas.activate(channel_id, Some(schema)).await;
         if let Some(record) = self.channels.write().await.get_mut(channel_id) {
             record.definition.message_schema = Some(definition);
         }

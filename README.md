@@ -512,6 +512,7 @@ Distill requires:
 | `DISTILL_ALLOW_ADMIN_NETWORK` | No | Set `true` only for a private network endpoint such as Aspire service discovery; permits a non-loopback administrative bind |
 | `DISTILL_REQUEST_BODY_LIMIT_BYTES` | No | Maximum HTTP request body size; defaults to `2097152`, `0` disables |
 | `DISTILL_REQUEST_TIMEOUT_SECONDS` | No | Maximum HTTP request duration; defaults to `30`, `0` disables |
+| `DISTILL_SHUTDOWN_TIMEOUT_SECONDS` | No | Maximum confirmed aggregate flush duration; defaults to `30` and must be positive |
 | `DISTILL_MAX_CONCURRENT_REQUESTS` | No | Maximum simultaneous HTTP requests; defaults to `128`, `0` disables |
 | `DISTILL_MAX_REQUESTS_PER_MINUTE` | No | Process-wide rolling request allowance; defaults to `6000`, `0` disables |
 | `DISTILL_CONFIG_PATH` | No | JSON file containing startup channel definitions |

@@ -23,56 +23,68 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 - Run PostgreSQL migrations explicitly before production deployment. Permit automatic migration only with an opt-in development setting.
 - Support Azure Container Apps deployment through Aspire publish as production golden path. Compose remains development-only.
 
+## Current-branch architecture decisions
+
+- An accepted ingest is represented by one routed, persistent RabbitMQ message. The route flags and channel generation travel with that message so `PersistAndAggregate` does not require two independently fallible admission publications.
+- Ingestion returns `202` only after a mandatory publish receives an explicit broker acknowledgement. An unroutable or negatively acknowledged publish fails admission.
+- Aggregate inputs use durable, ordered queues isolated by channel generation. Their broker delivery is acknowledged only after any direct persistence finishes and the resulting aggregate publication is broker-confirmed.
+- A channel replacement prepares its sink, schema, exchange, generation queue, and actors before it stops the old event actor. Already accepted work remains pinned to the old generation and sink; newly accepted work uses the activated generation.
+- Startup-configured definitions derive stable generations. Runtime replacements deliberately receive fresh generations, but runtime mutations remain ephemeral until the control plane and generation lifecycle are persisted.
+- Shutdown stops admission, drains the HTTP listeners, and then flushes every in-process aggregate generation. `DISTILL_SHUTDOWN_TIMEOUT_SECONDS` bounds this work and defaults to 30 seconds.
+- Malformed broker deliveries are confirmed into the DLQ before the original is acknowledged. Structured failure metadata, envelope versioning, and operator replay remain required before release.
+
+## Current status
+
+**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean (blocker 37), but still needs CI enforcement.
+
+**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` still needs Docker-capable CI execution. Blocker 2 stops admission and bounds confirmed shutdown flushing but lacks SIGTERM integration coverage. Blocker 5 now isolates aggregate channels, while direct persistence still shares one sleeping retry consumer. Blocker 6 confirms malformed-envelope dead-lettering but still needs failure metadata and broker integration coverage. Blocker 30 now stages replacement resources and preserves generation-specific sinks, but failure rollback, restart behavior for ephemeral generations, and generation retirement remain incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack their complete contract/integration coverage.
+
+**Current critical path:** run blocker 1's Docker-backed crash/restart test in CI. Then finish broker recovery/retry/limits/replay and generation retirement (4, 5, 28, 29, 30), and close partial blockers with integration tests. All unlisted blockers remain open.
+
+**Verification snapshot (2026-08-30):** `cargo test --all-targets` passes all 42 tests; `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell syntax validation for the durable-aggregate script pass locally. Docker daemon access was unavailable, so the RabbitMQ/PostgreSQL crash-restart scenario is not yet verified.
+
 ## P0 — Correctness and durability
 
-### 1. Aggregate-only events are acknowledged before durable handoff
+### 1. Durable aggregate acceptance lacks crash/restart verification
 
-**Evidence:** `src/core/channel.rs` stores aggregate-only events in `EventBuffer`; RabbitMQ publication occurs only when the aggregate flushes. `src/http/ingest.rs` still reports `durability: "queued"` and returns `202 Accepted`.
+**Status:** Partial. Each accepted event is one mandatory, publisher-confirmed broker message. Aggregate routes use ordered, per-channel-generation queues whose acknowledgements wait for confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` starts RabbitMQ/PostgreSQL, kills Distill after its first accepted event, restarts it, and expects a two-event aggregate.
 
-**Impact:** Process crash can lose events already reported as durably accepted.
-
-**Minimal resolution:**
-
-1. Publish every accepted event to RabbitMQ before returning `202`.
-2. Move aggregation behind the durable broker boundary, or introduce a durable aggregate-input queue consumed by the aggregator.
-3. Return `202` only after publisher confirmation.
-4. Add an integration test that kills Distill after acceptance but before aggregate flush, restarts it, and verifies the event contributes to the eventual aggregate.
+**Remaining work:** Run this Docker-backed check in CI; it could not run locally without Docker daemon access.
 
 **Done when:** Every `202` response has a tested recovery path after immediate process termination.
 
-### 2. Graceful shutdown does not flush aggregate buffers
+### 2. Graceful aggregate flushing lacks SIGTERM coverage
 
-**Evidence:** `run_actor` in `src/core/channel.rs` exits when its command channel closes and only logs that it stopped. `src/lib.rs` stops HTTP servers but does not flush all registered channels.
+**Status:** Partial. `ChannelRegistry::shutdown` stops admission and gives every active aggregate generation a configurable, 30-second-default window to publish with broker confirmation after both listeners stop. SIGTERM integration coverage remains.
 
-**Impact:** Normal container replacement or deployment shutdown can lose buffered aggregate events.
+**Remaining risk:** The shutdown path is implemented but not yet proven against a real SIGTERM with non-empty aggregate buffers and an unavailable broker.
 
 **Minimal resolution:**
 
-1. Add a registry shutdown method that stops admission and flushes every active channel.
-2. Invoke it after HTTP shutdown begins and before process exit.
-3. Bound shutdown with a configurable timeout; fail visibly when durable handoff cannot complete.
-4. Test SIGTERM with a non-empty aggregate buffer.
+1. Add a SIGTERM integration test with a non-empty aggregate buffer.
 
 **Done when:** SIGTERM either durably flushes all accepted data or exits with an explicit failure after the configured timeout.
 
 ### 3. Dynamic channel and lifecycle state is not durable
 
+**Status:** Open. Stable generations let unchanged startup-configured definitions reconnect to their durable aggregate queues. API-created definitions, lifecycle changes, and the fresh generations assigned to runtime replacements are not persisted. The broker consumer also starts before startup definitions finish registering.
+
 **Evidence:** `ChannelRegistry` stores channels in an in-memory `HashMap`. API-created channels, schemas, and paused/archived states are not written back to configuration.
 
-**Impact:** Restart removes runtime-created channels. Existing RabbitMQ messages may then retry or dead-letter because their sink/channel mapping no longer exists.
+**Impact:** Restart removes runtime-created channels and cannot recreate runtime replacement generations. Existing RabbitMQ messages may retry or dead-letter because their generation-specific sink, actor, or queue consumer no longer exists.
 
 **Minimal resolution:**
 
 1. Document explicit application startup declarations as the supported channel provisioning workflow.
 2. Keep runtime channel mutation, but clearly mark it ephemeral until a durable control-plane store is added.
-3. Persist ensured definitions or otherwise restore channel definitions and sink mappings before RabbitMQ resumes backlog consumption.
+3. Persist ensured definitions and active generations, or otherwise restore channel definitions and generation-specific sink mappings before RabbitMQ resumes backlog consumption.
 4. Add restart tests with queued messages and lifecycle changes.
 
-**Done when:** Restart restores every startup-configured channel before queued delivery resumes; runtime channel and lifecycle mutations are documented as ephemeral.
+**Done when:** Restart restores every startup-configured channel before queued delivery resumes, and runtime mutation is either disabled on the production boundary or persisted with its active generation mappings.
 
 ### 4. RabbitMQ consumer does not recover after connection failure
 
-**Evidence:** `RabbitConsumer::connect` spawns one consumer task. If `consume` returns, it logs `distill.rabbit.consumer.stopped` and is not restarted.
+**Evidence:** `RabbitConsumer::connect` spawns the shared persistence consumer and each generation consumer once. If any consume loop returns, it logs that the consumer stopped and is not restarted.
 
 **Impact:** Process remains alive and healthy while persistence delivery has permanently stopped.
 
@@ -85,11 +97,13 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** RabbitMQ restart recovers automatically without restarting Distill or losing acknowledged events.
 
-### 5. One failing sink blocks all delivery
+### 5. Shared direct-persistence retries block unrelated channels
 
-**Evidence:** `src/broker/mod.rs` uses prefetch `1` and sleeps inside the only consumer before republishing a retry.
+**Status:** Partial. Per-channel-generation aggregate queues isolate aggregate ingestion and preserve ordered actor admission. Direct event and aggregate persistence still share one consumer that sleeps before republishing a retry.
 
-**Impact:** One unavailable sink stalls every channel for up to the retry delay.
+**Evidence:** `src/broker/mod.rs` uses prefetch `1` for the shared persistence queue and sleeps inside that consumer before republishing a retry.
+
+**Impact:** One unavailable direct-persistence sink can still stall unrelated direct event and aggregate delivery for up to the retry delay.
 
 **Minimal resolution:**
 
@@ -100,22 +114,22 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Failure of one destination does not stop delivery to unrelated healthy destinations.
 
-### 6. Poison messages can requeue forever
+### 6. Poison-message DLQ handling lacks a complete recovery contract
 
-**Evidence:** If envelope deserialization fails in `process_delivery`, `retry_delivery` fails to deserialize the same payload, then the consumer negatively acknowledges it with `requeue: true`.
+**Status:** Partial. Malformed envelopes and payloads are now published to the DLQ and acknowledged; unit coverage proves they bypass retry. DLQ messages still lack structured failure metadata and broker integration coverage.
 
-**Impact:** One malformed message can loop forever and block the prefetch-one consumer.
+**Remaining risk:** Operators cannot safely diagnose or selectively replay poison messages, and the confirmed DLQ path has not been exercised against RabbitMQ.
 
 **Minimal resolution:**
 
-1. Treat malformed envelopes as non-retryable.
-2. Publish raw bytes plus failure metadata to the dead-letter exchange.
-3. Confirm dead-letter publication, then acknowledge the original.
-4. Add malformed JSON and unknown-version envelope tests.
+1. Add failure reason and envelope-version metadata to DLQ publications without exposing payload data in logs.
+2. Add envelope versioning and malformed JSON/unsupported-version broker integration tests; prove later valid delivery continues.
 
-**Done when:** Poison messages reach DLQ once and later valid messages continue processing.
+**Done when:** Poison messages reach the DLQ once with safe diagnostic/version metadata, later valid messages continue processing, and operators have a tested replay path.
 
 ### 7. Rolling aggregates are inconsistent across sink drivers
+
+**Status:** Partial. Channel registration rejects rolling aggregates for every non-PostgreSQL sink. PostgreSQL rolling contract coverage remains.
 
 **Evidence:** PostgreSQL merges rolling windows transactionally. MySQL and SQL Server overwrite the existing record with the latest window snapshot. HTTP receivers get repeated snapshots with the same stable aggregate ID, while current documentation also recommends deduplicating that ID; a receiver can therefore mistake later rolling windows for duplicates.
 
@@ -129,24 +143,19 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Rolling aggregates are rejected for every non-PostgreSQL sink, and PostgreSQL rolling-aggregate contract tests pass.
 
-### 8. Retention and compression settings have no behavior
+### 8. Unsupported retention and compression must remain rejected
 
-**Evidence:** `retention_hours` and `compression_enabled` are parsed, validated, and returned, but persistence code does not enforce either setting.
+**Status:** Implemented. `retention_hours` and enabled `compression_enabled` return v1 validation errors; production documentation no longer advertises either behavior.
 
-**Impact:** Operators can believe data is expiring or compressed when it is not.
-
-**Minimal resolution:**
-
-1. Remove these fields from v1 SDK examples and production claims, or return a validation error when set.
-2. Reintroduce them only with database jobs/policies and end-to-end tests.
+**Future work:** Reintroduce these fields only with database jobs/policies and end-to-end tests.
 
 **Done when:** Configuration cannot claim unsupported retention or compression behavior.
 
 ## P0 — Aspire integration
 
-### 9. Aspire PostgreSQL and HTTP sink configuration does not match the server
+### 9. Aspire sink configuration lacks complete golden-path coverage
 
-**Evidence:** `Distill.Aspire` emits `DISTILL_SINK__{NAME}__*` and `DISTILL_DEFAULT_SINK`. Server configuration reads `DISTILL_SINKS_CONFIG_PATH` and legacy `DISTILL_DEFAULT_SINK_CONNECTION_STRING` only.
+**Status:** Partial. Server parses `DISTILL_SINK__{NAME}__*` and `DISTILL_DEFAULT_SINK`; Aspire emits that format. Explicit HTTP/PostgreSQL golden-path APIs, private receiver allowlisting, secret-backed headers, and end-to-end contract coverage remain.
 
 **Impact:** Mandatory custom HTTP sinks do not work through Aspire as documented. PostgreSQL works only through the legacy fallback.
 
@@ -194,11 +203,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** `.WithReference(distill)` supplies the endpoint and required credentials without plaintext duplication, and ingest-only consumers never receive the admin key.
 
-### 11. Management endpoint boundary is contradictory
+### 11. Management boundary lacks complete contract coverage
 
-**Evidence:** `public_router` merges administrative routes, and `Caddyfile` proxies every public path. Documentation says administrative routes are loopback-only. A second loopback admin router also exists.
+**Status:** Partial. Public router no longer merges administrative routes; Aspire exposes a non-external private admin endpoint. Route tests and final Caddy/OpenAPI/documentation alignment remain.
 
-**Impact:** Operators cannot know which security model is real; administrative routes are publicly reachable when the public listener is exposed.
+**Remaining risk:** Caddy, OpenAPI, and route coverage can drift from the now-private administrative boundary.
 
 **Minimal resolution:**
 
@@ -209,11 +218,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Public and administrative surfaces have one documented, tested boundary.
 
-### 12. Aspire health check uses an administrative operation
+### 12. Aspire health registration and readiness semantics are incomplete
 
-**Evidence:** `DistillHealthCheck` calls `GetChannelAsync("application")`. Without an admin key, the client sends the ingest key and receives `401`.
+**Status:** Partial. `DistillHealthCheck` now probes `/health` through `CheckHealthAsync` without admin credentials. Resource-level registration and final liveness/readiness split remain.
 
-**Impact:** Default Aspire dashboard health can be unhealthy even when ingestion works.
+**Remaining risk:** Resource-level health and liveness/readiness semantics can still diverge.
 
 **Minimal resolution:**
 
@@ -238,11 +247,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Installing the NuGet package plus documented GHCR credentials is sufficient to launch the matching Distill image.
 
-### 14. Aspire resource uses a fixed host port
+### 14. Dynamic Aspire host ports lack parallel-AppHost coverage
 
-**Evidence:** `WithHttpEndpoint(DefaultHttpPort, DefaultHttpPort, "http")` fixes host and target ports to `8080`.
+**Status:** Partial. Aspire specifies target port `8080` only; host port allocation is dynamic. Parallel-AppHost coverage remains.
 
-**Impact:** Parallel AppHosts or an existing service on port 8080 cause avoidable conflicts.
+**Remaining risk:** A regression could reintroduce fixed host ports without parallel-AppHost coverage.
 
 **Minimal resolution:**
 
@@ -280,11 +289,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ## P0 — C# SDK and logging provider
 
-### 17. Presets always serialize `aggregator: null`
+### 17. Aggregation override serialization must remain three-state
 
-**Evidence:** `CreateChannelRequest.Aggregator` uses `JsonIgnoreCondition.Never`. Default requests therefore include `"aggregator": null`, which tells the server to disable the preset aggregator.
+**Status:** Implemented. Null aggregators are omitted; `DisableAggregation = true` emits `"aggregator": null`. Runnable contract checks cover omitted and explicit-null behavior.
 
-**Impact:** `metrics`, `count`, and `errors_only` presets silently behave differently through C#.
+**Regression risk:** Serialization changes could again make presets silently disable aggregation.
 
 **Minimal resolution:**
 
@@ -382,11 +391,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** DI registration has managed client lifetimes and no hidden owned `HttpClient`.
 
-### 24. SDK uses unchecked strings for closed protocol values
+### 24. Typed SDK protocol values must remain wire-compatible
 
-**Evidence:** Presets, severity, aggregation function, granularity, and ordering are public strings.
+**Status:** Implemented. C# enum types serialize with snake_case wire values; raw full-definition API remains an explicit escape hatch.
 
-**Impact:** Typos compile and fail only at runtime.
+**Regression risk:** Enum wire values can drift from the server contract without OpenAPI contract coverage.
 
 **Minimal resolution:**
 
@@ -396,11 +405,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Normal channel creation is compile-time guided and server-compatible.
 
-### 25. SDK does not pin API version
+### 25. SDK API-version pinning must remain enforced
 
-**Evidence:** Server supports `X-API-VERSION`; C# requests do not set it.
+**Status:** Implemented. C# requests send supported API version `1`; runnable contract check asserts the header.
 
-**Impact:** Client behavior can drift when server defaults change.
+**Regression risk:** Supported client and server API versions can drift without OpenAPI contract coverage.
 
 **Minimal resolution:**
 
@@ -443,7 +452,9 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 28. Queue growth has no application-defined ceiling
 
-**Evidence:** Durable delivery and dead-letter queues are declared without maximum length/bytes or retention policy.
+**Status:** Open; the 1 GiB/1,000,000-message `reject-publish` policy is decided but not implemented.
+
+**Evidence:** The shared delivery queue, DLQ, and durable per-generation aggregate queues are declared without maximum length/bytes or retention policy. Replaced generations also have no retirement or queue-deletion workflow.
 
 **Impact:** Extended sink outage can consume RabbitMQ disk until broker alarms stop the system.
 
@@ -451,9 +462,10 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 1. Document required RabbitMQ disk alarms and queue policies.
 2. Cap each delivery and retry queue at 1 GiB or 1,000,000 messages, whichever comes first, with `reject-publish` overflow. Failed broker admission must fail ingestion rather than return `202`.
-3. Alert on queue depth, oldest message age, disk watermark, retry depth, and DLQ count.
+3. Define when a drained generation is retired, stop its consumer, remove its in-memory sink/actor bindings, and delete or expire its queue without discarding accepted work.
+4. Alert on queue depth, oldest message age, disk watermark, retry depth, generation count, and DLQ count.
 
-**Done when:** Sink outage produces bounded, observable behavior with a documented operator response.
+**Done when:** Sink outage produces bounded, observable behavior with a documented operator response, and drained generations do not leave unbounded queues or in-memory bindings.
 
 ### 29. Dead-letter messages have no supported replay workflow
 
@@ -469,20 +481,22 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Operator can recover from a resolved sink outage using documented tooling.
 
-### 30. Channel replacement is not transactional
+### 30. Channel replacement is not fully transactional or restart-safe
 
-**Evidence:** Schema state can change before sink and broker setup completes. Replacement flushes and mutates several resources without one commit boundary.
+**Status:** Partial. Registration is serialized and validates/builds the sink, schema, exchange, generation queue, and actors before touching the active record. Queued work remains pinned to its generation-specific sink. The old event actor is then stopped and flushed before schema/consumer activation and the record swap.
 
-**Impact:** Failed replacement can leave schema/runtime state inconsistent.
+**Remaining gaps:** A failure while stopping or flushing the old actor has no rollback, prepared actors/queues are not cleaned up, and old generations are retained indefinitely. Runtime replacement generations are not restored across process restart.
+
+**Impact:** Most preparation failures leave the prior channel operational, but a late replacement failure can stop its event actor or leak generation resources. A restart can strand backlog accepted under an ephemeral runtime generation.
 
 **Minimal resolution:**
 
-1. Validate and construct new sink, schema, and topology before changing active state.
-2. Atomically swap the channel record only after preparation succeeds.
-3. Retain old channel and schema on failure.
-4. Add failure-injection tests for each preparation step.
+1. Add rollback or a recoverable commit protocol for failures after the old actor begins stopping.
+2. Retire prepared resources when activation fails and retire old generations only after their queues and actor buffers are durably drained.
+3. Persist or deterministically restore runtime generation mappings before consuming backlog after restart.
+4. Add failure-injection and concurrent-ingest tests for every preparation and activation boundary.
 
-**Done when:** Every failed replacement leaves the prior channel fully operational.
+**Done when:** Every failed replacement leaves the prior channel fully operational, every accepted event remains bound to the intended sink across replacement and restart, and drained generations are reclaimed safely.
 
 ### 31. Database schema changes are ad hoc
 
@@ -560,11 +574,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Done when:** Releases are reproducible and cannot bypass required checks.
 
-### 37. Rust formatting currently fails
+### 37. Rust formatting lacks CI enforcement
 
-**Evidence:** `cargo fmt --check` reports differences in `src/core/errors.rs` and `src/http/openapi.rs`.
+**Status:** Partial. `cargo fmt --check` passes locally. Add CI enforcement with blocker 36.
 
-**Minimal resolution:** Run `cargo fmt` and enforce `cargo fmt --check` in CI.
+**Remaining work:** Enforce `cargo fmt --check` in CI.
 
 **Done when:** Clean checkout passes formatting without modifications.
 
@@ -609,6 +623,7 @@ Production-ready v1 should not ship until all items below pass:
 - [ ] RabbitMQ restart recovers automatically.
 - [ ] Poison and exhausted messages reach DLQ without blocking healthy delivery.
 - [ ] Distill restart restores channel/sink state before consuming backlog.
+- [ ] Channel replacement preserves old-generation delivery, rolls back every injected failure, and retires drained generation queues without data loss.
 - [ ] `/health` and `/ready` report liveness and readiness accurately.
 - [ ] Metrics distinguish admission, sink persistence, retries, drops, and DLQ delivery.
 - [ ] NuGet packages pack, install, and run from a clean local feed.
@@ -619,11 +634,11 @@ Production-ready v1 should not ship until all items below pass:
 
 Work in this order to avoid implementing behavior that v1 later removes:
 
-1. **Lock v1 surface first** — blockers 3, 7, 8, and 22. Startup/Aspire is supported channel provisioning workflow; runtime channel mutations remain documented as ephemeral; PostgreSQL-only rolling aggregates; reject retention/compression; no logger self-provisioning. *In progress: scope and validation complete; startup recovery testing remains.*
-2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types. *In progress: public/admin split, dynamic host port, and SDK wire types/version pinning complete; Aspire secrets, HTTP receiver contract, and checked-in OpenAPI remain.*
-3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, replay.
-4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; transactional replacement; explicit migrations.
+1. **Lock v1 surface first** — blockers 3, 7, 8, and 22. Owning applications explicitly provision finite channels at startup; runtime channel mutations remain documented as ephemeral; PostgreSQL-only rolling aggregates; reject retention/compression; no logger self-provisioning. *In progress: retention/compression and explicit provisioning are implemented; rolling and restart integration coverage remain.*
+2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types. *In progress: server/Aspire sink environment contract, private admin route, dynamic host port, typed SDK values, aggregation serialization, and API version pinning are implemented; secrets, HTTP receiver contract, resource-level health, OpenAPI artifact, and integration coverage remain.*
+3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, generation retirement, replay. *In progress: bounded listener shutdown/aggregate flush, poison-message DLQ bypass, one confirmed admission publication, and isolated durable aggregate input are implemented; run aggregate crash/restart coverage in Docker CI before accepting final semantics.*
+4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; replacement rollback and restart-safe generations; explicit migrations. *In progress: replacement resources are staged and queued work retains its generation-specific sink; rollback, durable runtime generations, retirement, and failure-injection coverage remain.*
 5. **Ship golden path** — blockers 13, 15, 16, and 32. Versioned image, RabbitMQ persistence/credentials, Aspire sample plus end-to-end test, Azure publish docs.
-6. **Release guardrails and docs** — blockers 33–39. Run blocker 37 now; package metadata/pack fix; CI gates; contract checks; remove stale claims.
+6. **Release guardrails and docs** — blockers 33–39. Rust formatting is clean; add CI enforcement, package metadata/pack fix, CI gates, contract checks, and remove stale claims.
 
 Build tests with each phase. Phase 5 golden-path test becomes release gate in phase 6.
