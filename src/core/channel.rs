@@ -215,7 +215,7 @@ async fn run_aggregator(
                                     &metrics,
                                 ).await
                             {
-                                warn!(event.name = "distill.aggregate.flush.failure", error.message = %error, "aggregate flush failed");
+                                warn!(event.name = "distill.aggregate.flush.failure", error.code = %error.error_code(), "aggregate flush failed");
                             }
                         }
                         Err(error) => {
@@ -263,7 +263,7 @@ async fn run_aggregator(
                         &metrics,
                     ).await
                 {
-                    warn!(event.name = "distill.aggregate.flush.failure", error.message = %error, "aggregate flush failed");
+                    warn!(event.name = "distill.aggregate.flush.failure", error.code = %error.error_code(), "aggregate flush failed");
                 }
             }
         }

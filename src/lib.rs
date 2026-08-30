@@ -28,7 +28,7 @@ mod persistence;
 pub async fn run() -> anyhow::Result<()> {
     let command = infra::cli::Cli::parse();
     if command.command.is_some() {
-        return command.run();
+        return command.run().await;
     }
     let http_limits = command.http_limits();
 

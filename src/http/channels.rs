@@ -307,7 +307,6 @@ fn log_registration_failure(channel_id: &str, error: &DistillError) {
         event.name = "distill.channel.registration_failed",
         channel.id = %channel_id,
         error.code = %error.error_code(),
-        error = %error,
         "channel registration failed"
     );
 }

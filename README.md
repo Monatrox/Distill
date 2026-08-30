@@ -475,11 +475,13 @@ Distill is designed around a clear handoff contract:
 3. Distill publishes the event or aggregate to RabbitMQ.
 4. RabbitMQ confirms durable publication.
 5. The internal consumer writes to the channel’s configured sink.
-6. The consumer acknowledges only after an idempotent sink write succeeds.
+6. The consumer acknowledges after an idempotent sink write succeeds or after a confirmed handoff to retry/DLQ storage.
 
-If the configured sink is temporarily unavailable, messages are retried with bounded backoff. Exhausted messages are sent to the durable `distill.dead-letter` exchange and queue for operator investigation.
+If the configured sink is temporarily unavailable, messages move through durable quorum TTL retry queues configured for RabbitMQ at-least-once dead-lettering; consumer tasks never sleep while holding the shared delivery path. Exhausted or malformed deliveries move to the durable `distill.dead-letter` exchange and queue with bounded failure metadata and original broker bytes. Use `distill dlq list` to inspect metadata and `distill dlq replay --id <message-id>` or `--all` only after destination recovery. Replay is intentionally limited to valid, exhausted direct-persistence records; poison and aggregate-input records remain retained because replaying their unchanged bytes is unsafe. Default CLI output never prints payloads.
 
-Because writes are idempotent, producers should retry an event using the same `event_id` when a request times out.
+Delivery, retry, dead-letter, and aggregate-generation queues cap at 1,000,000 messages or 1 GiB with `reject-publish`. A full queue rejects publication, so ingest returns non-success instead of `202`. Configure RabbitMQ disk alarms and alert on queue depth, oldest-message age, DLQ count, and broker disk watermark; a full DLQ leaves original delivery recoverable rather than discarding failure.
+
+Direct event and aggregate-output sink writes are idempotent by their stable record IDs. Producers should retry an event using the same `event_id` when a request times out. Aggregate-input deduplication is not yet durable across every acknowledgement-failure window, so aggregate replay remains disabled.
 
 ## Configuration
 

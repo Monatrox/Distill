@@ -31,37 +31,38 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 - A channel replacement prepares its sink, schema, exchange, generation queue, and actors before it stops the old event actor. Already accepted work remains pinned to the old generation and sink; newly accepted work uses the activated generation.
 - Startup-configured definitions derive stable generations. Runtime replacements deliberately receive fresh generations, but runtime mutations remain ephemeral until the control plane and generation lifecycle are persisted.
 - Shutdown stops admission, drains the HTTP listeners, and then flushes every in-process aggregate generation. `DISTILL_SHUTDOWN_TIMEOUT_SECONDS` bounds this work and defaults to 30 seconds.
-- Malformed broker deliveries are confirmed into the DLQ before the original is acknowledged. Structured failure metadata, envelope versioning, and operator replay remain required before release.
+- Malformed broker deliveries are confirmed into the DLQ before the original is acknowledged. Structured failure metadata, envelope versioning, and safe replay of eligible records are implemented; real-broker evidence and a repair path for ineligible records remain required before release.
+- Retry delay queues are quorum queues configured for RabbitMQ at-least-once dead-lettering. Replay is limited to valid exhausted direct-persistence records; poison and aggregate-input records remain retained until a safe transformation/deduplication contract exists.
 
 ## Current status
 
-**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean (blocker 37), but still needs CI enforcement.
+**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean and the new broker-durability workflow enforces it, but that workflow still needs execution evidence before blocker 37 can close.
 
-**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` still needs Docker-capable CI execution. Blocker 2 stops admission and bounds confirmed shutdown flushing but lacks SIGTERM integration coverage. Blocker 5 now isolates aggregate channels, while direct persistence still shares one sleeping retry consumer. Blocker 6 confirms malformed-envelope dead-lettering but still needs failure metadata and broker integration coverage. Blocker 30 now stages replacement resources and preserves generation-specific sinks, but failure rollback, restart behavior for ephemeral generations, and generation retirement remain incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack their complete contract/integration coverage.
+**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. The crash/restart script passed under Podman before the latest quorum-retry and permission corrections and must be rerun. Blocker 2 has the same prior local SIGTERM evidence and also needs rerun/CI evidence. Blocker 4 now reconnects shared and generation consumers after a bounded delay, but lacks state, shutdown-aware backoff, jitter, publisher reconnect, and broker-restart coverage. Blocker 5 uses quorum TTL retry queues with at-least-once dead-lettering, but needs RabbitMQ isolation and saturation coverage. Blocker 6 versions envelopes, records byte-bounded failure metadata, and provides bounded metadata-only DLQ tooling; broker integration coverage remains. Blocker 28 applies `reject-publish` limits to delivery, retry, DLQ, and generation queues, but needs broker assertions and generation retirement. Blocker 29 safely replays eligible direct-persistence records but deliberately retains poison and aggregate inputs; PostgreSQL replay coverage remains. Blocker 30 remains incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack complete contract/integration coverage.
 
 **Current critical path:** run blocker 1's Docker-backed crash/restart test in CI. Then finish broker recovery/retry/limits/replay and generation retirement (4, 5, 28, 29, 30), and close partial blockers with integration tests. All unlisted blockers remain open.
 
-**Verification snapshot (2026-08-30):** `cargo test --all-targets` passes all 42 tests; `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell syntax validation for the durable-aggregate script pass locally. Docker daemon access was unavailable, so the RabbitMQ/PostgreSQL crash-restart scenario is not yet verified.
+**Verification snapshot (2026-08-30):** `cargo test --all-targets` passes 49 tests; CLI selector/error smoke checks, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell validation pass. The revised broker script could not run because neither Podman nor Docker was accessible. Current retry, DLQ, replay, reconnect, overflow, crash/restart, SIGTERM, and retirement scenarios therefore still require real-broker evidence.
 
 ## P0 — Correctness and durability
 
 ### 1. Durable aggregate acceptance lacks crash/restart verification
 
-**Status:** Partial. Each accepted event is one mandatory, publisher-confirmed broker message. Aggregate routes use ordered, per-channel-generation queues whose acknowledgements wait for confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` starts RabbitMQ/PostgreSQL, kills Distill after its first accepted event, restarts it, and expects a two-event aggregate.
+**Status:** Partial. Each accepted event is one mandatory, publisher-confirmed broker message. Aggregate routes use ordered, per-channel-generation queues whose acknowledgements wait for confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` starts RabbitMQ/PostgreSQL, kills Distill after confirmed direct, aggregate-only, and `PersistAndAggregate` admissions, restarts it, and verifies direct events persist once plus each aggregate contains two events.
 
-**Remaining work:** Run this Docker-backed check in CI; it could not run locally without Docker daemon access.
+**Remaining work:** Rerun the revised Podman/Docker-backed check and preserve it as CI evidence. Prior evidence predates the retry-topology correction.
 
 **Done when:** Every `202` response has a tested recovery path after immediate process termination.
 
 ### 2. Graceful aggregate flushing lacks SIGTERM coverage
 
-**Status:** Partial. `ChannelRegistry::shutdown` stops admission and gives every active aggregate generation a configurable, 30-second-default window to publish with broker confirmation after both listeners stop. SIGTERM integration coverage remains.
+**Status:** Partial. `ChannelRegistry::shutdown` stops admission and gives every active aggregate generation a configurable, 30-second-default window to publish with broker confirmation after both listeners stop. The script covers successful and unavailable-broker SIGTERM cases, but its current revision lacks executed container evidence.
 
-**Remaining risk:** The shutdown path is implemented but not yet proven against a real SIGTERM with non-empty aggregate buffers and an unavailable broker.
+**Remaining risk:** Prior Podman evidence predates the latest broker and fixture corrections; rerun locally and in CI.
 
 **Minimal resolution:**
 
-1. Add a SIGTERM integration test with a non-empty aggregate buffer.
+1. Preserve the SIGTERM integration check as CI evidence.
 
 **Done when:** SIGTERM either durably flushes all accepted data or exits with an explicit failure after the configured timeout.
 
@@ -84,46 +85,43 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 4. RabbitMQ consumer does not recover after connection failure
 
-**Evidence:** `RabbitConsumer::connect` spawns the shared persistence consumer and each generation consumer once. If any consume loop returns, it logs that the consumer stopped and is not restarted.
+**Status:** Partial. Shared persistence and generation consumers reconnect on fresh connections after a bounded two-second delay, re-declaring their required topology, confirms, and QoS. Publisher reconnect, consumer state, jittered exponential backoff, shutdown cancellation, and real broker-restart coverage remain.
 
-**Impact:** Process remains alive and healthy while persistence delivery has permanently stopped.
+**Remaining risk:** Process health still does not expose consumer degradation, and the publisher remains fail-closed rather than reconnecting.
 
 **Minimal resolution:**
 
-1. Supervise the consumer task with bounded reconnect backoff.
-2. Re-declare topology and resume consumption after reconnect.
-3. Track consumer state for readiness and metrics.
+1. Add exponential backoff with jitter and shutdown cancellation to the current supervisor.
+2. Track consumer state for readiness and metrics.
+3. Reconnect the publisher or verify its fail-closed admission behavior throughout broker restart.
 4. Test broker restart during active delivery.
 
 **Done when:** RabbitMQ restart recovers automatically without restarting Distill or losing acknowledged events.
 
 ### 5. Shared direct-persistence retries block unrelated channels
 
-**Status:** Partial. Per-channel-generation aggregate queues isolate aggregate ingestion and preserve ordered actor admission. Direct event and aggregate persistence still share one consumer that sleeps before republishing a retry.
+**Status:** Partial. Per-channel-generation aggregate queues isolate aggregate ingestion and preserve ordered actor admission. Direct persistence now hands failures to durable, capped TTL retry queues and acknowledges only after confirmed retry publication. RabbitMQ isolation coverage remains.
 
-**Evidence:** `src/broker/mod.rs` uses prefetch `1` for the shared persistence queue and sleeps inside that consumer before republishing a retry.
+**Evidence:** `src/broker/mod.rs` routes failed delivery through confirmed, TTL-based retry queues; real-broker isolation coverage remains.
 
-**Impact:** One unavailable direct-persistence sink can still stall unrelated direct event and aggregate delivery for up to the retry delay.
+**Remaining risk:** Sink-call latency can still hold the shared prefetch-one consumer briefly, and retry/DLQ saturation isolation lacks broker coverage.
 
 **Minimal resolution:**
 
-1. Replace in-consumer sleeps with durable RabbitMQ retry queues using TTL and dead-letter routing.
-2. Preserve retry count in message headers or the existing envelope.
-3. Acknowledge the original only after retry publication is confirmed.
-4. Test that a healthy channel continues while another sink fails.
+1. Test quorum TTL/DLX transfer and prove a healthy channel continues while another sink fails or its retry queue is saturated.
 
 **Done when:** Failure of one destination does not stop delivery to unrelated healthy destinations.
 
 ### 6. Poison-message DLQ handling lacks a complete recovery contract
 
-**Status:** Partial. Malformed envelopes and payloads are now published to the DLQ and acknowledged; unit coverage proves they bypass retry. DLQ messages still lack structured failure metadata and broker integration coverage.
+**Status:** Partial. Malformed envelopes and payloads are published to the DLQ before acknowledgement; envelopes are versioned, failure reasons are bounded by UTF-8 bytes, and CLI inspection/replay is async, constant-memory, and payload-free by default. Poison and aggregate-input replay is intentionally ineligible. Broker integration coverage remains.
 
-**Remaining risk:** Operators cannot safely diagnose or selectively replay poison messages, and the confirmed DLQ path has not been exercised against RabbitMQ.
+**Remaining risk:** Confirmed DLQ/replay and full-DLQ recovery have not been exercised against RabbitMQ. Unsafe records need a separate repair/export contract rather than unchanged replay.
 
 **Minimal resolution:**
 
-1. Add failure reason and envelope-version metadata to DLQ publications without exposing payload data in logs.
-2. Add envelope versioning and malformed JSON/unsupported-version broker integration tests; prove later valid delivery continues.
+1. Add malformed JSON/unsupported-version/full-DLQ broker integration tests; prove later valid delivery continues or the supervised consumer recovers after capacity returns.
+2. Define safe inspection/repair for ineligible poison records without exposing payloads by default.
 
 **Done when:** Poison messages reach the DLQ once with safe diagnostic/version metadata, later valid messages continue processing, and operators have a tested replay path.
 
@@ -452,32 +450,30 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 28. Queue growth has no application-defined ceiling
 
-**Status:** Open; the 1 GiB/1,000,000-message `reject-publish` policy is decided but not implemented.
+**Status:** Partial; the 1 GiB/1,000,000-message `reject-publish` policy is applied to application delivery, retry, DLQ, and generation queues. Broker assertions, operator alarms, and safe generation retirement remain.
 
-**Evidence:** The shared delivery queue, DLQ, and durable per-generation aggregate queues are declared without maximum length/bytes or retention policy. Replaced generations also have no retirement or queue-deletion workflow.
+**Evidence:** Application queues now declare maximum length/bytes and `reject-publish`; replacing pre-existing queues requires an explicit drain/recreate maintenance step. Replaced generations still have no retirement or queue-deletion workflow.
 
-**Impact:** Extended sink outage can consume RabbitMQ disk until broker alarms stop the system.
+**Remaining risk:** Per-queue limits lack real-broker assertions, the number of retry/generation queues can still grow, and operator alarms/retirement are incomplete.
 
 **Minimal resolution:**
 
-1. Document required RabbitMQ disk alarms and queue policies.
-2. Cap each delivery and retry queue at 1 GiB or 1,000,000 messages, whichever comes first, with `reject-publish` overflow. Failed broker admission must fail ingestion rather than return `202`.
-3. Define when a drained generation is retired, stop its consumer, remove its in-memory sink/actor bindings, and delete or expire its queue without discarding accepted work.
-4. Alert on queue depth, oldest message age, disk watermark, retry depth, generation count, and DLQ count.
+1. Assert queue caps and queue-full admission behavior against RabbitMQ.
+2. Define when drained retry and channel generations are retired without discarding accepted work.
+3. Document and test required disk alarms plus queue depth, oldest-message, retry-generation, channel-generation, and DLQ alerts.
 
 **Done when:** Sink outage produces bounded, observable behavior with a documented operator response, and drained generations do not leave unbounded queues or in-memory bindings.
 
-### 29. Dead-letter messages have no supported replay workflow
+### 29. Dead-letter recovery lacks complete integration and repair coverage
 
-**Evidence:** Exhausted messages reach a durable DLQ, but no command/API safely inspects or replays them.
+**Status:** Partial. The local async CLI passively inspects safe metadata and replays one selected or all eligible retry-exhausted direct records with confirmation before acknowledgement. It scans without retaining payload bodies, separately reports confirmed, intentionally retained, and malformed records, and does not redeclare application queues. Poison and aggregate inputs remain retained without failing successful all-eligible replay; integration coverage remains.
 
 **Impact:** “Durable failure” becomes permanent manual RabbitMQ surgery.
 
 **Minimal resolution:**
 
-1. Add a minimal CLI command to list counts and replay selected/all DLQ messages.
-2. Preserve original exchange, routing key, retry count, and failure reason.
-3. Make replay idempotent and test it against PostgreSQL.
+1. Test eligible replay idempotency against PostgreSQL and partial broker failure.
+2. Define a safe repair/export workflow for poison and aggregate-input records without unchanged replay.
 
 **Done when:** Operator can recover from a resolved sink outage using documented tooling.
 
@@ -576,9 +572,9 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 37. Rust formatting lacks CI enforcement
 
-**Status:** Partial. `cargo fmt --check` passes locally. Add CI enforcement with blocker 36.
+**Status:** Partial. `cargo fmt --check` passes locally and `.github/workflows/broker-durability.yml` enforces it on pushes and pull requests; the new workflow has not yet produced execution evidence.
 
-**Remaining work:** Enforce `cargo fmt --check` in CI.
+**Remaining work:** Preserve a successful workflow run as CI evidence.
 
 **Done when:** Clean checkout passes formatting without modifications.
 
@@ -636,9 +632,9 @@ Work in this order to avoid implementing behavior that v1 later removes:
 
 1. **Lock v1 surface first** — blockers 3, 7, 8, and 22. Owning applications explicitly provision finite channels at startup; runtime channel mutations remain documented as ephemeral; PostgreSQL-only rolling aggregates; reject retention/compression; no logger self-provisioning. *In progress: retention/compression and explicit provisioning are implemented; rolling and restart integration coverage remain.*
 2. **Define contracts and boundaries** — blockers 9, 9a, 10, 11, 12, 14, 17, 24, 25, and 38. One configuration format, public/admin split, health API, HTTP receiver wire contract, SDK serialization/version types. *In progress: server/Aspire sink environment contract, private admin route, dynamic host port, typed SDK values, aggregation serialization, and API version pinning are implemented; secrets, HTTP receiver contract, resource-level health, OpenAPI artifact, and integration coverage remain.*
-3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, generation retirement, replay. *In progress: bounded listener shutdown/aggregate flush, poison-message DLQ bypass, one confirmed admission publication, and isolated durable aggregate input are implemented; run aggregate crash/restart coverage in Docker CI before accepting final semantics.*
+3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, generation retirement, replay. *In progress: bounded listener shutdown/aggregate flush, poison-message DLQ bypass, one confirmed admission publication, and isolated durable aggregate input are implemented; run aggregate crash/restart coverage in Docker CI before accepting final semantics. Dispatch prompt: `docs/next-production-blockers-dispatch.md`.*
 4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; replacement rollback and restart-safe generations; explicit migrations. *In progress: replacement resources are staged and queued work retains its generation-specific sink; rollback, durable runtime generations, retirement, and failure-injection coverage remain.*
 5. **Ship golden path** — blockers 13, 15, 16, and 32. Versioned image, RabbitMQ persistence/credentials, Aspire sample plus end-to-end test, Azure publish docs.
-6. **Release guardrails and docs** — blockers 33–39. Rust formatting is clean; add CI enforcement, package metadata/pack fix, CI gates, contract checks, and remove stale claims.
+6. **Release guardrails and docs** — blockers 33–39. Rust formatting is clean and included in the new broker workflow; execute and extend CI, fix package metadata/pack, add contract checks, and remove stale claims.
 
 Build tests with each phase. Phase 5 golden-path test becomes release gate in phase 6.

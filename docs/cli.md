@@ -23,6 +23,8 @@ distill sink create ...
 distill sink list ...
 distill secret file-write ...
 distill secret env-write ...
+distill dlq list
+distill dlq replay --id <message-id>
 distill
 ```
 
@@ -133,6 +135,26 @@ postgres-primary    postgres (default)
 custom-http         http
 ```
 
+## Dead-letter recovery
+
+Inspect dead-letter count and safe metadata without exposing payloads:
+
+```powershell
+distill dlq list --limit 100
+```
+
+After resolving the destination failure, replay one message or every eligible message:
+
+```powershell
+distill dlq replay --id 6cdd38e0-3bd4-47fb-b014-4a4791d228ad
+# Review listed metadata first; this acknowledges each item only after RabbitMQ confirms republish.
+distill dlq replay --all
+```
+
+DLQ commands require `RABBITMQ_URI` with read access to the DLQ and write access to original destination exchanges. They inspect the existing DLQ passively and do not redeclare unrelated application queues, so they remain usable during queue-upgrade recovery. Output contains DLQ ID, timestamp, failure category, retry count, envelope version, original record ID when known, original exchange, and routing key—never original event payload, failure text, or credentials.
+
+Only structurally valid, retry-exhausted direct event and aggregate-output records are eligible. Malformed, unsupported-version, and aggregate-input records remain in the DLQ because replaying unchanged poison data or an aggregate input without durable source-event deduplication is unsafe. Listing and replay scan without retaining message bodies in process memory. Replay reports confirmed, intentionally retained, and invalid record counts. `--all` succeeds when every eligible record was confirmed even if intentionally ineligible records remain; malformed DLQ wrappers produce a non-zero exit for repair. An explicit `--id` also exits non-zero when that record is missing or ineligible.
+
 ## Local secret helpers
 
 The CLI can prompt without echoing a value and write a local secret file:
@@ -183,6 +205,12 @@ For production, prefer a secret manager, Docker secret, Kubernetes Secret, or se
 
 The sink manifest is safe to version-control only when it contains references and non-secret endpoints. Review HTTP URLs and egress policy because the HTTP sink can deliver data to any administrator-approved destination.
 
+## Queue limits and upgrades
+
+Distill declares delivery, retry, dead-letter, and aggregate-generation queues with `x-max-length=1000000`, `x-max-length-bytes=1073741824`, and `x-overflow=reject-publish`. Retry queues are quorum queues with at-least-once dead-lettering; RabbitMQ 3.10 or newer with the `stream_queue` feature flag is required. RabbitMQ disk alarms remain mandatory.
+
+Existing queues declared without these arguments require a maintenance migration because RabbitMQ rejects incompatible redeclaration. Stop new admission, keep the previous Distill release running until delivery, generation, and retry queues drain, and use the passively connected DLQ CLI to replay eligible records after destination recovery. Do not delete a non-empty DLQ: if ineligible records remain, preserve the queue and defer migration until an approved backup/export-and-repair workflow can retain them. Once every affected queue is proven empty and the broker is backed up, stop the previous release, recreate those queues, and start the new release. There is no automatic queue migration.
+
 ## Exit codes and automation
 
-Successful commands exit with code `0`. Invalid arguments, invalid manifests, and filesystem failures return a non-zero exit code and write a human-readable error to stderr. `sink create` is idempotent: creating an existing `sink_id` replaces its definition in the selected manifest.
+Successful commands exit with code `0`. Invalid arguments, invalid manifests, broker failures, and filesystem failures return a non-zero exit code and write a human-readable error to stderr. `sink create` is idempotent: creating an existing `sink_id` replaces its definition in the selected manifest.
