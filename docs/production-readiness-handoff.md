@@ -7,12 +7,11 @@ Last updated: 2026-09-05
 ## Repository snapshot
 
 - Branch: `production-readiness`
-- Base commit: `a29af9a` (`Continued work dealing with production-readiness-blockers.md, made some progress, still needs a lot of work and review.`)
-- The work below is **uncommitted**. Do not reset, discard, or overwrite it.
-- Inspect the current diff before editing. Some files were already dirty when this work began, so treat all current changes as user work and preserve them.
+- Tested implementation commit: `df28e18936b8aba1aa8b2d768987d8435fc067e5` (`Harden broker durability and recovery`).
+- Local verification below was repeated immediately before that commit.
 - Repository instructions: follow `AGENTS.md`; because `.codegraph/` exists, use CodeGraph before grep/find or broad code reading. Read and follow the mandatory `ms-rust` skill before modifying any `.rs` file.
 
-Current changed files:
+Files in the tested implementation:
 
 | File | Current work |
 | --- | --- |
