@@ -15,18 +15,25 @@ use lapin::{
     options::{
         BasicAckOptions, BasicConsumeOptions, BasicGetOptions, BasicNackOptions,
         BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions, ExchangeDeclareOptions,
-        QueueBindOptions, QueueDeclareOptions,
+        QueueBindOptions, QueueDeclareOptions, QueueDeleteOptions,
     },
     publisher_confirm::Confirmation,
     types::{AMQPValue, FieldTable},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio::{
-    sync::RwLock,
-    time::{Duration, sleep},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+    },
 };
-use tracing::{error, warn};
+use tokio::{
+    sync::{Mutex, RwLock, watch},
+    task::JoinHandle,
+    time::{Duration, Instant, sleep},
+};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DELIVERY_QUEUE: &str = "distill.persistence";
@@ -50,26 +57,72 @@ const ROUTED_EVENT_SUFFIX: &str = "routed-event-v1";
 const ROUTED_AGGREGATE_SUFFIX: &str = "routed-aggregate-v1";
 /// Bounds unacknowledged aggregate inputs while allowing per-event windows to fill.
 const CONSUMER_PREFETCH: u16 = 256;
-/// Prevents failed consumers from hot-looping while retaining automatic recovery.
-const CONSUMER_RESTART_DELAY: Duration = Duration::from_secs(2);
+/// Initial reconnect delay keeps brief broker interruptions responsive.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+/// Maximum reconnect delay bounds recovery latency during prolonged outages.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Retirement must observe an idle generation twice to exclude sampling races.
+const RETIREMENT_STABLE_OBSERVATIONS: u8 = 2;
+/// Bounds background retirement so failed proof cannot retain a busy task forever.
+const RETIREMENT_PROOF_TIMEOUT: Duration = Duration::from_secs(30);
+/// Spaces passive queue observations without introducing a hot loop.
+const RETIREMENT_POLL_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ConsumerState {
+    Starting = 0,
+    Healthy = 1,
+    Reconnecting = 2,
+    Stopped = 3,
+}
+
+impl ConsumerState {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            0 => Self::Starting,
+            1 => Self::Healthy,
+            2 => Self::Reconnecting,
+            _ => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConsumerStatus(AtomicU8);
+
+impl ConsumerStatus {
+    fn new(state: ConsumerState) -> Self {
+        Self(AtomicU8::new(state as u8))
+    }
+
+    fn get(&self) -> ConsumerState {
+        ConsumerState::from_atomic(self.0.load(Ordering::Acquire))
+    }
+
+    fn set(&self, state: ConsumerState) {
+        self.0.store(state as u8, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
-pub struct RabbitPublisher {
+struct PublisherSession {
     _connection: Arc<Connection>,
     channel: Arc<Channel>,
 }
 
+#[derive(Clone)]
+pub struct RabbitPublisher {
+    uri: Arc<str>,
+    session: Arc<RwLock<PublisherSession>>,
+}
+
 impl RabbitPublisher {
     pub async fn connect(uri: &str) -> Result<Self, DistillError> {
-        let connection = Connection::connect(uri, ConnectionProperties::default()).await?;
-        let channel = connection.create_channel().await?;
-        channel
-            .confirm_select(ConfirmSelectOptions::default())
-            .await?;
-        declare_exchange(&channel, AGGREGATE_INPUT_EXCHANGE).await?;
+        let session = connect_publisher(uri).await?;
         Ok(Self {
-            _connection: Arc::new(connection),
-            channel: Arc::new(channel),
+            uri: Arc::from(uri),
+            session: Arc::new(RwLock::new(session)),
         })
     }
 
@@ -79,17 +132,6 @@ impl RabbitPublisher {
         routing_key: &str,
         message: &T,
     ) -> Result<(), DistillError> {
-        self.channel
-            .exchange_declare(
-                exchange,
-                ExchangeKind::Topic,
-                ExchangeDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await?;
         let envelope = DeliveryEnvelope {
             version: ENVELOPE_VERSION,
             payload: serde_json::to_value(message)
@@ -98,7 +140,22 @@ impl RabbitPublisher {
         };
         let payload = serde_json::to_vec(&envelope)
             .map_err(|error| DistillError::Persistence(error.to_string()))?;
-        publish_confirmed(&self.channel, exchange, routing_key, &payload).await
+        let session = self.session.read().await.clone();
+        let failure = match publish_on_session(&session, exchange, routing_key, &payload).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        let mut current = self.session.write().await;
+        if Arc::ptr_eq(&current.channel, &session.channel)
+            && let Ok(replacement) = connect_publisher(&self.uri).await
+        {
+            *current = replacement;
+        }
+        Err(DistillError::Persistence(format!(
+            "RabbitMQ admission failed before an unambiguous confirmation ({})",
+            failure.error_code()
+        )))
     }
 
     pub(crate) async fn publish_routed_event(
@@ -146,6 +203,29 @@ impl RabbitPublisher {
         )
         .await
     }
+}
+
+async fn connect_publisher(uri: &str) -> Result<PublisherSession, DistillError> {
+    let connection = Arc::new(Connection::connect(uri, ConnectionProperties::default()).await?);
+    let channel = Arc::new(connection.create_channel().await?);
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await?;
+    declare_exchange(&channel, AGGREGATE_INPUT_EXCHANGE).await?;
+    Ok(PublisherSession {
+        _connection: connection,
+        channel,
+    })
+}
+
+async fn publish_on_session(
+    session: &PublisherSession,
+    exchange: &str,
+    routing_key: &str,
+    payload: &[u8],
+) -> Result<(), DistillError> {
+    declare_exchange(&session.channel, exchange).await?;
+    publish_confirmed(&session.channel, exchange, routing_key, payload).await
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -236,6 +316,30 @@ struct AggregateBinding {
 struct GenerationSink {
     channel_id: String,
     sink: Arc<dyn Sink>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+struct GenerationSinkLease {
+    sink: Arc<dyn Sink>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for GenerationSinkLease {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct GenerationRuntime {
+    channel_id: String,
+    shutdown: watch::Sender<bool>,
+    #[expect(
+        dead_code,
+        reason = "consumer state is retained for the planned readiness and metrics surface"
+    )]
+    state: Arc<ConsumerStatus>,
+    in_flight: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,16 +368,25 @@ pub(crate) struct DeadLetterClient {
 
 pub struct RabbitConsumer {
     uri: Arc<str>,
-    connection: Arc<Connection>,
+    _connection: Arc<Connection>,
     channel: Arc<Channel>,
     sinks: Arc<RwLock<HashMap<String, SinkBinding>>>,
     generation_sinks: Arc<RwLock<HashMap<Uuid, GenerationSink>>>,
     aggregators: Arc<RwLock<HashMap<String, AggregateBinding>>>,
     aggregate_handles: Arc<RwLock<HashMap<Uuid, ChannelHandle>>>,
+    generation_runtimes: Arc<RwLock<HashMap<Uuid, GenerationRuntime>>>,
+    #[expect(
+        dead_code,
+        reason = "consumer state is retained for the planned readiness and metrics surface"
+    )]
+    persistence_state: Arc<ConsumerStatus>,
+    persistence_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    shutdown: watch::Sender<bool>,
     metrics: Arc<Metrics>,
 }
 
 pub(crate) struct PreparedChannel {
+    connection: Option<Arc<Connection>>,
     channel: Option<Arc<Channel>>,
     channel_id: String,
     generation: Uuid,
@@ -455,14 +568,22 @@ impl RabbitConsumer {
         let aggregators = Arc::new(RwLock::new(HashMap::new()));
         let generation_sinks = Arc::new(RwLock::new(HashMap::new()));
         let aggregate_handles = Arc::new(RwLock::new(HashMap::new()));
+        let generation_runtimes = Arc::new(RwLock::new(HashMap::new()));
+        let persistence_state = Arc::new(ConsumerStatus::new(ConsumerState::Starting));
+        let persistence_task = Arc::new(Mutex::new(None));
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let consumer = Self {
             uri: Arc::from(uri),
-            connection: Arc::new(connection),
+            _connection: Arc::new(connection),
             channel,
             sinks: Arc::clone(&sinks),
             generation_sinks: Arc::clone(&generation_sinks),
             aggregators: Arc::clone(&aggregators),
             aggregate_handles,
+            generation_runtimes,
+            persistence_state: Arc::clone(&persistence_state),
+            persistence_task: Arc::clone(&persistence_task),
+            shutdown,
             metrics: Arc::clone(&metrics),
         };
         let consumer_channel = Arc::clone(&consumer.channel);
@@ -472,19 +593,25 @@ impl RabbitConsumer {
         let persistence_aggregators = Arc::clone(&consumer_aggregators);
         let persistence_metrics = Arc::clone(&metrics);
         let consumer_uri = Arc::clone(&consumer.uri);
-        tokio::spawn(supervise_persistence(
+        let task = tokio::spawn(supervise_persistence(
             consumer_uri,
             consumer_channel,
             consumer_sinks,
             consumer_generation_sinks,
             persistence_aggregators,
             persistence_metrics,
+            persistence_state,
+            shutdown_rx,
         ));
+        *persistence_task.lock().await = Some(task);
         Ok(consumer)
     }
 
     pub async fn register_exchange(&self, exchange: &str) -> Result<(), DistillError> {
-        declare_topology(&self.channel, exchange).await
+        let connection = Connection::connect(&self.uri, ConnectionProperties::default()).await?;
+        let channel = connection.create_channel().await?;
+        declare_consumer_queue(&channel).await?;
+        declare_topology(&channel, exchange).await
     }
 
     pub(crate) async fn prepare_channel(
@@ -495,17 +622,20 @@ impl RabbitConsumer {
         handle: ChannelHandle,
         aggregate_enabled: bool,
     ) -> Result<PreparedChannel, DistillError> {
-        let channel = if aggregate_enabled {
-            let channel = Arc::new(self.connection.create_channel().await?);
+        let (connection, channel) = if aggregate_enabled {
+            let connection =
+                Arc::new(Connection::connect(&self.uri, ConnectionProperties::default()).await?);
+            let channel = Arc::new(connection.create_channel().await?);
             declare_generation_queue(&channel, &channel_id, generation).await?;
             channel
                 .confirm_select(ConfirmSelectOptions::default())
                 .await?;
-            Some(channel)
+            (Some(connection), Some(channel))
         } else {
-            None
+            (None, None)
         };
         Ok(PreparedChannel {
+            connection,
             channel,
             channel_id,
             generation,
@@ -516,6 +646,7 @@ impl RabbitConsumer {
 
     pub(crate) async fn activate_channel(&self, prepared: PreparedChannel) -> ChannelHandle {
         let PreparedChannel {
+            connection,
             channel,
             channel_id,
             generation,
@@ -533,6 +664,7 @@ impl RabbitConsumer {
             GenerationSink {
                 channel_id: channel_id.clone(),
                 sink: Arc::clone(&sink),
+                in_flight: Arc::new(AtomicUsize::new(0)),
             },
         );
         if let Some(channel) = channel {
@@ -546,17 +678,57 @@ impl RabbitConsumer {
                 .insert(generation, handle.clone());
             let metrics = Arc::clone(&self.metrics);
             let consumer_handle = handle.clone();
-            tokio::spawn(supervise_generation(
+            let state = Arc::new(ConsumerStatus::new(ConsumerState::Starting));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(supervise_generation(
                 Arc::clone(&self.uri),
+                connection.expect("aggregate channel always retains its connection"),
                 channel,
-                channel_id,
+                channel_id.clone(),
                 generation,
                 sink,
                 consumer_handle,
                 metrics,
+                Arc::clone(&state),
+                Arc::clone(&in_flight),
+                shutdown_rx,
             ));
+            self.generation_runtimes.write().await.insert(
+                generation,
+                GenerationRuntime {
+                    channel_id,
+                    shutdown,
+                    state,
+                    in_flight,
+                    task,
+                },
+            );
         }
         handle
+    }
+
+    #[expect(
+        dead_code,
+        reason = "the later readiness and metrics work will consume this explicit state"
+    )]
+    pub(crate) fn persistence_state(&self) -> ConsumerState {
+        self.persistence_state.get()
+    }
+
+    #[expect(
+        dead_code,
+        reason = "the later readiness and metrics work will consume this health projection"
+    )]
+    pub(crate) async fn consumers_healthy(&self) -> bool {
+        if self.persistence_state() != ConsumerState::Healthy {
+            return false;
+        }
+        self.generation_runtimes
+            .read()
+            .await
+            .values()
+            .all(|runtime| runtime.state.get() == ConsumerState::Healthy)
     }
 
     pub(crate) async fn flush_aggregators(&self) -> Result<(), DistillError> {
@@ -572,8 +744,203 @@ impl RabbitConsumer {
         }
         Ok(())
     }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), DistillError> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.persistence_task.lock().await.take() {
+            task.await.map_err(|error| {
+                DistillError::Persistence(format!("consumer shutdown task failed: {error}"))
+            })?;
+        }
+        let runtimes = self
+            .generation_runtimes
+            .write()
+            .await
+            .drain()
+            .map(|(_, runtime)| runtime)
+            .collect::<Vec<_>>();
+        for runtime in runtimes {
+            let _ = runtime.shutdown.send(true);
+            runtime.task.await.map_err(|error| {
+                DistillError::Persistence(format!("consumer shutdown task failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_generation(self: &Arc<Self>, generation: Uuid, handle: ChannelHandle) {
+        let consumer = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = consumer.retire_generation_inner(generation, handle).await {
+                warn!(
+                    event.name = "distill.rabbit.generation_retirement.deferred",
+                    generation.id = %generation,
+                    error.code = %error.error_code(),
+                    "generation cleanup deferred because drain proof was incomplete"
+                );
+            }
+        });
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "retirement keeps its ordered drain proof and destructive action in one routine"
+    )]
+    async fn retire_generation_inner(
+        &self,
+        generation: Uuid,
+        handle: ChannelHandle,
+    ) -> Result<(), DistillError> {
+        let connection = Connection::connect(&self.uri, ConnectionProperties::default()).await?;
+        let channel = connection.create_channel().await?;
+        let has_runtime = self
+            .generation_runtimes
+            .read()
+            .await
+            .contains_key(&generation);
+        let mut runtime_channel_id = None;
+        if has_runtime {
+            let deadline = Instant::now() + RETIREMENT_PROOF_TIMEOUT;
+            let mut stable = 0;
+            loop {
+                let (queue, in_flight) = {
+                    let runtimes = self.generation_runtimes.read().await;
+                    let runtime = runtimes.get(&generation).ok_or_else(|| {
+                        DistillError::InvalidConfiguration(
+                            "generation runtime is unavailable for retirement".to_string(),
+                        )
+                    })?;
+                    (
+                        generation_queue(&runtime.channel_id, generation),
+                        runtime.in_flight.load(Ordering::Acquire),
+                    )
+                };
+                if queue_message_count(&channel, &queue).await? == 0 && in_flight == 0 {
+                    stable += 1;
+                    if stable >= RETIREMENT_STABLE_OBSERVATIONS {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
+                if Instant::now() >= deadline {
+                    return Err(DistillError::Persistence(
+                        "generation queue did not become idle before retirement timeout"
+                            .to_string(),
+                    ));
+                }
+                sleep(RETIREMENT_POLL_DELAY).await;
+            }
+
+            let removed = self
+                .generation_runtimes
+                .write()
+                .await
+                .remove(&generation)
+                .ok_or_else(|| {
+                    DistillError::InvalidConfiguration(
+                        "generation runtime disappeared during retirement".to_string(),
+                    )
+                })?;
+            let _ = removed.shutdown.send(true);
+            runtime_channel_id = Some(removed.channel_id.clone());
+            removed.task.await.map_err(|error| {
+                DistillError::Persistence(format!("generation consumer shutdown failed: {error}"))
+            })?;
+        }
+        handle.flush().await?;
+
+        let sink_in_flight = self
+            .generation_sinks
+            .read()
+            .await
+            .get(&generation)
+            .map(|binding| Arc::clone(&binding.in_flight))
+            .ok_or_else(|| {
+                DistillError::InvalidConfiguration(
+                    "generation sink disappeared during retirement".to_string(),
+                )
+            })?;
+        let deadline = Instant::now() + RETIREMENT_PROOF_TIMEOUT;
+        let mut stable = 0;
+        loop {
+            let delivery_empty = queue_message_count(&channel, DELIVERY_QUEUE).await? == 0;
+            if delivery_empty && sink_in_flight.load(Ordering::Acquire) == 0 {
+                stable += 1;
+                if stable >= RETIREMENT_STABLE_OBSERVATIONS {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            if Instant::now() >= deadline {
+                return Err(DistillError::Persistence(
+                    "generation output could not be proven persisted before retirement timeout"
+                        .to_string(),
+                ));
+            }
+            sleep(RETIREMENT_POLL_DELAY).await;
+        }
+
+        let channel_id = self
+            .generation_sinks
+            .read()
+            .await
+            .get(&generation)
+            .map(|binding| binding.channel_id.clone())
+            .ok_or_else(|| {
+                DistillError::InvalidConfiguration(
+                    "generation sink disappeared during retirement".to_string(),
+                )
+            })?;
+        if let Some(runtime_channel_id) = runtime_channel_id {
+            let queue = generation_queue(&runtime_channel_id, generation);
+            if queue_message_count(&channel, &queue).await? != 0 {
+                return Err(DistillError::Persistence(
+                    "generation queue received work during retirement".to_string(),
+                ));
+            }
+            channel
+                .queue_delete(
+                    &queue,
+                    QueueDeleteOptions {
+                        if_empty: true,
+                        if_unused: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
+        self.aggregate_handles.write().await.remove(&generation);
+        self.generation_sinks.write().await.remove(&generation);
+        info!(
+            event.name = "distill.rabbit.generation_retirement.completed",
+            channel.id = %channel_id,
+            generation.id = %generation,
+            "drained channel generation retired"
+        );
+        Ok(())
+    }
 }
 
+async fn queue_message_count(channel: &Channel, queue: &str) -> Result<u32, DistillError> {
+    Ok(channel
+        .queue_declare(
+            queue,
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?
+        .message_count())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the supervisor owns shared consumer dependencies and explicit lifecycle state"
+)]
 async fn supervise_persistence(
     uri: Arc<str>,
     initial_channel: Arc<Channel>,
@@ -581,9 +948,16 @@ async fn supervise_persistence(
     generation_sinks: Arc<RwLock<HashMap<Uuid, GenerationSink>>>,
     aggregators: Arc<RwLock<HashMap<String, AggregateBinding>>>,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut channel = Some(initial_channel);
+    let mut attempt = 0;
     loop {
+        if *shutdown.borrow() {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
         let result = if let Some(initial) = channel.take() {
             consume_persistence(
                 initial,
@@ -591,6 +965,8 @@ async fn supervise_persistence(
                 Arc::clone(&generation_sinks),
                 Arc::clone(&aggregators),
                 Arc::clone(&metrics),
+                Arc::clone(&state),
+                shutdown.clone(),
             )
             .await
         } else {
@@ -600,19 +976,34 @@ async fn supervise_persistence(
                 Arc::clone(&generation_sinks),
                 Arc::clone(&aggregators),
                 Arc::clone(&metrics),
+                Arc::clone(&state),
+                shutdown.clone(),
             )
             .await
         };
+        if *shutdown.borrow() {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
+        if state.get() == ConsumerState::Healthy {
+            attempt = 0;
+        }
+        state.set(ConsumerState::Reconnecting);
+        let delay = reconnect_delay(attempt, 0);
+        attempt = attempt.saturating_add(1);
         let error_code = result
             .err()
             .map_or("CONSUMER_ENDED", |error| error.error_code().as_str());
         error!(
             event.name = "distill.rabbit.consumer.restarting",
             error.code = error_code,
-            retry.seconds = CONSUMER_RESTART_DELAY.as_secs(),
+            retry.milliseconds = delay.as_millis(),
             "RabbitMQ consumer stopped; retrying with a fresh connection"
         );
-        sleep(CONSUMER_RESTART_DELAY).await;
+        if wait_for_retry(delay, &mut shutdown).await {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
     }
 }
 
@@ -622,6 +1013,8 @@ async fn consume_persistence_connection(
     generation_sinks: Arc<RwLock<HashMap<Uuid, GenerationSink>>>,
     aggregators: Arc<RwLock<HashMap<String, AggregateBinding>>>,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), DistillError> {
     let connection = Connection::connect(uri, ConnectionProperties::default()).await?;
     let channel = Arc::new(connection.create_channel().await?);
@@ -629,32 +1022,60 @@ async fn consume_persistence_connection(
     channel
         .confirm_select(ConfirmSelectOptions::default())
         .await?;
-    let result = consume_persistence(channel, sinks, generation_sinks, aggregators, metrics).await;
+    let result = consume_persistence(
+        channel,
+        sinks,
+        generation_sinks,
+        aggregators,
+        metrics,
+        state,
+        shutdown,
+    )
+    .await;
     drop(connection);
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the generation supervisor owns isolated broker, actor, and lifecycle state"
+)]
 async fn supervise_generation(
     uri: Arc<str>,
+    initial_connection: Arc<Connection>,
     initial_channel: Arc<Channel>,
     channel_id: String,
     generation: Uuid,
     sink: Arc<dyn Sink>,
     handle: ChannelHandle,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    in_flight: Arc<AtomicUsize>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut connection = Some(initial_connection);
     let mut channel = Some(initial_channel);
+    let mut attempt = 0;
     loop {
+        if *shutdown.borrow() {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
         let result = if let Some(initial) = channel.take() {
-            consume_generation(
+            let result = consume_generation(
                 initial,
                 channel_id.clone(),
                 generation,
                 Arc::clone(&sink),
                 handle.clone(),
                 Arc::clone(&metrics),
+                Arc::clone(&state),
+                Arc::clone(&in_flight),
+                shutdown.clone(),
             )
-            .await
+            .await;
+            drop(connection.take());
+            result
         } else {
             consume_generation_connection(
                 &uri,
@@ -663,9 +1084,23 @@ async fn supervise_generation(
                 Arc::clone(&sink),
                 handle.clone(),
                 Arc::clone(&metrics),
+                Arc::clone(&state),
+                Arc::clone(&in_flight),
+                shutdown.clone(),
             )
             .await
         };
+        if *shutdown.borrow() {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
+        if state.get() == ConsumerState::Healthy {
+            attempt = 0;
+        }
+        state.set(ConsumerState::Reconnecting);
+        let (generation_high, generation_low) = generation.as_u64_pair();
+        let delay = reconnect_delay(attempt, generation_high ^ generation_low);
+        attempt = attempt.saturating_add(1);
         let error_code = result
             .err()
             .map_or("CONSUMER_ENDED", |error| error.error_code().as_str());
@@ -674,13 +1109,20 @@ async fn supervise_generation(
             channel.id = %channel_id,
             generation.id = %generation,
             error.code = error_code,
-            retry.seconds = CONSUMER_RESTART_DELAY.as_secs(),
+            retry.milliseconds = delay.as_millis(),
             "RabbitMQ aggregate consumer stopped; retrying with a fresh connection"
         );
-        sleep(CONSUMER_RESTART_DELAY).await;
+        if wait_for_retry(delay, &mut shutdown).await {
+            state.set(ConsumerState::Stopped);
+            return;
+        }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reconnection restores the complete isolated generation consumer context"
+)]
 async fn consume_generation_connection(
     uri: &str,
     channel_id: String,
@@ -688,6 +1130,9 @@ async fn consume_generation_connection(
     sink: Arc<dyn Sink>,
     handle: ChannelHandle,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    in_flight: Arc<AtomicUsize>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), DistillError> {
     let connection = Connection::connect(uri, ConnectionProperties::default()).await?;
     let channel = Arc::new(connection.create_channel().await?);
@@ -695,9 +1140,41 @@ async fn consume_generation_connection(
     channel
         .confirm_select(ConfirmSelectOptions::default())
         .await?;
-    let result = consume_generation(channel, channel_id, generation, sink, handle, metrics).await;
+    let result = consume_generation(
+        channel, channel_id, generation, sink, handle, metrics, state, in_flight, shutdown,
+    )
+    .await;
     drop(connection);
     result
+}
+
+fn reconnect_delay(attempt: u32, seed: u64) -> Duration {
+    let exponent = attempt.min(7);
+    let base_millis = RECONNECT_INITIAL_DELAY
+        .as_millis()
+        .saturating_mul(1_u128 << exponent)
+        .min(RECONNECT_MAX_DELAY.as_millis());
+    let mixed = seed
+        .wrapping_add(u64::from(attempt))
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1);
+    // A 75%-125% band prevents synchronized reconnect storms without unbounded delay.
+    let jitter_percent = 75 + (mixed % 51);
+    let jittered = base_millis
+        .saturating_mul(u128::from(jitter_percent))
+        .saturating_div(100)
+        .min(RECONNECT_MAX_DELAY.as_millis());
+    Duration::from_millis(u64::try_from(jittered).unwrap_or(u64::MAX))
+}
+
+async fn wait_for_retry(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        () = sleep(delay) => false,
+        result = shutdown.changed() => result.is_err() || *shutdown.borrow(),
+    }
 }
 
 async fn declare_exchange(channel: &Channel, exchange: &str) -> Result<(), DistillError> {
@@ -827,12 +1304,18 @@ async fn declare_topology(channel: &Channel, exchange: &str) -> Result<(), Disti
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the consumer loop keeps delivery settlement adjacent to every durable handoff"
+)]
 async fn consume_persistence(
     channel: Arc<Channel>,
     sinks: Arc<RwLock<HashMap<String, SinkBinding>>>,
     generation_sinks: Arc<RwLock<HashMap<Uuid, GenerationSink>>>,
     aggregators: Arc<RwLock<HashMap<String, AggregateBinding>>>,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), DistillError> {
     channel.basic_qos(1, BasicQosOptions::default()).await?;
     let mut consumer = channel
@@ -843,7 +1326,20 @@ async fn consume_persistence(
             FieldTable::default(),
         )
         .await?;
-    while let Some(delivery) = consumer.next().await {
+    state.set(ConsumerState::Healthy);
+    loop {
+        let delivery = tokio::select! {
+            delivery = consumer.next() => delivery,
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(delivery) = delivery else {
+            break;
+        };
         let delivery = delivery?;
         if let Err(error) = validate_delivery(&delivery.data, delivery.routing_key.as_str()) {
             warn!(
@@ -927,6 +1423,11 @@ async fn consume_persistence(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the ordered generation loop owns broker delivery, actor acknowledgement, and cancellation"
+)]
 async fn consume_generation(
     channel: Arc<Channel>,
     channel_id: String,
@@ -934,6 +1435,9 @@ async fn consume_generation(
     sink: Arc<dyn Sink>,
     handle: ChannelHandle,
     metrics: Arc<Metrics>,
+    state: Arc<ConsumerStatus>,
+    in_flight: Arc<AtomicUsize>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), DistillError> {
     channel
         .basic_qos(CONSUMER_PREFETCH, BasicQosOptions::default())
@@ -946,19 +1450,31 @@ async fn consume_generation(
             FieldTable::default(),
         )
         .await?;
+    state.set(ConsumerState::Healthy);
     let mut pending = FuturesUnordered::new();
+    let mut draining = false;
     loop {
+        if draining && pending.is_empty() {
+            break;
+        }
         tokio::select! {
+            result = shutdown.changed(), if !draining => {
+                if result.is_err() || *shutdown.borrow() {
+                    draining = true;
+                }
+            }
             completion = pending.next(), if !pending.is_empty() => {
                 if let Some((delivery, result)) = completion {
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
                     settle_delivery(&channel, delivery, result).await?;
                 }
             }
-            delivery = consumer.next() => {
+            delivery = consumer.next(), if !draining => {
                 let Some(delivery) = delivery else {
                     break;
                 };
                 let delivery = delivery?;
+                in_flight.fetch_add(1, Ordering::AcqRel);
                 let routed = match routed_event(&delivery.data) {
                     Ok(routed)
                         if routed.aggregate
@@ -973,6 +1489,7 @@ async fn consume_generation(
                             )),
                         )
                         .await?;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
                         continue;
                     }
                     Err(error) => {
@@ -999,6 +1516,7 @@ async fn consume_generation(
                             )));
                         }
                         delivery.ack(BasicAckOptions::default()).await?;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
                         continue;
                     }
                 };
@@ -1012,13 +1530,17 @@ async fn consume_generation(
                         });
                         (delivery, result)
                     }),
-                    Err(error) => settle_delivery(&channel, delivery, Err(error)).await?,
+                    Err(error) => {
+                        settle_delivery(&channel, delivery, Err(error)).await?;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
             }
         }
     }
     while let Some(completion) = pending.next().await {
         let (delivery, result) = completion;
+        in_flight.fetch_sub(1, Ordering::AcqRel);
         settle_delivery(&channel, delivery, result).await?;
     }
     Ok(())
@@ -1065,7 +1587,7 @@ async fn process_delivery(
             routed.generation,
         )
         .await?;
-        sink.persist_event(&routed.event).await?;
+        sink.sink.persist_event(&routed.event).await?;
         metrics.persisted();
     } else if routing_key.ends_with(ROUTED_AGGREGATE_SUFFIX) {
         let routed: RoutedAggregate = serde_json::from_value(envelope.payload)
@@ -1076,7 +1598,7 @@ async fn process_delivery(
             routed.generation,
         )
         .await?;
-        sink.persist_aggregate(&routed.aggregate).await?;
+        sink.sink.persist_aggregate(&routed.aggregate).await?;
         metrics.aggregate_persisted();
     } else if routing_key.ends_with("aggregate") {
         let aggregate: AggregatedLog = serde_json::from_value(envelope.payload)
@@ -1109,23 +1631,23 @@ async fn generation_sink(
     sinks: &RwLock<HashMap<Uuid, GenerationSink>>,
     channel_id: &str,
     generation: Uuid,
-) -> Result<Arc<dyn Sink>, DistillError> {
-    let binding = sinks
-        .read()
-        .await
-        .get(&generation)
-        .cloned()
-        .ok_or_else(|| {
-            DistillError::InvalidConfiguration(format!(
-                "channel '{channel_id}' delivery generation is unavailable"
-            ))
-        })?;
+) -> Result<GenerationSinkLease, DistillError> {
+    let sinks = sinks.read().await;
+    let binding = sinks.get(&generation).ok_or_else(|| {
+        DistillError::InvalidConfiguration(format!(
+            "channel '{channel_id}' delivery generation is unavailable"
+        ))
+    })?;
     if binding.channel_id != channel_id {
         return Err(DistillError::InvalidConfiguration(
             "delivery generation does not match its channel".to_string(),
         ));
     }
-    Ok(binding.sink)
+    binding.in_flight.fetch_add(1, Ordering::AcqRel);
+    Ok(GenerationSinkLease {
+        sink: Arc::clone(&binding.sink),
+        in_flight: Arc::clone(&binding.in_flight),
+    })
 }
 
 fn routed_event(data: &[u8]) -> Result<RoutedEvent, DistillError> {
@@ -1429,9 +1951,10 @@ mod tests {
     use super::{
         AGGREGATE_INPUT_EXCHANGE, AMQPValue, DeadLetterMessage, DeadLetterMetadata,
         ENVELOPE_VERSION, LEGACY_ENVELOPE_VERSION, MAX_FAILURE_REASON_BYTES, MAX_QUEUE_BYTES,
-        MAX_QUEUE_MESSAGES, generation_queue, parse_envelope, queue_arguments, replay_eligible,
-        retry_delay_seconds, retry_queue, retry_queue_arguments, sanitized_reason,
-        validate_confirmation, validate_delivery,
+        MAX_QUEUE_MESSAGES, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY, generation_queue,
+        parse_envelope, queue_arguments, reconnect_delay, replay_eligible, retry_delay_seconds,
+        retry_queue, retry_queue_arguments, sanitized_reason, validate_confirmation,
+        validate_delivery,
     };
     use chrono::Utc;
     use lapin::publisher_confirm::Confirmation;
@@ -1467,6 +1990,16 @@ mod tests {
             retry_queue("distill.orders", "orders.event", 1),
             retry_queue("distill.orders", "orders.event", 2)
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_jittered() {
+        let first = reconnect_delay(0, 1);
+        let second = reconnect_delay(1, 1);
+        assert!(first >= RECONNECT_INITIAL_DELAY.mul_f32(0.75));
+        assert!(second > first);
+        assert!(reconnect_delay(u32::MAX, 1) <= RECONNECT_MAX_DELAY);
+        assert_ne!(reconnect_delay(3, 1), reconnect_delay(3, 2));
     }
 
     #[test]

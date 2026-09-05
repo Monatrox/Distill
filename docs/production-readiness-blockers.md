@@ -2,6 +2,8 @@
 
 This document tracks work required before Distill can make a production-ready v1 release. Priorities assume v1 targets Aspire, the C# SDK, RabbitMQ, PostgreSQL, and custom HTTP/API endpoint sinks.
 
+The current session-to-session worktree snapshot, completed work, executed evidence, unresolved risks, and continuation runbook live in `docs/production-readiness-handoff.md`. Read it before resuming implementation.
+
 ## Recommended v1 scope
 
 Keep the first supported path narrow:
@@ -36,13 +38,13 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ## Current status
 
-**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean and the new broker-durability workflow enforces it, but that workflow still needs execution evidence before blocker 37 can close.
+**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean and the automatic `CI` workflow enforces it, but that workflow still needs successful execution evidence before blocker 37 can close.
 
-**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. The crash/restart script passed under Podman before the latest quorum-retry and permission corrections and must be rerun. Blocker 2 has the same prior local SIGTERM evidence and also needs rerun/CI evidence. Blocker 4 now reconnects shared and generation consumers after a bounded delay, but lacks state, shutdown-aware backoff, jitter, publisher reconnect, and broker-restart coverage. Blocker 5 uses quorum TTL retry queues with at-least-once dead-lettering, but needs RabbitMQ isolation and saturation coverage. Blocker 6 versions envelopes, records byte-bounded failure metadata, and provides bounded metadata-only DLQ tooling; broker integration coverage remains. Blocker 28 applies `reject-publish` limits to delivery, retry, DLQ, and generation queues, but needs broker assertions and generation retirement. Blocker 29 safely replays eligible direct-persistence records but deliberately retains poison and aggregate inputs; PostgreSQL replay coverage remains. Blocker 30 remains incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack complete contract/integration coverage.
+**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. The current crash/restart script passes locally under rootless Podman 5.8.4 for direct, aggregate-only, and `PersistAndAggregate` routes; CI evidence remains. Blocker 2's current successful-flush and unavailable-broker timeout scenarios also pass locally under Podman but need CI evidence. Blocker 4 now reconnects publishers plus shared and generation consumers, exposes explicit lifecycle state, and uses bounded jittered backoff with shutdown cancellation. Local Podman coverage proves fail-closed admission during outage and direct/aggregate recovery after RabbitMQ restart; in-flight restart and CI coverage remain. Blocker 5 uses quorum TTL retry queues with at-least-once dead-lettering; local real-broker coverage proves a failed HTTP destination enters broker-managed retry, later reaches a recovered receiver, and does not delay an unrelated PostgreSQL destination, while saturation coverage remains. Blocker 6 has local broker evidence for malformed-message DLQ, later-valid delivery, metadata-only listing, poison retention, and confirmed eligible replay; full-DLQ and repair/export coverage remain. Blocker 28 has local assertions for all capped queue classes, visible `reject-publish` admission failure, operator alarm guidance, and repeated generation reclamation; drained retry-queue retirement and sustained-concurrency coverage remain. Blocker 29 has confirmed PostgreSQL replay evidence but deliberately retains poison and aggregate inputs; a safe repair/export workflow remains. Blocker 30 has conservative generation retirement with local repeated-replacement/old-input-flush evidence but lacks concurrent-ingest coverage and remains incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack complete contract/integration coverage.
 
 **Current critical path:** run blocker 1's Docker-backed crash/restart test in CI. Then finish broker recovery/retry/limits/replay and generation retirement (4, 5, 28, 29, 30), and close partial blockers with integration tests. All unlisted blockers remain open.
 
-**Verification snapshot (2026-08-30):** `cargo test --all-targets` passes 49 tests; CLI selector/error smoke checks, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell validation pass. The revised broker script could not run because neither Podman nor Docker was accessible. Current retry, DLQ, replay, reconnect, overflow, crash/restart, SIGTERM, and retirement scenarios therefore still require real-broker evidence.
+**Verification snapshot (2026-09-05):** `cargo test --all-targets` passes 50 tests; CLI replay-help smoke checks, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell validation pass. The complete current handoff script passes under rootless Podman 5.8.4: direct, aggregate-only, and `PersistAndAggregate` crash/restart recovery; successful and unavailable-broker SIGTERM behavior; fail-closed outage admission; direct and aggregate recovery after RabbitMQ restart; failed-destination isolation and broker-managed retry to a recovered HTTP receiver; malformed-message DLQ and later-valid delivery; metadata-only listing and poison retention; confirmed PostgreSQL replay; visible queue-overflow rejection; repeated replacement with old-generation flush/reclamation; and delivery/retry/DLQ/generation queue-argument assertions. The first GitHub-hosted broker attempt supplied no evidence because its exited-container error masked the cause; the revised manual workflow has not yet run. Full-DLQ/saturation, in-flight restart, repair/export, and concurrent-ingest retirement remain outside the current script and still require real-broker evidence.
 
 ## P0 — Correctness and durability
 
@@ -50,15 +52,15 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 **Status:** Partial. Each accepted event is one mandatory, publisher-confirmed broker message. Aggregate routes use ordered, per-channel-generation queues whose acknowledgements wait for confirmed aggregate publication. `scripts/test-durable-aggregate-input.sh` starts RabbitMQ/PostgreSQL, kills Distill after confirmed direct, aggregate-only, and `PersistAndAggregate` admissions, restarts it, and verifies direct events persist once plus each aggregate contains two events.
 
-**Remaining work:** Rerun the revised Podman/Docker-backed check and preserve it as CI evidence. Prior evidence predates the retry-topology correction.
+**Remaining work:** Preserve the now-passing current scenario as successful manual GitHub Actions evidence before closing the blocker.
 
 **Done when:** Every `202` response has a tested recovery path after immediate process termination.
 
 ### 2. Graceful aggregate flushing lacks SIGTERM coverage
 
-**Status:** Partial. `ChannelRegistry::shutdown` stops admission and gives every active aggregate generation a configurable, 30-second-default window to publish with broker confirmation after both listeners stop. The script covers successful and unavailable-broker SIGTERM cases, but its current revision lacks executed container evidence.
+**Status:** Partial. `ChannelRegistry::shutdown` stops admission and gives every active aggregate generation a configurable, 30-second-default window to publish with broker confirmation after both listeners stop. The current successful and unavailable-broker SIGTERM cases pass under local rootless Podman; GitHub Actions evidence remains.
 
-**Remaining risk:** Prior Podman evidence predates the latest broker and fixture corrections; rerun locally and in CI.
+**Remaining risk:** The corrected scenario has not yet passed in the manually dispatched GitHub-hosted Docker environment.
 
 **Minimal resolution:**
 
@@ -85,24 +87,22 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 4. RabbitMQ consumer does not recover after connection failure
 
-**Status:** Partial. Shared persistence and generation consumers reconnect on fresh connections after a bounded two-second delay, re-declaring their required topology, confirms, and QoS. Publisher reconnect, consumer state, jittered exponential backoff, shutdown cancellation, and real broker-restart coverage remain.
+**Status:** Partial. Publishers plus shared persistence and generation consumers reconnect on fresh connections. Consumers expose starting/healthy/reconnecting/stopped state, restore topology/confirms/QoS, use bounded jittered exponential backoff, and cancel during shutdown. Local Podman coverage proves outage admission fails closed and later direct/aggregate work succeeds after RabbitMQ restart.
 
-**Remaining risk:** Process health still does not expose consumer degradation, and the publisher remains fail-closed rather than reconnecting.
+**Remaining risk:** The restart scenario does not yet interrupt an already accepted in-flight delivery, and revised GitHub-hosted Docker evidence remains unavailable.
 
 **Minimal resolution:**
 
-1. Add exponential backoff with jitter and shutdown cancellation to the current supervisor.
-2. Track consumer state for readiness and metrics.
-3. Reconnect the publisher or verify its fail-closed admission behavior throughout broker restart.
-4. Test broker restart during active delivery.
+1. Surface the implemented consumer state through the later readiness and metrics work.
+2. Test broker restart while an acknowledged direct and aggregate delivery is in flight.
 
 **Done when:** RabbitMQ restart recovers automatically without restarting Distill or losing acknowledged events.
 
 ### 5. Shared direct-persistence retries block unrelated channels
 
-**Status:** Partial. Per-channel-generation aggregate queues isolate aggregate ingestion and preserve ordered actor admission. Direct persistence now hands failures to durable, capped TTL retry queues and acknowledges only after confirmed retry publication. RabbitMQ isolation coverage remains.
+**Status:** Partial. Per-channel-generation aggregate queues isolate aggregate ingestion and preserve ordered actor admission. Direct persistence hands failures to durable, capped TTL retry queues and acknowledges only after confirmed retry publication. Local real-broker coverage proves a failed HTTP destination does not block an unrelated PostgreSQL destination and reaches the receiver after it recovers. Retry/DLQ saturation remains untested.
 
-**Evidence:** `src/broker/mod.rs` routes failed delivery through confirmed, TTL-based retry queues; real-broker isolation coverage remains.
+**Evidence:** `src/broker/mod.rs` routes failed delivery through confirmed, TTL-based retry queues; the Podman harness proves isolation and recovery against RabbitMQ.
 
 **Remaining risk:** Sink-call latency can still hold the shared prefetch-one consumer briefly, and retry/DLQ saturation isolation lacks broker coverage.
 
@@ -114,9 +114,9 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 6. Poison-message DLQ handling lacks a complete recovery contract
 
-**Status:** Partial. Malformed envelopes and payloads are published to the DLQ before acknowledgement; envelopes are versioned, failure reasons are bounded by UTF-8 bytes, and CLI inspection/replay is async, constant-memory, and payload-free by default. Poison and aggregate-input replay is intentionally ineligible. Broker integration coverage remains.
+**Status:** Partial. Malformed envelopes and payloads are published to the DLQ before acknowledgement; envelopes are versioned, failure reasons are bounded by UTF-8 bytes, and CLI inspection/replay is async, constant-memory, and payload-free by default. Local broker coverage proves malformed-message handoff, later-valid delivery, metadata-only listing, poison retention, and confirmed eligible replay to PostgreSQL. Full-DLQ recovery and repair/export remain.
 
-**Remaining risk:** Confirmed DLQ/replay and full-DLQ recovery have not been exercised against RabbitMQ. Unsafe records need a separate repair/export contract rather than unchanged replay.
+**Remaining risk:** Full-DLQ recovery has not been exercised. Unsafe records need a separate repair/export contract rather than unchanged replay.
 
 **Minimal resolution:**
 
@@ -450,11 +450,11 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 28. Queue growth has no application-defined ceiling
 
-**Status:** Partial; the 1 GiB/1,000,000-message `reject-publish` policy is applied to application delivery, retry, DLQ, and generation queues. Broker assertions, operator alarms, and safe generation retirement remain.
+**Status:** Partial; the 1 GiB/1,000,000-message `reject-publish` policy is applied to application delivery, retry, DLQ, and generation queues. Local RabbitMQ assertions cover every queue class and visible overflow rejection, operator alarm/response guidance is documented, and conservative generation retirement is implemented. Drained retry-queue retirement and sustained concurrent-retirement evidence remain.
 
-**Evidence:** Application queues now declare maximum length/bytes and `reject-publish`; replacing pre-existing queues requires an explicit drain/recreate maintenance step. Replaced generations still have no retirement or queue-deletion workflow.
+**Evidence:** Application queues declare maximum length/bytes and `reject-publish`; replacing pre-existing queues requires an explicit drain/recreate maintenance step. Retirement uses repeated empty/in-flight proof and RabbitMQ `if-empty`/`if-unused` deletion, deferring cleanup when proof fails.
 
-**Remaining risk:** Per-queue limits lack real-broker assertions, the number of retry/generation queues can still grow, and operator alarms/retirement are incomplete.
+**Remaining risk:** Full application-queue saturation and concurrent retirement remain untested, and drained retry queues are not retired.
 
 **Minimal resolution:**
 
@@ -466,7 +466,7 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 29. Dead-letter recovery lacks complete integration and repair coverage
 
-**Status:** Partial. The local async CLI passively inspects safe metadata and replays one selected or all eligible retry-exhausted direct records with confirmation before acknowledgement. It scans without retaining payload bodies, separately reports confirmed, intentionally retained, and malformed records, and does not redeclare application queues. Poison and aggregate inputs remain retained without failing successful all-eligible replay; integration coverage remains.
+**Status:** Partial. The async CLI passively inspects safe metadata and replays one selected or all eligible retry-exhausted direct records with confirmation before acknowledgement. Local broker coverage proves metadata-only inspection, poison retention, and confirmed PostgreSQL replay. Poison and aggregate inputs remain retained and still need a safe repair/export workflow.
 
 **Impact:** “Durable failure” becomes permanent manual RabbitMQ surgery.
 
@@ -479,9 +479,9 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 30. Channel replacement is not fully transactional or restart-safe
 
-**Status:** Partial. Registration is serialized and validates/builds the sink, schema, exchange, generation queue, and actors before touching the active record. Queued work remains pinned to its generation-specific sink. The old event actor is then stopped and flushed before schema/consumer activation and the record swap.
+**Status:** Partial. Registration is serialized and validates/builds the sink, schema, exchange, generation queue, and actors before touching the active record. Queued work remains pinned to its generation-specific sink. Drained old generations are retired conservatively only after admission moves, the generation consumer drains and stops, the actor flushes, output persistence is proven, and RabbitMQ accepts `if-empty`/`if-unused` deletion; cleanup is deferred on incomplete proof.
 
-**Remaining gaps:** A failure while stopping or flushing the old actor has no rollback, prepared actors/queues are not cleaned up, and old generations are retained indefinitely. Runtime replacement generations are not restored across process restart.
+**Remaining gaps:** A failure while stopping or flushing the old actor has no rollback, prepared resources are not cleaned up, retirement lacks concurrent-ingest evidence, and runtime replacement generations are not restored across process restart.
 
 **Impact:** Most preparation failures leave the prior channel operational, but a late replacement failure can stop its event actor or leak generation resources. A restart can strand backlog accepted under an ephemeral runtime generation.
 
@@ -572,7 +572,7 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 
 ### 37. Rust formatting lacks CI enforcement
 
-**Status:** Partial. `cargo fmt --check` passes locally and `.github/workflows/broker-durability.yml` enforces it on pushes and pull requests; the new workflow has not yet produced execution evidence.
+**Status:** Partial. `cargo fmt --check` passes locally and `.github/workflows/ci.yml` enforces it on pushes and pull requests; the new workflow has not yet produced successful execution evidence.
 
 **Remaining work:** Preserve a successful workflow run as CI evidence.
 
@@ -635,6 +635,6 @@ Work in this order to avoid implementing behavior that v1 later removes:
 3. **Make broker acceptance durable** — blockers 1, 2, 4, 5, 6, 28, and 29. Durable event handoff, shutdown flush, reconnect supervision, retry/DLQ topology, poison handling, queue caps, generation retirement, replay. *In progress: bounded listener shutdown/aggregate flush, poison-message DLQ bypass, one confirmed admission publication, and isolated durable aggregate input are implemented; run aggregate crash/restart coverage in Docker CI before accepting final semantics. Dispatch prompt: `docs/next-production-blockers-dispatch.md`.*
 4. **Finish runtime correctness** — blockers 18, 19, 20, 21, 23, 26, 27, 30, and 31. SDK drain/timestamps/failures/client ownership; readiness/metrics; replacement rollback and restart-safe generations; explicit migrations. *In progress: replacement resources are staged and queued work retains its generation-specific sink; rollback, durable runtime generations, retirement, and failure-injection coverage remain.*
 5. **Ship golden path** — blockers 13, 15, 16, and 32. Versioned image, RabbitMQ persistence/credentials, Aspire sample plus end-to-end test, Azure publish docs.
-6. **Release guardrails and docs** — blockers 33–39. Rust formatting is clean and included in the new broker workflow; execute and extend CI, fix package metadata/pack, add contract checks, and remove stale claims.
+6. **Release guardrails and docs** — blockers 33–39. Rust formatting is clean and included in automatic CI; execute and extend CI, stabilize the manually dispatched broker suite, fix package metadata/pack, add contract checks, and remove stale claims.
 
 Build tests with each phase. Phase 5 golden-path test becomes release gate in phase 6.

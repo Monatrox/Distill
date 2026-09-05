@@ -183,14 +183,17 @@ impl ChannelRegistry {
     /// Returns an error when a channel cannot hand buffered aggregates to `RabbitMQ`.
     pub(crate) async fn shutdown(&self) -> Result<(), DistillError> {
         self.stop_admission();
-        timeout(self.shutdown_timeout, self.consumer.flush_aggregators())
-            .await
-            .map_err(|_| {
-                DistillError::Persistence(format!(
-                    "channel shutdown exceeded {} seconds",
-                    self.shutdown_timeout.as_secs()
-                ))
-            })?
+        timeout(self.shutdown_timeout, async {
+            self.consumer.flush_aggregators().await?;
+            self.consumer.shutdown().await
+        })
+        .await
+        .map_err(|_| {
+            DistillError::Persistence(format!(
+                "channel shutdown exceeded {} seconds",
+                self.shutdown_timeout.as_secs()
+            ))
+        })?
     }
 
     pub(crate) fn stop_admission(&self) {
@@ -301,6 +304,10 @@ impl ChannelRegistry {
                 lifecycle: ChannelLifecycle::Active,
             },
         );
+        if let Some(previous) = old {
+            self.consumer
+                .retire_generation(previous.handle.generation(), previous.handle);
+        }
         info!(event.name = "distill.channel.registered", channel.id = %channel_id, "channel registered");
         Ok(())
     }

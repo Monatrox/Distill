@@ -2,6 +2,8 @@
 
 Use the following prompt to dispatch the next production-readiness work.
 
+For the durable worktree snapshot, completed work, executed evidence, unresolved risks, and exact next-session order, read `docs/production-readiness-handoff.md` first.
+
 ---
 
 You are working in the Distill repository. Implement and verify the next production-readiness phase: broker durability and recovery. Use `docs/production-readiness-blockers.md` as the source of truth, focusing on blockers 1, 2, 4, 5, 6, 28, and 29, plus only the generation-retirement portion of blocker 30.
@@ -26,11 +28,12 @@ This phase is **partial**. Do not mark any listed blocker resolved without its r
   - Sink failures move to per-destination quorum TTL retry queues using RabbitMQ at-least-once dead-lettering. Retry admission receives a publisher confirm before the original delivery is acknowledged. No consumer sleeps for retry delay.
   - Delivery, retry, DLQ, and aggregate-generation queues declare `x-max-length=1000000`, `x-max-length-bytes=1073741824`, and `x-overflow=reject-publish`.
   - Malformed and exhausted deliveries are wrapped once in a DLQ record containing bounded failure metadata, original exchange/routing data, retry count, known envelope/record IDs, timestamp, and base64 original bytes. Logs do not print payloads.
-  - Consumer, retry, registration, and actor-flush logs retain stable error codes while omitting potentially sensitive dynamic text. Shared and generation consumers reconnect after failure with a bounded delay, but full state/readiness and shutdown-aware backoff remain open.
+  - Consumer, retry, registration, and actor-flush logs retain stable error codes while omitting potentially sensitive dynamic text. Publishers and consumers reconnect; consumers expose explicit lifecycle state and use bounded jittered backoff with shutdown cancellation.
   - `DeadLetterClient` connects passively, scans in constant memory, and supports metadata-only listing plus confirmed replay of `--id` or `--all`. Only structurally valid, retry-exhausted direct persistence records are eligible; poison and aggregate-input records remain retained without making successful all-eligible replay fail, while malformed DLQ wrappers produce a non-zero repair signal.
 - `src/infra/cli.rs`: DLQ commands run on the application's existing Tokio runtime, Clap enforces exactly one replay selector, and default output omits payload and failure text.
-- `scripts/test-durable-aggregate-input.sh`: supports Podman first and Docker fallback, uses fully qualified images and broker network aliases, and keeps its credential-bearing configuration owner-only. It covers direct, aggregate-only, and `PersistAndAggregate` crash/restart recovery plus SIGTERM flush/failure behavior, but must be rerun after the quorum-retry and permission changes.
-- `.github/workflows/broker-durability.yml`: `durable-handoff` runs formatting, Clippy, tests, script syntax, and the complete durable-handoff integration script.
+- `scripts/test-durable-aggregate-input.sh`: supports Docker and rootless Podman (including `keep-id` mapping), uses fully qualified images and broker network aliases, and keeps its credential-bearing configuration owner-only. Its current direct, aggregate-only, and `PersistAndAggregate` crash/restart recovery plus SIGTERM flush/failure scenarios pass locally under Podman 5.8.4.
+- `.github/workflows/ci.yml`: automatic push/PR CI runs formatting, Clippy, unit tests, CLI help, and broker-script syntax without requiring a container runtime.
+- `.github/workflows/broker-durability.yml`: manually dispatched `durable-handoff` forces Docker and runs the container integration script. Failed runs upload redacted container state and logs for seven days.
 - `src/core/channel.rs` and `src/http/channels.rs`: aggregate-flush and registration logs also omit dynamic error text; registration retains its stable error code.
 - `Dockerfile`, `README.md`, `docs/cli.md`, and `docs/production-readiness-blockers.md` document current behavior and queue upgrade caveat.
 
@@ -41,31 +44,32 @@ Passed locally:
 ```text
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets            # 49 tests
+cargo test --all-targets            # 50 tests
 bash -n scripts/test-durable-aggregate-input.sh
 cargo run --quiet -- dlq replay --help
+DISTILL_CONTAINER_ENGINE=podman bash scripts/test-durable-aggregate-input.sh
 git diff --check
 ```
 
-The prior version of the integration script passed under Podman, but that evidence predates the quorum-retry and owner-only configuration corrections. Neither Podman nor Docker is accessible in the current review environment, and GitHub Actions has not yet supplied execution evidence. Treat all current real-broker acceptance criteria as unverified until the revised script runs.
+The current integration script passes under local rootless Podman 5.8.4. It covers crash/restart, SIGTERM, fail-closed outage admission, direct/aggregate broker-restart recovery, failed-destination isolation and retry to a recovered HTTP receiver, malformed-message DLQ and later-valid delivery, metadata-only listing and poison retention, confirmed PostgreSQL replay, overflow rejection, repeated generation reclamation, and delivery/retry/DLQ/generation queue arguments. The first GitHub-hosted run failed because the earlier harness attempted `exec` after a container had exited; it did not expose the underlying container failure and supplies no acceptance evidence. The harness now checks container state before exec and preserves redacted inspect/log artifacts, while the broker workflow is manual-only until it is stable. Full-DLQ/saturation, in-flight restart, repair/export, and concurrent retirement remain unverified.
 
 ### Important limits and risks
 
 - Existing RabbitMQ queues declared without new `x-*` arguments cannot be redeclared compatibly. Drain/replay backlog, then recreate queues during maintenance; no automatic queue migration exists.
-- The shared and generation consumers reconnect with a bounded fixed delay, but they do not yet expose consumer state or cancel their delay explicitly during shutdown. `RabbitPublisher` remains one-shot and fails admission safely when unavailable.
-- Old channel generations are not retired. Do not add forced queue deletion; safe retirement needs drain, actor flush, no in-flight delivery, and empty-queue proof.
-- Retry isolation, at-least-once DLX behavior, DLQ/replay, overflow, reconnect, poison, and retirement remain untested against a real broker after the corrections. Docker/Podman and CI execution remain unverified.
+- Publishers reconnect once before failing admission. Shared and generation consumers expose lifecycle state and reconnect with bounded jittered backoff that cancels during shutdown.
+- Old channel generations now have conservative background retirement using repeated drain observations, actor flush, in-flight tracking, and RabbitMQ `if-empty`/`if-unused` deletion. Cleanup is deferred on incomplete proof; concurrent-ingest evidence remains.
+- Retry isolation, at-least-once DLX behavior, DLQ/replay, overflow, reconnect, poison, and repeated retirement have current local real-broker Podman evidence but no revised GitHub-hosted Docker evidence. Full-queue recovery, in-flight restart, replay partial failure, and concurrent retirement remain untested.
 - Aggregate-input DLQ replay remains disabled until durable source-event deduplication exists. Do not describe aggregate replay as idempotent merely because sink record IDs are stable.
 - Consumer logs now provide safe error codes and reconnect, but consumer health is not exposed. Do not treat process liveness as broker-consumer health.
 - The shutdown integration scenario intentionally stops the active Distill container before starting the next one. Do not run overlapping instances against the same generation queue when asserting which actor owns an unacknowledged delivery.
 
 ### Next work, in order
 
-1. Run `durable-handoff` in GitHub Actions and preserve its result. Run the same script with Docker daemon access when available. Keep blockers 1 and 2 partial until that evidence is recorded.
-2. Complete consumer supervision with bounded exponential backoff and jitter, shutdown cancellation, and explicit starting/healthy/reconnecting/stopped state. Reconnect the publisher or retain verified fail-closed admission. Add RabbitMQ-restart integration coverage before changing blocker 4 beyond partial.
-3. Add isolated real-broker coverage for retry TTL/DLX routing, a failing destination not delaying healthy work, malformed/unsupported/exhausted poison delivery, metadata-only DLQ listing, confirmed replay to PostgreSQL, queue arguments, and queue-full `202` rejection. Use bounded, observable waits; do not add consumer sleeps.
-4. Define bounded DLQ capacity/retention and operator response without silent loss. Document broker disk alarms and queue-depth/oldest-message alerts.
-5. Implement race-safe generation retirement only after proof that admission moved, actor buffer flushed, in-flight deliveries reached zero, and generation queue is empty. Defer and surface cleanup when proof fails; never force-delete. Then add concurrent-ingest retirement coverage.
+1. Manually dispatch `durable-handoff` and preserve a successful Docker result; use its diagnostic artifact if the host behaves differently from the passing local Podman run. Keep blockers 1 and 2 partial until that evidence is recorded; restore automatic/nightly execution only after the harness is reliable.
+2. Extend RabbitMQ-restart coverage to interrupt already accepted in-flight direct and aggregate deliveries, proving acknowledged work survives the restart.
+3. Add real-broker coverage for unsupported/exhausted poison delivery, full DLQ/retry queues, replay idempotency, and partial replay failure. Use bounded, observable waits; do not add consumer sleeps.
+4. Define and implement a safe export/repair workflow for ineligible poison and aggregate-input records without unchanged replay or default payload exposure.
+5. Exercise conservative generation retirement during concurrent ingest. Prove accepted work remains on its original sink and deferred cleanup is surfaced when proof fails.
 6. Update blocker statuses only from executed evidence. Current status: blockers 1, 2, 4, 5, 6, 28, 29, and 30 remain partial.
 
 Before editing, inspect the current uncommitted changes and preserve unrelated user work. Follow `AGENTS.md`; use CodeGraph first when available, and follow the mandatory Rust skill before changing Rust files.
@@ -74,10 +78,10 @@ Before editing, inspect the current uncommitted changes and preserve unrelated u
 
 Do not reimplement already-delivered confirmed routed admission, quorum retry topology, envelope versioning/DLQ records, queue caps, bounded DLQ CLI, crash/restart coverage, or SIGTERM coverage. Extend them only with real-broker evidence or a defect fix. Aggregate-input replay is intentionally not delivered.
 
-1. Supervise shared persistence and every generation consumer. On connection/channel/consumer failure, reconnect with bounded exponential backoff and jitter; re-declare compatible topology; restore consumers; cancel promptly at shutdown; and expose truthful consumer state. Ensure publisher unavailability cannot produce `202`.
-2. Prove retry isolation, TTL/DLX routing, poison/DLQ behavior, metadata-only listing, confirmed PostgreSQL replay, queue arguments, and overflow admission behavior against RabbitMQ. Add DLQ retention/capacity policy, disk-alarm guidance, and operator response.
-3. Implement safe generation retirement. Remove a generation from consumer, actor, sink maps, and broker topology only after admission moves, actor flush succeeds, no delivery is in flight, and queue emptiness is proven. Add concurrent-ingest coverage; defer cleanup when proof fails.
-4. Preserve complete CI and Docker evidence for durable-handoff. Update operator/integrator docs and `docs/production-readiness-blockers.md` only from executed evidence.
+1. Prove accepted in-flight work survives RabbitMQ restart, and preserve a successful GitHub-hosted Docker run.
+2. Prove unsupported/exhausted poison handling, full-DLQ recovery, replay idempotency, and partial broker failure against RabbitMQ.
+3. Prove conservative generation retirement with concurrent ingest; defer cleanup when proof fails.
+4. Deliver a safe export/repair workflow for intentionally ineligible DLQ records.
 
 Do not expand this dispatch into full transactional replacement rollback, persistence of runtime channel definitions/generations, general `/ready` endpoint design, the complete metrics overhaul, SDK work, or database migrations. Leave blocker 30 partial unless all of its separate acceptance criteria are actually completed.
 

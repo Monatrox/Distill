@@ -209,6 +209,17 @@ The sink manifest is safe to version-control only when it contains references an
 
 Distill declares delivery, retry, dead-letter, and aggregate-generation queues with `x-max-length=1000000`, `x-max-length-bytes=1073741824`, and `x-overflow=reject-publish`. Retry queues are quorum queues with at-least-once dead-lettering; RabbitMQ 3.10 or newer with the `stream_queue` feature flag is required. RabbitMQ disk alarms remain mandatory.
 
+The DLQ deliberately has no time-based retention: records remain until an operator confirms replay, export/repair, or approved disposal. Its one-million-message/1-GiB limits bound disk growth. When the DLQ rejects a publish, Distill does not acknowledge the original delivery; the supervised consumer becomes degraded and retries after capacity is restored, preventing silent loss.
+
+Production monitoring must alert before the hard limits are reached:
+
+- RabbitMQ memory or disk alarms: page immediately and stop nonessential publishers; restore capacity before changing Distill queues.
+- Any DLQ depth: investigate the failure category and destination. Warn at 100,000 messages or 100 MiB and page at 800,000 messages or 800 MiB.
+- Oldest DLQ message: warn after 15 minutes and page after one hour unless a documented incident exception applies.
+- Delivery, retry, or generation queues: alert on sustained growth and oldest-message age; a growing retry generation identifies an unhealthy destination.
+
+At an alert, stop or rate-limit new admission if broker capacity is threatened, repair the destination, inspect metadata with `distill dlq list`, and replay only eligible records. Never increase limits merely to clear an alarm, and never purge or delete a non-empty DLQ. Back up/export ineligible records under the deployment's data-handling policy before an approved repair or disposal action.
+
 Existing queues declared without these arguments require a maintenance migration because RabbitMQ rejects incompatible redeclaration. Stop new admission, keep the previous Distill release running until delivery, generation, and retry queues drain, and use the passively connected DLQ CLI to replay eligible records after destination recovery. Do not delete a non-empty DLQ: if ineligible records remain, preserve the queue and defer migration until an approved backup/export-and-repair workflow can retain them. Once every affected queue is proven empty and the broker is backed up, stop the previous release, recreate those queues, and start the new release. There is no automatic queue migration.
 
 ## Exit codes and automation
