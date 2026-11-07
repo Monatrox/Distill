@@ -13,6 +13,8 @@ use super::{
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ChannelDefinition {
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub severity_threshold: SeverityLevel,
     pub rabbitmq_config: RabbitMqConfig,
     #[serde(default)]
@@ -56,6 +58,15 @@ impl ChannelDefinition {
                 "channel_id must not exceed {MAX_CHANNEL_ID_LENGTH} characters"
             ));
         }
+        if self.version.as_ref().is_some_and(|version| {
+            version.is_empty()
+                || version.len() > 64
+                || !version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        }) {
+            return Err("version must contain 1-64 ASCII letters, digits, dots, hyphens, underscores, or plus signs".to_string());
+        }
         if self.buffer_bytes == 0 || self.mailbox_capacity == 0 {
             return Err("buffer_bytes and mailbox_capacity must be positive".to_string());
         }
@@ -78,30 +89,28 @@ impl ChannelDefinition {
         }
         if self.sink_id.is_none() {
             self.sink_config.validate()?;
-            self.validate_for_sink(&self.sink_config.driver)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_for_sink(&self, sink_driver: &str) -> Result<(), String> {
-        if self
-            .aggregator
-            .as_ref()
-            .is_some_and(|aggregator| aggregator.rolling)
-            && sink_driver != "postgres"
-        {
-            return Err("rolling aggregates require a PostgreSQL sink in v1".to_string());
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 pub struct RabbitMqConfig {
     pub connection_string: String,
     pub exchange_name: String,
     #[serde(default)]
     pub routing_key_prefix: String,
+}
+
+impl std::fmt::Debug for RabbitMqConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RabbitMqConfig")
+            .field("connection_string", &"[REDACTED]")
+            .field("exchange_name", &self.exchange_name)
+            .field("routing_key_prefix", &self.routing_key_prefix)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -124,6 +133,7 @@ mod tests {
         ttl_seconds: u64,
     ) -> ChannelDefinition {
         ChannelDefinition {
+            version: None,
             channel_id: "orders.production".to_string(),
             severity_threshold: SeverityLevel::Error,
             rabbitmq_config: RabbitMqConfig {
@@ -190,8 +200,10 @@ mod tests {
             parameter: None,
             rolling: true,
         });
-        assert!(definition.validate_for_sink("postgres").is_ok());
-        assert!(definition.validate_for_sink("http").is_err());
+        assert!(definition.validate().is_ok());
+        definition.sink_config.driver = "http".to_string();
+        definition.sink_config.connection_string = "https://receiver.example/records".to_string();
+        assert!(definition.validate().is_ok());
     }
 
     #[test]

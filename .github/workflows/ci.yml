@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
   pull_request:
   push:
 
@@ -18,4 +19,41 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo run --quiet -- dlq replay --help
-      - run: bash -n scripts/test-durable-aggregate-input.sh
+      - run: bash -n scripts/test-durable-aggregate-input.sh scripts/test-sink-contracts.sh scripts/test-packages.sh scripts/test-http-only.sh
+      - run: python3 -m py_compile examples/http_receiver.py scripts/seed-legacy-sink-schema.py scripts/test-aspire-application.py
+      - run: node --check scripts/test-aspire-ui.cjs
+
+  dotnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - run: dotnet run --project clients/dotnet/Distill.Client.ContractTests -p:BuildInParallel=false
+      - run: |
+          dotnet pack clients/dotnet/Distill.Client -c Release -o artifacts
+          dotnet pack clients/dotnet/Distill.Extensions.Logging -c Release -o artifacts
+          dotnet pack clients/dotnet/Distill.Aspire -c Release -o artifacts
+      - run: bash scripts/test-packages.sh artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distill-nuget
+          path: artifacts/*nupkg
+
+  sink-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/test-sink-contracts.sh
+        env:
+          DISTILL_CONTAINER_ENGINE: docker
+      - run: bash scripts/test-http-only.sh
+        env:
+          DISTILL_CONTAINER_ENGINE: docker

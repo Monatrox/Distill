@@ -11,9 +11,17 @@ public sealed record CreateChannelRequest
     [JsonPropertyName("name")]
     public required string Name { get; init; }
 
+    /// Gets the immutable configuration version supplied by the producer.
+    [JsonPropertyName("version")]
+    public string? Version { get; init; }
+
     /// Gets or initializes the preset used before applying overrides.
     [JsonPropertyName("preset")]
     public ChannelPreset Preset { get; init; } = ChannelPreset.RawEvents;
+
+    /// Gets an optional payload descriptor included in this immutable version.
+    [JsonPropertyName("message_schema")]
+    public MessageSchemaDefinition? MessageSchema { get; init; }
 
     /// Gets or initializes an optional severity threshold override.
     [JsonPropertyName("severity_threshold")]
@@ -31,11 +39,7 @@ public sealed record CreateChannelRequest
     [JsonPropertyName("sink_id")]
     public string? SinkId { get; init; }
 
-    /// Gets or initializes a legacy inline sink configuration override.
-    ///
-    /// Prefer <see cref="SinkId"/>. Sink credentials should be provisioned by the Distill CLI
-    /// or deployment system, not passed through application configuration.
-    [Obsolete("Use SinkId and provision the sink with the Distill CLI.")]
+    /// Gets an inline destination; prefer registering a versioned sink when shared.
     [JsonPropertyName("sink_config")]
     public SinkConfig? SinkConfig { get; init; }
 
@@ -62,6 +66,20 @@ public sealed record CreateChannelRequest
     /// Gets or initializes an optional unit of measure for channel values.
     [JsonPropertyName("channel_uom")]
     public string? ChannelUom { get; init; }
+}
+
+/// Describes the Protobuf payload schema validated by a channel version.
+public sealed record MessageSchemaDefinition
+{
+    [JsonPropertyName("message_type")]
+    public required string MessageType { get; init; }
+
+    [JsonPropertyName("version")]
+    public required string Version { get; init; }
+
+    /// Gets a base64 encoded FileDescriptorSet including required imports.
+    [JsonPropertyName("descriptor_set_base64")]
+    public required string DescriptorSetBase64 { get; init; }
 }
 
 /// Identifies a built-in channel preset.
@@ -132,7 +150,7 @@ public sealed record AggregatorSpec
     public bool Rolling { get; init; }
 }
 
-/// Configures a PostgreSQL sink.
+/// Configures a supported persistence destination.
 public sealed record SinkConfig
 {
     /// Gets or initializes the sink driver name.
@@ -142,6 +160,12 @@ public sealed record SinkConfig
     /// Gets or initializes the sink connection string.
     [JsonPropertyName("connection_string")]
     public required string ConnectionString { get; init; }
+
+    /// Gets HTTP receiver authentication and custom headers.
+    [JsonPropertyName("headers")]
+    public IReadOnlyDictionary<string, string>? Headers { get; init; }
+
+    public override string ToString() => $"SinkConfig {{ Driver = {Driver}, ConnectionString = [REDACTED], Headers = [REDACTED] }}";
 }
 
 /// Represents one structured event sent through the batch ingestion endpoint.
@@ -159,6 +183,10 @@ public sealed record DistillEvent
     [JsonPropertyName("channel_id")]
     public required string ChannelId { get; init; }
 
+    /// Gets the configuration version; reconciliation can bind it automatically.
+    [JsonPropertyName("version")]
+    public string? Version { get; init; }
+
     /// Gets or initializes the Distill severity name.
     [JsonPropertyName("severity_level")]
     public DistillSeverity SeverityLevel { get; init; } = DistillSeverity.Info;
@@ -175,13 +203,17 @@ public sealed record DistillEvent
 /// Represents a single event written through the channel-bound endpoint.
 public sealed record SimpleEvent
 {
+    /// Gets the target configuration version.
+    [JsonPropertyName("version")]
+    public string? Version { get; init; }
+
     /// Gets or initializes the optional stable event identifier.
     [JsonPropertyName("event_id")]
-    public Guid? EventId { get; init; }
+    public Guid? EventId { get; init; } = Guid.NewGuid();
 
     /// Gets or initializes the optional event timestamp.
     [JsonPropertyName("timestamp")]
-    public DateTimeOffset? Timestamp { get; init; }
+    public DateTimeOffset? Timestamp { get; init; } = DateTimeOffset.UtcNow;
 
     /// Gets or initializes the severity name.
     [JsonPropertyName("severity")]
@@ -250,6 +282,10 @@ public sealed record ChannelConfigResponse
     /// Gets the channel identifier.
     [JsonPropertyName("channel_id")]
     public string ChannelId { get; init; } = string.Empty;
+
+    /// Gets the immutable configuration version.
+    [JsonPropertyName("version")]
+    public string? Version { get; init; }
 
     /// Gets whether the channel currently accepts events.
     [JsonPropertyName("active")]
@@ -372,4 +408,22 @@ public sealed class DistillApiException : Exception
 
     /// Gets the raw response body for diagnostics.
     public string ResponseBody { get; }
+}
+
+/// Registers a destination under an immutable name and version.
+public sealed record RegisterSinkRequest
+{
+    [JsonPropertyName("name")]
+    public required string Name { get; init; }
+    [JsonPropertyName("version")]
+    public required string Version { get; init; }
+    [JsonPropertyName("config")]
+    public required SinkConfig Config { get; init; }
+}
+
+/// Contains a reusable sink reference without credentials.
+public sealed record RegisterSinkResponse
+{
+    [JsonPropertyName("sink_id")]
+    public required string SinkId { get; init; }
 }

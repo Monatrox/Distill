@@ -15,7 +15,7 @@ use lapin::{
     options::{
         BasicAckOptions, BasicConsumeOptions, BasicGetOptions, BasicNackOptions,
         BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions, ExchangeDeclareOptions,
-        QueueBindOptions, QueueDeclareOptions, QueueDeleteOptions,
+        QueueBindOptions, QueueDeclareOptions,
     },
     publisher_confirm::Confirmation,
     types::{AMQPValue, FieldTable},
@@ -31,9 +31,9 @@ use std::{
 use tokio::{
     sync::{Mutex, RwLock, watch},
     task::JoinHandle,
-    time::{Duration, Instant, sleep},
+    time::{Duration, sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 const DELIVERY_QUEUE: &str = "distill.persistence";
@@ -43,6 +43,10 @@ const DEAD_LETTER_QUEUE: &str = "distill.dead-letter.queue";
 const RETRY_EXCHANGE: &str = "distill.retry";
 /// Stops repeated sink failures from retrying forever.
 const MAX_RETRIES: u32 = 10;
+/// Bounds a destination attempt so a stalled sink cannot hold delivery forever.
+const SINK_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Releases abandoned consumers promptly without hanging on an unavailable broker.
+const CONSUMER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Identifies compatible broker payload encoding.
 const ENVELOPE_VERSION: u8 = 1;
 /// Identifies envelopes written before explicit versioning was introduced.
@@ -61,13 +65,6 @@ const CONSUMER_PREFETCH: u16 = 256;
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 /// Maximum reconnect delay bounds recovery latency during prolonged outages.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
-/// Retirement must observe an idle generation twice to exclude sampling races.
-const RETIREMENT_STABLE_OBSERVATIONS: u8 = 2;
-/// Bounds background retirement so failed proof cannot retain a busy task forever.
-const RETIREMENT_PROOF_TIMEOUT: Duration = Duration::from_secs(30);
-/// Spaces passive queue observations without introducing a hot loop.
-const RETIREMENT_POLL_DELAY: Duration = Duration::from_millis(100);
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum ConsumerState {
@@ -124,6 +121,24 @@ impl RabbitPublisher {
             uri: Arc::from(uri),
             session: Arc::new(RwLock::new(session)),
         })
+    }
+
+    /// Reconnects an idle publisher so readiness can recover without new traffic.
+    pub(crate) async fn healthy(&self) -> bool {
+        if self.session.read().await.channel.status().connected() {
+            return true;
+        }
+        let mut session = self.session.write().await;
+        if session.channel.status().connected() {
+            return true;
+        }
+        match tokio::time::timeout(Duration::from_secs(2), connect_publisher(&self.uri)).await {
+            Ok(Ok(replacement)) => {
+                *session = replacement;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub async fn publish<T: Serialize>(
@@ -331,12 +346,7 @@ impl Drop for GenerationSinkLease {
 }
 
 struct GenerationRuntime {
-    channel_id: String,
     shutdown: watch::Sender<bool>,
-    #[expect(
-        dead_code,
-        reason = "consumer state is retained for the planned readiness and metrics surface"
-    )]
     state: Arc<ConsumerStatus>,
     in_flight: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -375,10 +385,6 @@ pub struct RabbitConsumer {
     aggregators: Arc<RwLock<HashMap<String, AggregateBinding>>>,
     aggregate_handles: Arc<RwLock<HashMap<Uuid, ChannelHandle>>>,
     generation_runtimes: Arc<RwLock<HashMap<Uuid, GenerationRuntime>>>,
-    #[expect(
-        dead_code,
-        reason = "consumer state is retained for the planned readiness and metrics surface"
-    )]
     persistence_state: Arc<ConsumerStatus>,
     persistence_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     shutdown: watch::Sender<bool>,
@@ -440,6 +446,38 @@ impl DeadLetterClient {
         }
         requeue_unacknowledged(&self.channel, last_unacknowledged).await?;
         Ok(records)
+    }
+
+    /// Exports protected broker bytes without acknowledging or replaying records.
+    pub(crate) async fn export(
+        &self,
+        file: &mut tokio::fs::File,
+        selected: Option<Uuid>,
+    ) -> Result<u32, DistillError> {
+        use tokio::io::AsyncWriteExt;
+        let limit = self.count().await?;
+        let mut last = None;
+        let result = async {
+            let mut count = 0;
+            for _ in 0..limit {
+                let Some(delivery) = self.channel.basic_get(DEAD_LETTER_QUEUE, BasicGetOptions { no_ack: false }).await? else { break; };
+                last = Some(delivery.delivery_tag);
+                let id = parse_dead_letter(&delivery.data).ok().map(|record| record.metadata.id);
+                if selected.is_some() && id != selected { continue; }
+                let line = serde_json::to_vec(&serde_json::json!({
+                    "format_version": 1, "dlq_message_id": id, "data_base64": STANDARD.encode(&delivery.data)
+                })).map_err(|_| DistillError::Persistence("DLQ export encoding failed".to_string()))?;
+                file.write_all(&line).await.map_err(|_| DistillError::Persistence("DLQ export write failed".to_string()))?;
+                file.write_all(b"\n").await.map_err(|_| DistillError::Persistence("DLQ export write failed".to_string()))?;
+                count += 1;
+                if selected.is_some() { break; }
+            }
+            file.flush().await.map_err(|_| DistillError::Persistence("DLQ export flush failed".to_string()))?;
+            file.sync_all().await.map_err(|_| DistillError::Persistence("DLQ export sync failed".to_string()))?;
+            Ok(count)
+        }.await;
+        requeue_unacknowledged(&self.channel, last).await?;
+        result
     }
 
     pub(crate) async fn replay(
@@ -586,25 +624,26 @@ impl RabbitConsumer {
             shutdown,
             metrics: Arc::clone(&metrics),
         };
-        let consumer_channel = Arc::clone(&consumer.channel);
-        let consumer_sinks = Arc::clone(&sinks);
-        let consumer_generation_sinks = Arc::clone(&generation_sinks);
-        let consumer_aggregators = Arc::clone(&aggregators);
-        let persistence_aggregators = Arc::clone(&consumer_aggregators);
-        let persistence_metrics = Arc::clone(&metrics);
-        let consumer_uri = Arc::clone(&consumer.uri);
-        let task = tokio::spawn(supervise_persistence(
-            consumer_uri,
-            consumer_channel,
-            consumer_sinks,
-            consumer_generation_sinks,
-            persistence_aggregators,
-            persistence_metrics,
-            persistence_state,
-            shutdown_rx,
-        ));
-        *persistence_task.lock().await = Some(task);
+        drop(shutdown_rx);
         Ok(consumer)
+    }
+
+    /// Starts shared delivery only after recovery mappings have been installed.
+    pub(crate) async fn start(&self) {
+        let mut task = self.persistence_task.lock().await;
+        if task.is_some() {
+            return;
+        }
+        *task = Some(tokio::spawn(supervise_persistence(
+            Arc::clone(&self.uri),
+            Arc::clone(&self.channel),
+            Arc::clone(&self.sinks),
+            Arc::clone(&self.generation_sinks),
+            Arc::clone(&self.aggregators),
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.persistence_state),
+            self.shutdown.subscribe(),
+        )));
     }
 
     pub async fn register_exchange(&self, exchange: &str) -> Result<(), DistillError> {
@@ -697,7 +736,6 @@ impl RabbitConsumer {
             self.generation_runtimes.write().await.insert(
                 generation,
                 GenerationRuntime {
-                    channel_id,
                     shutdown,
                     state,
                     in_flight,
@@ -708,18 +746,10 @@ impl RabbitConsumer {
         handle
     }
 
-    #[expect(
-        dead_code,
-        reason = "the later readiness and metrics work will consume this explicit state"
-    )]
     pub(crate) fn persistence_state(&self) -> ConsumerState {
         self.persistence_state.get()
     }
 
-    #[expect(
-        dead_code,
-        reason = "the later readiness and metrics work will consume this health projection"
-    )]
     pub(crate) async fn consumers_healthy(&self) -> bool {
         if self.persistence_state() != ConsumerState::Healthy {
             return false;
@@ -768,173 +798,14 @@ impl RabbitConsumer {
         Ok(())
     }
 
-    pub(crate) fn retire_generation(self: &Arc<Self>, generation: Uuid, handle: ChannelHandle) {
-        let consumer = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(error) = consumer.retire_generation_inner(generation, handle).await {
-                warn!(
-                    event.name = "distill.rabbit.generation_retirement.deferred",
-                    generation.id = %generation,
-                    error.code = %error.error_code(),
-                    "generation cleanup deferred because drain proof was incomplete"
-                );
-            }
-        });
+    pub(crate) async fn aggregate_in_flight(&self) -> usize {
+        self.generation_runtimes
+            .read()
+            .await
+            .values()
+            .map(|runtime| runtime.in_flight.load(Ordering::Acquire))
+            .sum()
     }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "retirement keeps its ordered drain proof and destructive action in one routine"
-    )]
-    async fn retire_generation_inner(
-        &self,
-        generation: Uuid,
-        handle: ChannelHandle,
-    ) -> Result<(), DistillError> {
-        let connection = Connection::connect(&self.uri, ConnectionProperties::default()).await?;
-        let channel = connection.create_channel().await?;
-        let has_runtime = self
-            .generation_runtimes
-            .read()
-            .await
-            .contains_key(&generation);
-        let mut runtime_channel_id = None;
-        if has_runtime {
-            let deadline = Instant::now() + RETIREMENT_PROOF_TIMEOUT;
-            let mut stable = 0;
-            loop {
-                let (queue, in_flight) = {
-                    let runtimes = self.generation_runtimes.read().await;
-                    let runtime = runtimes.get(&generation).ok_or_else(|| {
-                        DistillError::InvalidConfiguration(
-                            "generation runtime is unavailable for retirement".to_string(),
-                        )
-                    })?;
-                    (
-                        generation_queue(&runtime.channel_id, generation),
-                        runtime.in_flight.load(Ordering::Acquire),
-                    )
-                };
-                if queue_message_count(&channel, &queue).await? == 0 && in_flight == 0 {
-                    stable += 1;
-                    if stable >= RETIREMENT_STABLE_OBSERVATIONS {
-                        break;
-                    }
-                } else {
-                    stable = 0;
-                }
-                if Instant::now() >= deadline {
-                    return Err(DistillError::Persistence(
-                        "generation queue did not become idle before retirement timeout"
-                            .to_string(),
-                    ));
-                }
-                sleep(RETIREMENT_POLL_DELAY).await;
-            }
-
-            let removed = self
-                .generation_runtimes
-                .write()
-                .await
-                .remove(&generation)
-                .ok_or_else(|| {
-                    DistillError::InvalidConfiguration(
-                        "generation runtime disappeared during retirement".to_string(),
-                    )
-                })?;
-            let _ = removed.shutdown.send(true);
-            runtime_channel_id = Some(removed.channel_id.clone());
-            removed.task.await.map_err(|error| {
-                DistillError::Persistence(format!("generation consumer shutdown failed: {error}"))
-            })?;
-        }
-        handle.flush().await?;
-
-        let sink_in_flight = self
-            .generation_sinks
-            .read()
-            .await
-            .get(&generation)
-            .map(|binding| Arc::clone(&binding.in_flight))
-            .ok_or_else(|| {
-                DistillError::InvalidConfiguration(
-                    "generation sink disappeared during retirement".to_string(),
-                )
-            })?;
-        let deadline = Instant::now() + RETIREMENT_PROOF_TIMEOUT;
-        let mut stable = 0;
-        loop {
-            let delivery_empty = queue_message_count(&channel, DELIVERY_QUEUE).await? == 0;
-            if delivery_empty && sink_in_flight.load(Ordering::Acquire) == 0 {
-                stable += 1;
-                if stable >= RETIREMENT_STABLE_OBSERVATIONS {
-                    break;
-                }
-            } else {
-                stable = 0;
-            }
-            if Instant::now() >= deadline {
-                return Err(DistillError::Persistence(
-                    "generation output could not be proven persisted before retirement timeout"
-                        .to_string(),
-                ));
-            }
-            sleep(RETIREMENT_POLL_DELAY).await;
-        }
-
-        let channel_id = self
-            .generation_sinks
-            .read()
-            .await
-            .get(&generation)
-            .map(|binding| binding.channel_id.clone())
-            .ok_or_else(|| {
-                DistillError::InvalidConfiguration(
-                    "generation sink disappeared during retirement".to_string(),
-                )
-            })?;
-        if let Some(runtime_channel_id) = runtime_channel_id {
-            let queue = generation_queue(&runtime_channel_id, generation);
-            if queue_message_count(&channel, &queue).await? != 0 {
-                return Err(DistillError::Persistence(
-                    "generation queue received work during retirement".to_string(),
-                ));
-            }
-            channel
-                .queue_delete(
-                    &queue,
-                    QueueDeleteOptions {
-                        if_empty: true,
-                        if_unused: true,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-        }
-        self.aggregate_handles.write().await.remove(&generation);
-        self.generation_sinks.write().await.remove(&generation);
-        info!(
-            event.name = "distill.rabbit.generation_retirement.completed",
-            channel.id = %channel_id,
-            generation.id = %generation,
-            "drained channel generation retired"
-        );
-        Ok(())
-    }
-}
-
-async fn queue_message_count(channel: &Channel, queue: &str) -> Result<u32, DistillError> {
-    Ok(channel
-        .queue_declare(
-            queue,
-            QueueDeclareOptions {
-                passive: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?
-        .message_count())
 }
 
 #[expect(
@@ -959,8 +830,8 @@ async fn supervise_persistence(
             return;
         }
         let result = if let Some(initial) = channel.take() {
-            consume_persistence(
-                initial,
+            let result = consume_persistence(
+                Arc::clone(&initial),
                 Arc::clone(&sinks),
                 Arc::clone(&generation_sinks),
                 Arc::clone(&aggregators),
@@ -968,7 +839,9 @@ async fn supervise_persistence(
                 Arc::clone(&state),
                 shutdown.clone(),
             )
-            .await
+            .await;
+            close_consumer_channel(&initial).await;
+            result
         } else {
             consume_persistence_connection(
                 &uri,
@@ -1023,7 +896,7 @@ async fn consume_persistence_connection(
         .confirm_select(ConfirmSelectOptions::default())
         .await?;
     let result = consume_persistence(
-        channel,
+        Arc::clone(&channel),
         sinks,
         generation_sinks,
         aggregators,
@@ -1032,6 +905,7 @@ async fn consume_persistence_connection(
         shutdown,
     )
     .await;
+    close_consumer_channel(&channel).await;
     drop(connection);
     result
 }
@@ -1063,7 +937,7 @@ async fn supervise_generation(
         }
         let result = if let Some(initial) = channel.take() {
             let result = consume_generation(
-                initial,
+                Arc::clone(&initial),
                 channel_id.clone(),
                 generation,
                 Arc::clone(&sink),
@@ -1074,6 +948,7 @@ async fn supervise_generation(
                 shutdown.clone(),
             )
             .await;
+            close_consumer_channel(&initial).await;
             drop(connection.take());
             result
         } else {
@@ -1090,6 +965,9 @@ async fn supervise_generation(
             )
             .await
         };
+        // The previous consumer and its pending futures have now been dropped.
+        // RabbitMQ will redeliver unsettled work on the new connection.
+        in_flight.store(0, Ordering::Release);
         if *shutdown.borrow() {
             state.set(ConsumerState::Stopped);
             return;
@@ -1141,11 +1019,34 @@ async fn consume_generation_connection(
         .confirm_select(ConfirmSelectOptions::default())
         .await?;
     let result = consume_generation(
-        channel, channel_id, generation, sink, handle, metrics, state, in_flight, shutdown,
+        Arc::clone(&channel),
+        channel_id,
+        generation,
+        sink,
+        handle,
+        metrics,
+        state,
+        in_flight,
+        shutdown,
     )
     .await;
+    close_consumer_channel(&channel).await;
     drop(connection);
     result
+}
+
+async fn close_consumer_channel(channel: &Channel) {
+    // The initial shared channel also belongs to RabbitConsumer. Dropping a
+    // failed stream does not release that channel's server-side consumer: a
+    // requeued message can immediately become stranded there. Closing it first
+    // returns every unsettled delivery before the supervisor starts another one.
+    if channel.status().connected() {
+        let _ = tokio::time::timeout(
+            CONSUMER_CLOSE_TIMEOUT,
+            channel.close(200, "consumer loop ended"),
+        )
+        .await;
+    }
 }
 
 fn reconnect_delay(attempt: u32, seed: u64) -> Duration {
@@ -1304,10 +1205,6 @@ async fn declare_topology(channel: &Channel, exchange: &str) -> Result<(), Disti
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the consumer loop keeps delivery settlement adjacent to every durable handoff"
-)]
 async fn consume_persistence(
     channel: Arc<Channel>,
     sinks: Arc<RwLock<HashMap<String, SinkBinding>>>,
@@ -1352,7 +1249,7 @@ async fn consume_persistence(
                 delivery.exchange.as_str(),
                 delivery.routing_key.as_str(),
                 "invalid_envelope",
-                &error.to_string(),
+                error.error_code().as_str(),
             )
             .await
             {
@@ -1367,58 +1264,35 @@ async fn consume_persistence(
                     handoff_error.error_code()
                 )));
             }
+            metrics.delivery_failed();
+            metrics.dead_lettered();
             delivery.ack(BasicAckOptions::default()).await?;
             continue;
         }
         if delivery.routing_key.as_str().ends_with("aggregate-input") {
             let result =
                 migrate_legacy_aggregate_input(&channel, &aggregators, &delivery.data).await;
-            settle_delivery(&channel, delivery, result).await?;
+            settle_delivery(&channel, &metrics, delivery, result).await?;
             continue;
         }
-        let result = process_delivery(
-            &channel,
-            &sinks,
-            &generation_sinks,
-            &delivery.data,
-            delivery.routing_key.as_str(),
-            &metrics,
+        let result = tokio::time::timeout(
+            SINK_OPERATION_TIMEOUT,
+            process_delivery(
+                &channel,
+                &sinks,
+                &generation_sinks,
+                &delivery.data,
+                delivery.routing_key.as_str(),
+                &metrics,
+            ),
         )
-        .await;
-        match result {
-            Ok(()) => delivery.ack(BasicAckOptions::default()).await?,
-            Err(error) => {
-                warn!(
-                    event.name = "distill.rabbit.delivery.failure",
-                    error.code = %error.error_code(),
-                    "RabbitMQ delivery failed"
-                );
-                if let Err(retry_error) = retry_delivery(
-                    &channel,
-                    &delivery.data,
-                    delivery.exchange.as_str(),
-                    delivery.routing_key.as_str(),
-                )
-                .await
-                {
-                    delivery
-                        .nack(lapin::options::BasicNackOptions {
-                            requeue: true,
-                            ..Default::default()
-                        })
-                        .await?;
-                    warn!(
-                        event.name = "distill.rabbit.retry.failure",
-                        error.code = %retry_error.error_code(),
-                        "RabbitMQ retry publication failed"
-                    );
-                    return Err(DistillError::Persistence(
-                        "retry handoff unavailable".to_string(),
-                    ));
-                }
-                delivery.ack(BasicAckOptions::default()).await?;
-            }
-        }
+        .await
+        .unwrap_or_else(|_| {
+            Err(DistillError::Persistence(
+                "sink operation timed out".to_string(),
+            ))
+        });
+        settle_delivery(&channel, &metrics, delivery, result).await?;
     }
     Ok(())
 }
@@ -1466,7 +1340,7 @@ async fn consume_generation(
             completion = pending.next(), if !pending.is_empty() => {
                 if let Some((delivery, result)) = completion {
                     in_flight.fetch_sub(1, Ordering::AcqRel);
-                    settle_delivery(&channel, delivery, result).await?;
+                    settle_delivery(&channel, &metrics, delivery, result).await?;
                 }
             }
             delivery = consumer.next(), if !draining => {
@@ -1483,6 +1357,7 @@ async fn consume_generation(
                     Ok(_) => {
                         settle_delivery(
                             &channel,
+                            &metrics,
                             delivery,
                             Err(DistillError::InvalidRequest(
                                 "aggregate queue received a non-aggregate event".to_string(),
@@ -1500,7 +1375,7 @@ async fn consume_generation(
                             delivery.exchange.as_str(),
                             delivery.routing_key.as_str(),
                             "invalid_aggregate_input",
-                            &error.to_string(),
+                            error.error_code().as_str(),
                         )
                         .await
                         {
@@ -1531,7 +1406,7 @@ async fn consume_generation(
                         (delivery, result)
                     }),
                     Err(error) => {
-                        settle_delivery(&channel, delivery, Err(error)).await?;
+                        settle_delivery(&channel, &metrics, delivery, Err(error)).await?;
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
@@ -1541,7 +1416,7 @@ async fn consume_generation(
     while let Some(completion) = pending.next().await {
         let (delivery, result) = completion;
         in_flight.fetch_sub(1, Ordering::AcqRel);
-        settle_delivery(&channel, delivery, result).await?;
+        settle_delivery(&channel, &metrics, delivery, result).await?;
     }
     Ok(())
 }
@@ -1663,7 +1538,9 @@ async fn prepare_generation_input(
     routed: RoutedEvent,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<(), DistillError>>, DistillError> {
     if routed.persist {
-        sink.persist_event(&routed.event).await?;
+        tokio::time::timeout(SINK_OPERATION_TIMEOUT, sink.persist_event(&routed.event))
+            .await
+            .map_err(|_| DistillError::Persistence("sink operation timed out".to_string()))??;
         metrics.persisted();
     }
     handle.aggregate_input(routed.event).await
@@ -1707,12 +1584,47 @@ async fn migrate_legacy_aggregate_input(
 
 async fn settle_delivery(
     channel: &Channel,
+    metrics: &Metrics,
     delivery: Delivery,
     result: Result<(), DistillError>,
 ) -> Result<(), DistillError> {
     match result {
         Ok(()) => delivery.ack(BasicAckOptions::default()).await?,
         Err(error) => {
+            if matches!(
+                error,
+                DistillError::ConfigurationConflict
+                    | DistillError::InvalidRequest(_)
+                    | DistillError::SchemaValidation(_)
+            ) {
+                metrics.delivery_failed();
+                let category = if matches!(error, DistillError::ConfigurationConflict) {
+                    "identity_conflict"
+                } else {
+                    "invalid_delivery"
+                };
+                if let Err(error) = dead_letter(
+                    channel,
+                    &delivery.data,
+                    delivery.exchange.as_str(),
+                    delivery.routing_key.as_str(),
+                    category,
+                    error.error_code().as_str(),
+                )
+                .await
+                {
+                    delivery
+                        .nack(BasicNackOptions {
+                            requeue: true,
+                            ..Default::default()
+                        })
+                        .await?;
+                    return Err(error);
+                }
+                metrics.dead_lettered();
+                delivery.ack(BasicAckOptions::default()).await?;
+                return Ok(());
+            }
             warn!(
                 event.name = "distill.rabbit.delivery.failure",
                 error.code = %error.error_code(),
@@ -1720,6 +1632,7 @@ async fn settle_delivery(
             );
             if let Err(retry_error) = retry_delivery(
                 channel,
+                metrics,
                 &delivery.data,
                 delivery.exchange.as_str(),
                 delivery.routing_key.as_str(),
@@ -1803,13 +1716,15 @@ fn sanitized_reason(reason: &str) -> String {
 
 async fn retry_delivery(
     channel: &Channel,
+    metrics: &Metrics,
     data: &[u8],
     exchange: &str,
     routing_key: &str,
 ) -> Result<(), DistillError> {
+    metrics.delivery_failed();
     let mut envelope = parse_envelope(data)?;
     if envelope.retry_count >= MAX_RETRIES {
-        return dead_letter(
+        dead_letter(
             channel,
             data,
             exchange,
@@ -1817,7 +1732,9 @@ async fn retry_delivery(
             "retries_exhausted",
             "delivery failed after maximum retry attempts",
         )
-        .await;
+        .await?;
+        metrics.dead_lettered();
+        return Ok(());
     }
     envelope.retry_count += 1;
     declare_retry_queue(channel, exchange, routing_key, envelope.retry_count).await?;
@@ -1829,7 +1746,9 @@ async fn retry_delivery(
         &retry_routing_key(exchange, routing_key, envelope.retry_count),
         &payload,
     )
-    .await
+    .await?;
+    metrics.retried();
+    Ok(())
 }
 
 async fn declare_retry_queue(

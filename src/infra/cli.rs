@@ -103,6 +103,8 @@ pub enum SinkCommand {
     Create(CreateSink),
     /// List sink definitions without resolving or displaying secrets.
     List(ListSinks),
+    /// Apply versioned database migrations explicitly before production use.
+    Migrate(MigrateSink),
 }
 
 #[derive(Debug, Subcommand)]
@@ -111,6 +113,8 @@ pub enum DlqCommand {
     List(ListDlq),
     /// Replay one selected message or every eligible message after sink recovery.
     Replay(ReplayDlq),
+    /// Export original bytes into a new owner-only file; broker records remain retained.
+    Export(ExportDlq),
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +135,40 @@ pub struct ReplayDlq {
     /// Replay every eligible dead-letter message. Confirm sink recovery first.
     #[arg(long, conflicts_with = "id", required_unless_present = "id")]
     pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportDlq {
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub id: Option<Uuid>,
+    #[arg(long, conflicts_with = "id", required_unless_present = "id")]
+    pub all: bool,
+    /// New JSONL output file. Contains protected original bytes; never written to stdout.
+    #[arg(long)]
+    pub file: PathBuf,
+}
+
+impl ExportDlq {
+    async fn run(self) -> anyhow::Result<()> {
+        let uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required for DLQ commands")?;
+        let client = DeadLetterClient::connect(&uri).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&self.file)
+            .await
+            .context("creating a new protected DLQ export file")?;
+        let count = client.export(&mut file, self.id).await.context(
+            "DLQ export incomplete; partial file retained and broker records remain recoverable",
+        )?;
+        if self.id.is_some() && count == 0 {
+            bail!("selected record was not found; broker records remain retained");
+        }
+        println!("exported: {count}; broker records remain retained");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -164,6 +202,41 @@ pub struct CreateSink {
 }
 
 #[derive(Debug, Args)]
+pub struct MigrateSink {
+    pub sink_id: String,
+    #[arg(long, default_value = "sinks.json")]
+    pub file: PathBuf,
+}
+
+impl MigrateSink {
+    async fn run(self) -> anyhow::Result<()> {
+        let manifest = read_manifest(&self.file)?;
+        let definition = manifest
+            .sinks
+            .iter()
+            .find(|sink| sink.sink_id == self.sink_id)
+            .context("selected sink is not present in the manifest")?;
+        let config = crate::infra::config::resolve_sink(definition)?;
+        if config.driver == "http" {
+            bail!("HTTP receiver migrations are managed by the receiver");
+        }
+        crate::persistence::build_sink(
+            &config,
+            &crate::persistence::SinkAllowlist::default(),
+            true,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "sink migration failed; check migration credentials and target database"
+            )
+        })?;
+        println!("sink schema version 1 applied");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct ListSinks {
     /// Sink manifest to inspect.
     #[arg(long, default_value = "sinks.json")]
@@ -189,6 +262,7 @@ impl Cli {
             Command::Sink { command } => match command {
                 SinkCommand::Create(command) => command.run(),
                 SinkCommand::List(command) => command.run(),
+                SinkCommand::Migrate(command) => command.run().await,
             },
             Command::Secret { command } => match command {
                 SecretCommand::FileWrite(command) => command.run(),
@@ -197,6 +271,7 @@ impl Cli {
             Command::Dlq { command } => match command {
                 DlqCommand::List(command) => command.run().await,
                 DlqCommand::Replay(command) => command.run().await,
+                DlqCommand::Export(command) => command.run().await,
             },
         }
     }

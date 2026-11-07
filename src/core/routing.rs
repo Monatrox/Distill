@@ -59,6 +59,7 @@ mod tests {
 
     fn definition(aggregator: Option<AggregatorSpec>) -> ChannelDefinition {
         ChannelDefinition {
+            version: None,
             channel_id: "app.test".to_string(),
             severity_threshold: SeverityLevel::Error,
             rabbitmq_config: RabbitMqConfig {
@@ -87,6 +88,7 @@ mod tests {
 
     fn event(severity_level: SeverityLevel) -> LogEvent {
         LogEvent {
+            version: None,
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             channel_id: "app.test".to_string(),

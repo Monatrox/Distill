@@ -1,31 +1,44 @@
 # Production Readiness Blockers
 
-This document tracks work required before Distill can make a production-ready v1 release. Priorities assume v1 targets Aspire, the C# SDK, RabbitMQ, PostgreSQL, and custom HTTP/API endpoint sinks.
+This document tracks work required before Distill can make a production-ready v1 release. V1 targets Aspire, the C# SDK, RabbitMQ, and PostgreSQL/MySQL/SQL Server/custom HTTP sinks.
 
 The current session-to-session worktree snapshot, completed work, executed evidence, unresolved risks, and continuation runbook live in `docs/production-readiness-handoff.md`. Read it before resuming implementation.
 
-## Recommended v1 scope
+## Agreed V1 contract (2026-11-07)
 
-Keep the first supported path narrow:
+These decisions supersede conflicting recommendations and acceptance criteria below. The numbered backlog is retained as historical implementation evidence, not authorization to restore discarded scope restrictions.
 
-- PostgreSQL and custom HTTP/API endpoint sinks;
-- one default sink per Distill resource for the initial golden path;
-- one Aspire-managed RabbitMQ resource;
-- finite channels explicitly provisioned by the owning application during startup;
-- `Distill.Client` and `Distill.Extensions.Logging`;
-- published, version-pinned NuGet packages and container image.
+- Distill serves many applications. Deployments can register new sinks and reconcile channel schemas/aggregation settings at runtime without redeploying Distill or disrupting other producers.
+- Starting with no sinks or channels is a valid idle state. No default PostgreSQL or HTTP sink is required. RabbitMQ remains the transport dependency.
+- A single shared credential is sufficient for configuration and ingest. Application ownership, namespacing, and separate scoped credentials are optional. Multiple applications may intentionally contribute to the same aggregate; Distill does not infer ownership from application identity.
+- Developers provide configuration versions. Channel name plus version identifies an immutable definition. Identical reconciliation succeeds without creating another generation; conflicting definitions under the same version fail explicitly. Existing and new application versions coexist and the SDK attaches version identity to events. Ensure remains create-only. No automatic correlation or merging across configuration versions is required.
+- A channel targets one sink; deployments may register multiple sinks. Sink destination changes preserve the original destination of accepted work. No multi-sink fan-out is required.
+- Accepted event identity is stable across retries. Within the documented channel/version and deduplication lifetime, retries, reconnects, crashes, and replay must not apply an aggregate contribution twice. Conflicting content under the same identity is an explicit failure. At-least-once aggregate effects are not an acceptable V1 substitute.
+- Existing rolling aggregation functions are supported across PostgreSQL, MySQL, SQL Server, and HTTP. Distill owns computation and emits cumulative snapshots with stable aggregate identity and monotonically increasing update revision. Sinks atomically accept newer snapshots, treat identical duplicates as success, reject conflicting equal revisions, and prevent stale updates from replacing newer state.
+- Distill may maintain lightweight internal persistent state. SQLite is the selected implementation direction: registered definitions/revisions, deduplication identities, aggregate checkpoints, and recoverable pending outputs. It is not a default log sink or a complete event archive. Configuration can be JSON within SQLite; a JSON file or secret manager alone does not provide the required coordinated transactions.
+- Internal state must survive process/container replacement. SQLite requires suitable persistent storage; WAL on network filesystems is not a validated production deployment. Azure Container Apps persistence compatibility is an explicit release gate, not solved by mounting Azure Files and assuming local-disk semantics.
+- HTTP-only installations require no PostgreSQL. Receivers implement observable contracts, including atomic/idempotent writes where required; storage technology is their choice. Provide clear contracts, a reference receiver, and conformance tests. With Distill-owned recovery state, every receiver need not also host a configuration catalog.
+- Secrets use references where available and protected submission otherwise, never ordinary readback/logs. Credential handling has a documented fast-follow hardening path; do not defer baseline confidentiality or derive admin privileges from an ingest secret.
+- Loaded configurations continue processing during configuration-store outages where safe; new changes fail explicitly. Startup restores required state before consuming accepted backlog. Storage failures must never silently degrade deduplication guarantees.
+- One active Distill instance per dedicated broker virtual host is sufficient for V1, including deployment transitions. Multiple active logger replicas and zero-downtime logger replacement are deferred; overlapping producer versions are required.
+- Automatic revision retirement and producer leases/heartbeats are deferred. Retain old revisions and enforce resource ceilings. Automated or general-purpose removal is deferred; no removal may discard accepted work. Deleting sink data does not authorize deleting pending accepted work or deduplication history.
+- Fix SDK burst draining, log-time timestamps/IDs, overflow reporting, partial rejection/retry selection, bounded shutdown, and HTTP client ownership before release.
+- Keep confirmed single-publication admission, durable retries/DLQ, bounded queues, reconnect supervision, truthful readiness/metrics, safe diagnostics/export, explicit database migrations, and repeatable integration tests.
+- Retention/compression, general poison-record repair, new rolling semantics beyond the existing functions, automatic cross-version correlation, and multi-sink fan-out remain deferred.
+- Release artifacts retain version 0.1.0; private images target ghcr.io/monatrox/distill. NuGet packages remain CI artifacts until publication is explicitly requested. Compose is development-only; the supported Azure path needs executed deployment evidence.
 
-HTTP sink support is mandatory: it is the extension point that lets teams implement persistence against unsupported production systems. Defer additional first-party database drivers, retention, compression, and multi-sink orchestration until their end-to-end behavior is implemented and tested. Remove or mark those capabilities experimental in documentation until then.
+## Implementation order under the agreed contract
 
-## Confirmed v1 decisions
+1. Add transactional SQLite state, secure file handling and exclusive instance ownership; preserve idle startup and shared-key configuration.
+2. Persist runtime sink/channel definitions, versions, generations and lifecycle; restore mappings before consumers start. Add explicit reconciliation/version-bound ingest and preserve old versions.
+3. Atomically coordinate source-event deduplication, aggregate checkpoints and pending outputs. Prove crash recovery and conflicting-ID behavior, including replay.
+4. Implement cumulative rolling snapshots and conditional/idempotent persistence across all four sinks; add HTTP reference receiver and conformance tests.
+5. Fix SDK correctness and add version-aware startup reconciliation and secret/resource propagation through Aspire.
+6. Complete readiness/metrics, bounded capacity/recovery/export, migrations, packaging/image CI and end-to-end deployment tests. Measure supported workload and storage growth; record deduplication lifetime and recovery limits.
 
-- Publish private versioned images to `ghcr.io/monatrox/distill`; GitHub Actions publishes on `v*` tags. Consumers must provide GHCR pull credentials.
-- Use version `0.1.0` for server, image, and all NuGet packages. NuGet packages remain CI build artifacts; do not publish them yet.
-- Cap each RabbitMQ delivery and retry queue at 1 GiB or 1,000,000 messages, whichever comes first. Use `reject-publish`; failed admission must not return `202`.
-- Run PostgreSQL migrations explicitly before production deployment. Permit automatic migration only with an opt-in development setting.
-- Support Azure Container Apps deployment through Aspire publish as production golden path. Compose remains development-only.
+Remaining engineering gates: SQLite storage suitability on the Azure deployment target; exact wire/migration compatibility; deduplication retention and capacity sizing. These do not reopen the product decisions above.
 
-## Current-branch architecture decisions
+## Historical implementation architecture (before agreed V1 changes)
 
 - An accepted ingest is represented by one routed, persistent RabbitMQ message. The route flags and channel generation travel with that message so `PersistAndAggregate` does not require two independently fallible admission publications.
 - Ingestion returns `202` only after a mandatory publish receives an explicit broker acknowledgement. An unroutable or negatively acknowledged publish fails admission.
@@ -36,15 +49,15 @@ HTTP sink support is mandatory: it is the extension point that lets teams implem
 - Malformed broker deliveries are confirmed into the DLQ before the original is acknowledged. Structured failure metadata, envelope versioning, and safe replay of eligible records are implemented; real-broker evidence and a repair path for ineligible records remain required before release.
 - Retry delay queues are quorum queues configured for RabbitMQ at-least-once dead-lettering. Replay is limited to valid exhausted direct-persistence records; poison and aggregate-input records remain retained until a safe transformation/deduplication contract exists.
 
-## Current status
+## Current implementation status (2026-11-07)
 
-**Implemented and locally verified:** blocker 8 (unsupported retention/compression rejected), 17 (three-state aggregation serialization), 22 (explicit fail-fast application provisioning), 24 (typed C# protocol values), and 25 (SDK API-version pinning). Rust formatting is clean and the automatic `CI` workflow enforces it, but that workflow still needs successful execution evidence before blocker 37 can close.
+The active change set implements transactional SQLite recovery state; persistent runtime sink/channel/version registration; source deduplication plus checkpoints/outbox; cumulative rolling snapshots across all four sinks; native sink migrations; a conforming HTTP reference receiver; SDK draining/partial retry/shutdown fixes; Aspire broker/state/key propagation; readiness/metrics; protected DLQ export; package smoke tests; and gated image/artifact CI.
 
-**Partially implemented:** blocker 1 publishes one routed event with mandatory publisher confirmation before `202`; isolated generation queues hold aggregate acknowledgements until confirmed aggregate publication. The current crash/restart script passes locally under rootless Podman 5.8.4 for direct, aggregate-only, and `PersistAndAggregate` routes; CI evidence remains. Blocker 2's current successful-flush and unavailable-broker timeout scenarios also pass locally under Podman but need CI evidence. Blocker 4 now reconnects publishers plus shared and generation consumers, exposes explicit lifecycle state, and uses bounded jittered backoff with shutdown cancellation. Local Podman coverage proves fail-closed admission during outage and direct/aggregate recovery after RabbitMQ restart; in-flight restart and CI coverage remain. Blocker 5 uses quorum TTL retry queues with at-least-once dead-lettering; local real-broker coverage proves a failed HTTP destination enters broker-managed retry, later reaches a recovered receiver, and does not delay an unrelated PostgreSQL destination, while saturation coverage remains. Blocker 6 has local broker evidence for malformed-message DLQ, later-valid delivery, metadata-only listing, poison retention, and confirmed eligible replay; full-DLQ and repair/export coverage remain. Blocker 28 has local assertions for all capped queue classes, visible `reject-publish` admission failure, operator alarm guidance, and repeated generation reclamation; drained retry-queue retirement and sustained-concurrency coverage remain. Blocker 29 has confirmed PostgreSQL replay evidence but deliberately retains poison and aggregate inputs; a safe repair/export workflow remains. Blocker 30 has conservative generation retirement with local repeated-replacement/old-input-flush evidence but lacks concurrent-ingest coverage and remains incomplete. Blockers 7, 9, 11, 12, and 14 have core implementation but lack complete contract/integration coverage.
+Actual local Aspire qualification now covers the user's DistillTesting application with PostgreSQL, HTTP-only and external references, two producer versions, real browser interactions, concurrent ingest, process/broker replacement and coordinated backup/restore. Legacy native schemas upgrade through the CLI without losing sentinel data; full-DLQ recovery and configured SQLite-capacity recovery pass. Startup/shutdown and consumer cleanup bugs found by these tests were fixed.
 
-**Current critical path:** run blocker 1's Docker-backed crash/restart test in CI. Then finish broker recovery/retry/limits/replay and generation retirement (4, 5, 28, 29, 30), and close partial blockers with integration tests. All unlisted blockers remain open.
+See `production-readiness-handoff.md` and `production-readiness-local-evidence.json` for current executed evidence and open release gates. These changes supersede the historical item-level statuses below, especially ephemeral configuration, PostgreSQL-only rolling support, separate mandatory keys, and automatic generation retirement. The historical acceptance criteria must be reconciled against the agreed V1 contract before closing tickets; obsolete requirements are not release gates.
 
-**Verification snapshot (2026-09-05):** `cargo test --all-targets` passes 50 tests; CLI replay-help smoke checks, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and shell validation pass. The complete current handoff script passes under rootless Podman 5.8.4: direct, aggregate-only, and `PersistAndAggregate` crash/restart recovery; successful and unavailable-broker SIGTERM behavior; fail-closed outage admission; direct and aggregate recovery after RabbitMQ restart; failed-destination isolation and broker-managed retry to a recovered HTTP receiver; malformed-message DLQ and later-valid delivery; metadata-only listing and poison retention; confirmed PostgreSQL replay; visible queue-overflow rejection; repeated replacement with old-generation flush/reclamation; and delivery/retry/DLQ/generation queue-argument assertions. The first GitHub-hosted broker attempt supplied no evidence because its exited-container error masked the cause; the revised manual workflow has not yet run. Full-DLQ/saturation, in-flight restart, repair/export, and concurrent-ingest retirement remain outside the current script and still require real-broker evidence.
+## Historical numbered backlog (superseded where decisions conflict)
 
 ## P0 — Correctness and durability
 
@@ -626,7 +639,7 @@ Production-ready v1 should not ship until all items below pass:
 - [ ] Rust and .NET tests, formatting, linting, vulnerability scans, package builds, image build, and end-to-end test pass in CI.
 - [ ] Documentation describes only implemented and tested v1 behavior.
 
-## Implementation order
+## Historical implementation order (superseded above)
 
 Work in this order to avoid implementing behavior that v1 later removes:
 

@@ -49,7 +49,11 @@ pub enum OrderingMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AggregatedLog {
     pub aggregate_id: AggregateId,
+    #[serde(default)]
+    pub update_revision: u64,
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub window_start: DateTime<Utc>,
     pub window_end: DateTime<Utc>,
     pub aggregator_type: AggregationFunction,

@@ -8,8 +8,6 @@ public static class DistillResourceBuilderExtensions
 {
     private const int DefaultHttpPort = 8080;
     private const int DefaultAdminPort = 8081;
-    private const string RabbitMqImage = "rabbitmq:3.13-management";
-    private const int RabbitMqAmqpPort = 5672;
 
     /// Adds a Distill resource that launches a container with its RabbitMQ dependency.
     ///
@@ -31,24 +29,30 @@ public static class DistillResourceBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
-        var resource = new DistillResource(name);
+        var user = builder.AddParameter($"{name}-rabbitmq-user", "distill");
+        var rabbitMq = builder.AddRabbitMQ($"{name}-rabbitmq", userName: user).WithDataVolume();
+        return AddDistill(builder, name, rabbitMq, apiKey);
+    }
 
-        // Create the RabbitMQ container as a managed child resource.
-        var rabbitMq = builder.AddContainer($"{name}-rabbitmq", RabbitMqImage)
-            .WithEndpoint(targetPort: RabbitMqAmqpPort, name: "amqp");
-
-        var amqpEndpoint = rabbitMq.GetEndpoint("amqp");
-        var rabbitMqUri = ReferenceExpression.Create(
-            $"amqp://guest:guest@{amqpEndpoint.Property(EndpointProperty.Host)}:{amqpEndpoint.Property(EndpointProperty.Port)}/%2f");
-
-        var distill = builder.AddResource(resource)
+    /// Uses an existing broker resource, including an externally managed connection.
+    public static IResourceBuilder<DistillResource> AddDistill(
+        this IDistributedApplicationBuilder builder, string name,
+        IResourceBuilder<IResourceWithConnectionString> rabbitMq, string? apiKey = null)
+    {
+        var resource = new DistillResource(name) { ApiKeyLiteral = apiKey };
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            resource.ApiKeyParameter = builder.AddParameter($"{name}-api-key",
+                new GenerateParameterDefault { MinLength = 32, Special = false }, secret: true, persist: true).Resource;
+        }
+        return builder.AddResource(resource)
             .WithImage(DistillDefaults.ImageName, DistillDefaults.ImageTag)
             .WithHttpEndpoint(targetPort: DefaultHttpPort, name: "http")
             .WithEndpoint(targetPort: DefaultAdminPort, scheme: "http", name: "admin", isExternal: false)
-            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri))
+            .WithVolume($"{name}-state", "/var/lib/distill")
+            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMq.Resource.ConnectionStringExpression))
+            .WithHttpHealthCheck("/health", endpointName: "http")
             .WaitFor(rabbitMq);
-
-        return distill;
     }
 
     /// Adds a Distill resource configured for an externally-running Distill instance.
@@ -56,24 +60,54 @@ public static class DistillResourceBuilderExtensions
     /// No containers are launched. The resource sets <c>Distill__Endpoint</c> and
     /// <c>Distill__ApiKey</c> on consuming projects that use <c>.WithReference(distill)</c>.
     /// Configure sinks on externally managed Distill instances through their deployment.
-    public static IResourceBuilder<DistillResource> AddDistill(
+    public static IResourceBuilder<DistillExternalResource> AddDistill(
         this IDistributedApplicationBuilder builder,
         string name,
         Uri endpoint,
-        string? apiKey = null)
+        string? apiKey = null,
+        Uri? adminEndpoint = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(endpoint);
 
-        var resource = new DistillResource(name)
-        {
-            ExplicitEndpoint = endpoint
-        };
-
-        return builder.AddResource(resource)
-            .WithEnvironment(ApplyDefaultEnvironment(resource, apiKey, rabbitMqUri: null));
+        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
+        return builder.AddResource(new DistillExternalResource(name, endpoint, adminEndpoint ?? endpoint, apiKey));
     }
+
+    /// References an existing installation using an Aspire secret parameter.
+    public static IResourceBuilder<DistillExternalResource> AddDistill(
+        this IDistributedApplicationBuilder builder, string name, Uri endpoint,
+        IResourceBuilder<ParameterResource> apiKey, Uri? adminEndpoint = null)
+    {
+        ArgumentNullException.ThrowIfNull(apiKey);
+        return builder.AddResource(new DistillExternalResource(name, endpoint, adminEndpoint ?? endpoint, apiKey.Resource));
+    }
+
+    /// Supplies discovery and shared credentials to a consuming resource.
+    public static IResourceBuilder<T> WithReference<T>(this IResourceBuilder<T> consumer, IResourceBuilder<DistillResource> distill)
+        where T : IResourceWithEnvironment, IResourceWithWaitSupport
+    {
+        return consumer.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[$"ConnectionStrings__{distill.Resource.Name}"] = distill.Resource.ConnectionStringExpression;
+            object key = (object?)distill.Resource.ApiKeyParameter ?? distill.Resource.ApiKeyLiteral
+                ?? throw new InvalidOperationException("Distill credentials are not configured.");
+            context.EnvironmentVariables["Distill__ApiKey"] = key;
+            context.EnvironmentVariables["Distill__AdminApiKey"] = key;
+            context.EnvironmentVariables["Distill__AdminEndpoint"] = new EndpointReference(distill.Resource, "admin");
+        }).WaitFor(distill);
+    }
+
+    /// References a shared installation without launching or waiting for a container.
+    public static IResourceBuilder<T> WithReference<T>(this IResourceBuilder<T> consumer, IResourceBuilder<DistillExternalResource> distill)
+        where T : IResourceWithEnvironment => consumer.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[$"ConnectionStrings__{distill.Resource.Name}"] = distill.Resource.ConnectionStringExpression;
+            context.EnvironmentVariables["Distill__ApiKey"] = distill.Resource.ApiKey;
+            context.EnvironmentVariables["Distill__AdminApiKey"] = distill.Resource.ApiKey;
+            context.EnvironmentVariables["Distill__AdminEndpoint"] = distill.Resource.AdminEndpoint.ToString();
+        });
 
     /// Registers a startup sink from a connection-string resource and marks it as default.
     public static IResourceBuilder<DistillResource> WithSink(
@@ -222,11 +256,11 @@ public static class DistillResourceBuilderExtensions
         {
             var env = context.EnvironmentVariables;
 
-            if (!string.IsNullOrEmpty(apiKey))
-            {
-                env["DISTILL_INGEST_API_KEY"] = apiKey;
-                env["DISTILL_ADMIN_API_KEY"] = $"{apiKey}-admin";
-            }
+            object key = (object?)resource.ApiKeyParameter ?? apiKey
+                ?? throw new InvalidOperationException("Distill credentials are not configured.");
+            env["DISTILL_INGEST_API_KEY"] = key;
+            env["DISTILL_ADMIN_API_KEY"] = key;
+            env["DISTILL_STATE_PATH"] = "/var/lib/distill/state.sqlite3";
 
             env["DISTILL_BIND_ADDRESS"] = $"0.0.0.0:{DefaultHttpPort}";
             env["DISTILL_ADMIN_BIND_ADDRESS"] = $"0.0.0.0:{DefaultAdminPort}";
@@ -290,10 +324,10 @@ public static class DistillResourceBuilderExtensions
 public static class DistillDefaults
 {
     /// Default container image name for the Distill server.
-    public const string ImageName = "distill";
+    public const string ImageName = "ghcr.io/monatrox/distill";
 
     /// Default container image tag for the Distill server.
-    public const string ImageTag = "latest";
+    public const string ImageTag = "0.1.0";
 }
 
 internal sealed record DistillSinkAnnotation(

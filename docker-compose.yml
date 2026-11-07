@@ -2,6 +2,8 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     restart: unless-stopped
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -13,6 +15,8 @@ services:
 
   distill:
     build: .
+    volumes:
+      - distill_state:/var/lib/distill
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -43,5 +47,7 @@ services:
       - caddy_config:/config
 
 volumes:
+  rabbitmq_data:
+  distill_state:
   caddy_data:
   caddy_config:

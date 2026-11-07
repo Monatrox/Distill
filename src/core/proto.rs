@@ -32,6 +32,8 @@ pub struct ProtoLogEvent {
     pub payload: Vec<u8>,
     #[prost(map = "string, string", tag = "6")]
     pub metadata: HashMap<String, String>,
+    #[prost(string, optional, tag = "7")]
+    pub version: Option<String>,
 }
 
 impl TryFrom<ProtoLogEvent> for LogEvent {
@@ -60,6 +62,7 @@ impl TryFrom<ProtoLogEvent> for LogEvent {
                 json!({"raw_payload_base64": base64::engine::general_purpose::STANDARD.encode(&value.payload)})
             });
         Ok(LogEvent {
+            version: value.version,
             event_id,
             timestamp,
             channel_id: value.channel_id,

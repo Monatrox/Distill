@@ -12,6 +12,7 @@ use utoipa::ToSchema;
 #[derive(Debug, ToSchema)]
 pub(super) struct CreateChannelRequest {
     pub(super) name: String,
+    pub(super) version: Option<String>,
     pub(super) preset: ChannelPreset,
     pub(super) sink_id: Option<String>,
     pub(super) severity_threshold: Option<SeverityLevel>,
@@ -37,6 +38,8 @@ pub(super) struct CreateChannelRequest {
 pub(super) struct CreateChannelRequestWire {
     #[serde(alias = "channel_id")]
     pub(super) name: String,
+    #[serde(default)]
+    pub(super) version: Option<String>,
     #[serde(default)]
     pub(super) preset: ChannelPreset,
     #[serde(default)]
@@ -82,6 +85,7 @@ impl<'de> Deserialize<'de> for CreateChannelRequest {
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
             name: wire.name,
+            version: wire.version,
             preset: wire.preset,
             sink_id: wire.sink_id,
             severity_threshold: wire.severity_threshold,
@@ -147,6 +151,7 @@ impl CreateChannelRequest {
             routing_key_prefix: format!("{}.", self.name),
         });
         Ok(ChannelDefinition {
+            version: self.version.clone(),
             channel_id: self.name.clone(),
             severity_threshold: self.severity_threshold.unwrap_or(preset.severity_threshold),
             rabbitmq_config,
@@ -277,6 +282,8 @@ impl Default for PresetDefaults {
 #[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct SimpleEventRequest {
     #[serde(default)]
+    pub(super) version: Option<String>,
+    #[serde(default)]
     pub(super) event_id: Option<Uuid>,
     #[serde(default)]
     pub(super) timestamp: Option<chrono::DateTime<Utc>>,
@@ -309,6 +316,7 @@ impl SimpleEventRequest {
             payload.insert(key, value);
         }
         LogEvent {
+            version: self.version,
             event_id: self.event_id.unwrap_or_else(Uuid::new_v4),
             timestamp: self.timestamp.unwrap_or_else(Utc::now),
             channel_id,
@@ -349,6 +357,7 @@ pub(super) struct IngestItemError {
 #[derive(Debug, Serialize, ToSchema)]
 pub(super) struct ChannelConfigResponse {
     pub(super) channel_id: String,
+    pub(super) version: Option<String>,
     pub(super) active: bool,
     pub(super) lifecycle: ChannelLifecycle,
     pub(super) effective: PublicChannelConfig,
@@ -378,6 +387,7 @@ impl ChannelConfigResponse {
     pub(super) fn from_record(record: &ChannelRecord) -> Self {
         Self {
             channel_id: record.definition.channel_id.clone(),
+            version: record.definition.version.clone(),
             active: record.lifecycle == ChannelLifecycle::Active,
             lifecycle: record.lifecycle,
             effective: PublicChannelConfig::from_definition(&record.definition),

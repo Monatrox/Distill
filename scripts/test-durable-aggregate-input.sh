@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for required_command in base64 curl; do
+for required_command in base64 curl python3; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "required command is unavailable: $required_command" >&2
         exit 1
@@ -41,6 +41,8 @@ sixth="$name-sixth"
 seventh="$name-seventh"
 image="$name-image"
 config="$(mktemp)"
+state_dir="$(mktemp -d)"
+fixture_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 artifact_dir="${DISTILL_TEST_ARTIFACT_DIR:-}"
 containers=("$first" "$second" "$third" "$fourth" "$fifth" "$sixth" "$seventh" "$rabbit" "$postgres" "$receiver")
 
@@ -89,6 +91,7 @@ cleanup() {
     "$engine" network rm "$network" >/dev/null 2>&1 || true
     "$engine" image rm "$image" >/dev/null 2>&1 || true
     rm -f "$config"
+    rm -rf "$state_dir"
     return "$exit_code"
 }
 trap cleanup EXIT
@@ -118,13 +121,14 @@ start_distill() {
         --publish 127.0.0.1::8080 \
         --publish 127.0.0.1::8081 \
         --mount "type=bind,src=$config,dst=/config/channels.json,readonly" \
+        --mount "type=bind,src=$state_dir,dst=/var/lib/distill" \
         --env RABBITMQ_URI='amqp://guest:guest@rabbit:5672/%2f' \
         --env DISTILL_INGEST_API_KEY=ingest-key \
         --env DISTILL_ADMIN_API_KEY=admin-key \
         --env DISTILL_BIND_ADDRESS=0.0.0.0:8080 \
         --env DISTILL_ADMIN_BIND_ADDRESS=0.0.0.0:8081 \
         --env DISTILL_ALLOW_ADMIN_NETWORK=true \
-        --env DISTILL_CONFIG_PATH=/config/channels.json \
+        --env DISTILL_AUTO_MIGRATE=true \
         --env DISTILL_SINK_ALLOWLIST=unhealthy:5678 \
         --env DISTILL_SHUTDOWN_TIMEOUT_SECONDS="$shutdown_timeout" \
         "$image" >/dev/null
@@ -135,11 +139,13 @@ post_event() {
     local channel_id="$2"
     local severity="$3"
     local event_id="$4"
+    local version_json=null
+    if test -n "${5:-}"; then version_json="\"$5\""; fi
     local status
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
         --header 'Content-Type: application/json' \
         --header 'X-API-Key: ingest-key' \
-        --data "[{\"event_id\":\"$event_id\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"channel_id\":\"$channel_id\",\"severity_level\":\"$severity\",\"payload\":{}}]" \
+        --data "[{\"event_id\":\"$event_id\",\"timestamp\":\"${fixture_timestamp}\",\"channel_id\":\"$channel_id\",\"version\":$version_json,\"severity_level\":\"$severity\",\"payload\":{}}]" \
         "http://127.0.0.1:$port/ingest")"
     test "$status" = 202
 }
@@ -152,7 +158,7 @@ post_event_expect_failure() {
     status="$(curl --silent --max-time 35 --output /dev/null --write-out '%{http_code}' \
         --header 'Content-Type: application/json' \
         --header 'X-API-Key: ingest-key' \
-        --data "[{\"event_id\":\"$event_id\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"channel_id\":\"$channel_id\",\"severity_level\":\"info\",\"payload\":{}}]" \
+        --data "[{\"event_id\":\"$event_id\",\"timestamp\":\"${fixture_timestamp}\",\"channel_id\":\"$channel_id\",\"severity_level\":\"info\",\"payload\":{}}]" \
         "http://127.0.0.1:$port/ingest" || true)"
     test "$status" != 202
 }
@@ -163,7 +169,7 @@ post_event_eventually() {
     local severity="$3"
     local event_id="$4"
     for _ in $(seq 1 60); do
-        if post_event "$port" "$channel_id" "$severity" "$event_id"; then
+        if post_event "$port" "$channel_id" "$severity" "$event_id" "${5:-}"; then
             return
         fi
         sleep 1
@@ -243,6 +249,8 @@ wait_for_dlq_count() {
 
 run_dlq() {
     "$engine" run --rm --network "$network" \
+        "${runtime_user_args[@]}" \
+        --mount "type=bind,src=$state_dir,dst=/protected-export" \
         --env RABBITMQ_URI='amqp://guest:guest@rabbit:5672/%2f' \
         "$image" dlq "$@"
 }
@@ -255,25 +263,21 @@ replace_aggregate_channel() {
         --request PUT \
         --header 'Content-Type: application/json' \
         --header 'X-API-Key: admin-key' \
-        --data "{\"channel_id\":\"handoff.aggregate\",\"severity_threshold\":\"error\",\"rabbitmq_config\":{\"connection_string\":\"amqp://guest:guest@rabbit:5672/%2f\",\"exchange_name\":\"distill.handoff.aggregate\",\"routing_key_prefix\":\"handoff.\"},\"sink_config\":{\"driver\":\"postgres\",\"connection_string\":\"postgres://distill:password@postgres:5432/distill\"},\"aggregator\":{\"function\":\"count\",\"granularity\":\"per_n_events\",\"parameter\":$parameter},\"buffer_bytes\":1024,\"ttl_seconds\":3600,\"mailbox_capacity\":8}" \
+        --data "{\"channel_id\":\"handoff.aggregate\",\"version\":\"revision-$parameter\",\"severity_threshold\":\"error\",\"rabbitmq_config\":{\"connection_string\":\"amqp://guest:guest@rabbit:5672/%2f\",\"exchange_name\":\"distill.handoff.aggregate\",\"routing_key_prefix\":\"handoff.\"},\"sink_config\":{\"driver\":\"postgres\",\"connection_string\":\"postgres://distill:password@postgres:5432/distill\"},\"aggregator\":{\"function\":\"count\",\"granularity\":\"per_n_events\",\"parameter\":$parameter},\"buffer_bytes\":1024,\"ttl_seconds\":3600,\"mailbox_capacity\":8}" \
         "http://127.0.0.1:$admin_port/channels/handoff.aggregate")"
     test "$status" = 204
 }
 
-wait_for_single_generation_queue() {
-    local retired_queue="$1"
+assert_generation_queues_retained() {
+    local expected="$1"
     local queues
-    for _ in $(seq 1 60); do
-        queues="$(container_exec "$rabbit" rabbitmqctl list_queues -q name)"
-        if ! grep -Fxq "$retired_queue" <<<"$queues" \
-            && test "$(grep -Fc 'distill.aggregate.handoff.aggregate.' <<<"$queues")" = 1; then
-            return
-        fi
-        sleep 1
-    done
-    echo 'replaced aggregate generation was not retired' >&2
-    echo "$queues" >&2
-    return 1
+    queues="$(container_exec "$rabbit" rabbitmqctl list_queues -q name)"
+    test "$(grep -Fc 'distill.aggregate.handoff.aggregate.' <<<"$queues")" = "$expected"
+}
+
+flush_version() {
+    local version="${1:-}"
+    curl --silent --fail --request POST --header 'X-API-Key: admin-key'         "http://127.0.0.1:$sixth_admin_port/channels/handoff.aggregate/flush${version:+?version=$version}" >/dev/null
 }
 
 wait_for_sql() {
@@ -294,16 +298,22 @@ wait_for_sql() {
 
 wait_for_unacknowledged_aggregate() {
     local channel_id="$1"
-    local queues
     for _ in $(seq 1 60); do
-        queues="$(container_exec "$rabbit" rabbitmqctl list_queues -q name messages messages_unacknowledged)"
-        if awk -v prefix="distill.aggregate.$channel_id." '$1 ~ "^" prefix && $2 == 1 && $3 == 1 { found = 1 } END { exit !found }' <<<"$queues"; then
+        if python3 - "$state_dir/state.sqlite3" "$channel_id" <<'PYTHON'
+import sqlite3, sys
+try:
+    db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    row = db.execute("SELECT COUNT(*) FROM aggregate_checkpoints c JOIN channel_generations g USING(generation) WHERE g.channel_id = ? AND json_extract(c.checkpoint, '$.first_timestamp') IS NOT NULL", (sys.argv[2],)).fetchone()
+    sys.exit(0 if row[0] else 1)
+except sqlite3.Error:
+    sys.exit(1)
+PYTHON
+        then
             return
         fi
         sleep 1
     done
-    echo "$queues" >&2
-    echo "aggregate input for $channel_id was not buffered before shutdown" >&2
+    echo "aggregate input for $channel_id was not durably checkpointed before shutdown" >&2
     return 1
 }
 
@@ -417,6 +427,35 @@ replay_dlq_id=10000000-0000-0000-0000-000000000002
 start_distill "$first"
 first_port="$(port_for "$first")"
 wait_for_http "$first_port" "$first"
+first_admin_port="$(port_for "$first" 8081)"
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$first_port/ready")" = 503
+sink_status="$(curl --silent --output "$state_dir/sink-response.json" --write-out '%{http_code}' \
+    --header 'X-API-Key: admin-key' --header 'Content-Type: application/json' \
+    --data '{"name":"contract-receiver","version":"1","config":{"driver":"http","connection_string":"http://unhealthy:5678"}}' \
+    "http://127.0.0.1:$first_admin_port/sinks")"
+test "$sink_status" = 201
+grep -Fq 'contract-receiver@1' "$state_dir/sink-response.json"
+! grep -Fq 'connection_string' "$state_dir/sink-response.json"
+named_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --header 'X-API-Key: admin-key' --header 'Content-Type: application/json' \
+    --data '{"name":"handoff.named","version":"1","sink_id":"contract-receiver@1"}' \
+    "http://127.0.0.1:$first_admin_port/channels")"
+test "$named_status" = 201
+python3 - "$config" "$state_dir" <<'PYTHON'
+import json, os, sys
+for definition in json.load(open(sys.argv[1]))['channels']:
+    path = os.path.join(sys.argv[2], definition['channel_id'] + '.json')
+    with open(path, 'w') as stream:
+        json.dump(definition, stream)
+    os.chmod(path, 0o600)
+PYTHON
+for definition in "$state_dir"/handoff.*.json; do
+    channel_id="$(basename "$definition" .json)"
+    status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request PUT \
+        --header 'X-API-Key: admin-key' --header 'Content-Type: application/json' \
+        --data-binary "@$definition" "http://127.0.0.1:$first_admin_port/channels/$channel_id")"
+    test "$status" = 204
+done
 post_event "$first_port" handoff.aggregate info "$aggregate_first"
 "$engine" kill "$first" >/dev/null
 
@@ -472,14 +511,46 @@ wait_for_sql 1 "SELECT COUNT(*) FROM distill_events WHERE event_id = '$poison_fo
 dlq_list="$(run_dlq list --limit 10)"
 grep -Fq 'invalid_envelope' <<<"$dlq_list"
 ! grep -Fq 'not-json' <<<"$dlq_list"
-actual_poison_id="$(awk '$2 == "invalid_envelope" { print $1 }' <<<"$dlq_list")"
+actual_poison_id="$(awk '$3 == "invalid_envelope" { print $1 }' <<<"$dlq_list")"
+run_dlq export --id "$actual_poison_id" --file /protected-export/dlq.jsonl >/dev/null
+wait_for_dlq_count 1
+python3 - "$state_dir/dlq.jsonl" <<'PYTHON'
+import base64, json, os, stat, sys
+path = sys.argv[1]
+assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+record = json.loads(open(path).read())
+wrapper = json.loads(base64.b64decode(record['data_base64']))
+assert base64.b64decode(wrapper['original_data_base64']) == b'not-json'
+PYTHON
 if run_dlq replay --id "$actual_poison_id" >/dev/null 2>&1; then
     echo 'poison DLQ record was replayed unexpectedly' >&2
     exit 1
 fi
-original_payload="{\"version\":1,\"payload\":{\"event_id\":\"$replay_event\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"channel_id\":\"handoff.direct\",\"severity_level\":\"info\",\"payload\":{},\"metadata\":{}},\"retry_count\":10}"
+# A one-record effective policy fills the real DLQ without creating a million records.
+container_exec "$rabbit" rabbitmqctl set_policy --apply-to queues distill.contract.dlq '^distill[.]dead-letter[.]queue$' '{"max-length":1,"overflow":"reject-publish"}' >/dev/null
+sleep 1
+container_exec "$rabbit" rabbitmqadmin publish exchange=distill.handoff.direct routing_key=handoff.event payload='{"version":999,"payload":{}}' >/dev/null
+post_event "$sixth_port" handoff.direct info 00000000-0000-0000-0000-000000000024
+retained=false
+for _ in $(seq 1 30); do
+    queued="$(container_exec "$rabbit" rabbitmqctl list_queues -q name messages)"
+    if awk '$1 == "distill.persistence" && $2 > 0 { found = 1 } END { exit !found }' <<<"$queued"; then
+        retained=true
+        break
+    fi
+    sleep 1
+done
+test "$retained" = true
+wait_for_dlq_count 1
+# The first synthetic poison record was already exported and verified above.
+# Remove only that fixture record to restore capacity; no application record is removed.
+container_exec "$rabbit" rabbitmqadmin get queue=distill.dead-letter.queue count=1 ackmode=ack_requeue_false >/dev/null
+wait_for_dlq_count 1
+wait_for_sql 1 "SELECT COUNT(*) FROM distill_events WHERE event_id = '00000000-0000-0000-0000-000000000024'" 'delivery recovery after DLQ capacity returns'
+container_exec "$rabbit" rabbitmqctl clear_policy distill.contract.dlq >/dev/null
+original_payload="{\"version\":1,\"payload\":{\"event_id\":\"$replay_event\",\"timestamp\":\"${fixture_timestamp}\",\"channel_id\":\"handoff.direct\",\"severity_level\":\"info\",\"payload\":{},\"metadata\":{}},\"retry_count\":10}"
 original_base64="$(printf '%s' "$original_payload" | base64 -w0)"
-replay_wrapper="{\"metadata\":{\"id\":\"$replay_dlq_id\",\"envelope_version\":1,\"failure_category\":\"retries_exhausted\",\"failure_reason\":\"delivery failed after maximum retry attempts\",\"retry_count\":10,\"original_message_id\":\"$replay_event\",\"original_exchange\":\"distill.handoff.direct\",\"original_routing_key\":\"handoff.event\",\"failed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"},\"original_data_base64\":\"$original_base64\"}"
+replay_wrapper="{\"metadata\":{\"id\":\"$replay_dlq_id\",\"envelope_version\":1,\"failure_category\":\"retries_exhausted\",\"failure_reason\":\"delivery failed after maximum retry attempts\",\"retry_count\":10,\"original_message_id\":\"$replay_event\",\"original_exchange\":\"distill.handoff.direct\",\"original_routing_key\":\"handoff.event\",\"failed_at\":\"${fixture_timestamp}\"},\"original_data_base64\":\"$original_base64\"}"
 container_exec "$rabbit" rabbitmqadmin publish exchange=distill.dead-letter routing_key=handoff.event payload="$replay_wrapper" >/dev/null
 wait_for_dlq_count 2
 run_dlq replay --id "$replay_dlq_id" >/dev/null
@@ -491,17 +562,37 @@ container_exec "$rabbit" rabbitmqadmin declare binding source=distill.handoff.di
 post_event_expect_failure "$sixth_port" handoff.direct "$overflow_event"
 container_exec "$rabbit" rabbitmqadmin delete queue name=distill.overflow.probe >/dev/null
 aggregate_total="$(container_exec "$postgres" psql --username distill --dbname distill --tuples-only --no-align --command "SELECT COALESCE(SUM(event_count), 0) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate'")"
-retired_queue="$(container_exec "$rabbit" rabbitmqctl list_queues -q name | grep -m 1 -F 'distill.aggregate.handoff.aggregate.')"
 post_event "$sixth_port" handoff.aggregate info "$retirement_first"
 replace_aggregate_channel "$sixth_admin_port" 3
-wait_for_sql "$((aggregate_total + 1))" "SELECT COALESCE(SUM(event_count), 0) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate'" 'first replacement flush total'
-wait_for_single_generation_queue "$retired_queue"
+flush_version
+wait_for_sql "$((aggregate_total + 1))" "SELECT COALESCE(SUM(event_count), 0) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate'" 'old-version flush after registration'
+assert_generation_queues_retained 2
 aggregate_total="$((aggregate_total + 1))"
-retired_queue="$(container_exec "$rabbit" rabbitmqctl list_queues -q name | grep -m 1 -F 'distill.aggregate.handoff.aggregate.')"
-post_event "$sixth_port" handoff.aggregate info "$retirement_second"
+post_event "$sixth_port" handoff.aggregate info "$retirement_second" revision-3
 replace_aggregate_channel "$sixth_admin_port" 4
-wait_for_sql "$((aggregate_total + 1))" "SELECT COALESCE(SUM(event_count), 0) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate'" 'second replacement flush total'
-wait_for_single_generation_queue "$retired_queue"
+flush_version revision-3
+wait_for_sql "$((aggregate_total + 1))" "SELECT COALESCE(SUM(event_count), 0) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate'" 'overlapping-version flush total'
+assert_generation_queues_retained 3
+# An explicit database lock makes both accepted paths observably in-flight.
+# The 60-second statement timeout is a bounded failsafe; the test releases the lock explicitly.
+container_exec "$postgres" env PGAPPNAME=distill-contract-lock psql --username distill --dbname distill \
+    --command "BEGIN; SET LOCAL statement_timeout = '60s'; LOCK TABLE distill_events IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(60);" \
+    >"$state_dir/database-lock.log" 2>&1 &
+lock_job=$!
+wait_for_sql 1 "SELECT COUNT(*) FROM pg_locks WHERE relation = 'distill_events'::regclass AND mode = 'AccessExclusiveLock' AND granted" 'database lock readiness'
+post_event "$sixth_port" handoff.direct info 00000000-0000-0000-0000-000000000021
+post_event "$sixth_port" handoff.persist-and-aggregate error 00000000-0000-0000-0000-000000000022
+post_event "$sixth_port" handoff.persist-and-aggregate error 00000000-0000-0000-0000-000000000023
+inflight=false
+for _ in $(seq 1 30); do
+    queues="$(container_exec "$rabbit" rabbitmqctl list_queues -q name messages_unacknowledged)"
+    if awk '$1 == "distill.persistence" && $2 > 0 { direct = 1 } index($1, "distill.aggregate.handoff.persist-and-aggregate.") == 1 && $2 > 0 { aggregate = 1 } END { exit !(direct && aggregate) }' <<<"$queues"; then
+        inflight=true
+        break
+    fi
+    sleep 1
+done
+test "$inflight" = true
 "$engine" stop --time 10 "$rabbit" >/dev/null
 post_event_expect_failure "$sixth_port" handoff.direct "$broker_unavailable_event"
 "$engine" start "$rabbit" >/dev/null
@@ -512,18 +603,30 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 container_exec "$rabbit" rabbitmq-diagnostics -q ping >/dev/null
+container_exec "$postgres" psql --username distill --dbname distill --command "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'distill-contract-lock'" >/dev/null
+wait "$lock_job" || true
+wait_for_sql 3 "SELECT COUNT(*) FROM distill_events WHERE event_id IN ('00000000-0000-0000-0000-000000000021','00000000-0000-0000-0000-000000000022','00000000-0000-0000-0000-000000000023')" 'in-flight direct writes recovered exactly once'
+wait_for_sql 4 "SELECT SUM(event_count) FROM distill_aggregates WHERE channel_id = 'handoff.persist-and-aggregate'" 'in-flight aggregate inputs recovered exactly once'
 post_event_eventually "$sixth_port" handoff.direct info "$broker_recovered_direct"
-post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_first"
-post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_second"
-post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_third"
-post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_fourth"
+post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_first" revision-4
+post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_second" revision-4
+post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_third" revision-4
+post_event_eventually "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_fourth" revision-4
 wait_for_sql 1 "SELECT COUNT(*) FROM distill_events WHERE event_id = '$broker_recovered_direct'" 'broker-recovered direct event count'
 wait_for_sql 4 "SELECT event_count FROM distill_aggregates WHERE channel_id = 'handoff.aggregate' AND aggregate_id <> '00000000-0000-0000-0000-000000000000' ORDER BY window_end DESC LIMIT 1" 'broker-recovered aggregate event count'
+post_event "$sixth_port" handoff.aggregate info "$broker_recovered_aggregate_first" revision-4
+flush_version revision-4
+wait_for_sql 4 "SELECT SUM(event_count) FROM distill_aggregates WHERE channel_id = 'handoff.aggregate' AND configuration_version = 'revision-4'" 'duplicate input did not change the aggregate'
 "$engine" stop --time 10 "$sixth" >/dev/null
 
 start_distill "$seventh" 1
 seventh_port="$(port_for "$seventh")"
 wait_for_http "$seventh_port" "$seventh"
+seventh_admin_port="$(port_for "$seventh" 8081)"
+for version in revision-3 revision-4; do
+    curl --silent --fail --header 'X-API-Key: admin-key' "http://127.0.0.1:$seventh_admin_port/channels/handoff.aggregate/config?version=$version" >/dev/null
+done
+curl --silent --fail --header 'X-API-Key: admin-key' "http://127.0.0.1:$seventh_admin_port/channels/handoff.named/config?version=1" >/dev/null
 post_event "$seventh_port" handoff.shutdown-timeout info "$shutdown_timeout_event"
 wait_for_unacknowledged_aggregate handoff.shutdown-timeout
 "$engine" stop --time 10 "$rabbit" >/dev/null
@@ -533,4 +636,4 @@ timeout_log="$("$engine" logs "$seventh" 2>&1)"
 grep -Fq 'flushing channel buffers' <<<"$timeout_log"
 ! grep -Eq 'guest:guest|ingest-key|admin-key|password|00000000-0000-0000-0000-000000000007' <<<"$timeout_log"
 
-echo 'durable handoff, retry isolation, DLQ replay, overflow rejection, generation retirement, broker restart, queue limits, and SIGTERM behavior verified'
+echo 'durable handoff, retry isolation, DLQ saturation/recovery, unsupported envelopes, replay/export, overflow rejection, persistent configuration, overlapping versions, duplicate protection, in-flight broker restart, queue limits, and SIGTERM behavior verified'

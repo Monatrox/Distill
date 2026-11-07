@@ -4,7 +4,7 @@
 
 It is intentionally a separate package from `Distill.Client`: applications that want direct control can use the base client without taking a logging-provider dependency.
 
-Provision the Distill sink before starting the application. The provider only sends events; it does not receive, store, or manage PostgreSQL/HTTP sink credentials. Modular applications may explicitly ensure their finite channel set in `Program.cs` before serving traffic.
+Register a destination and reconcile versioned channels during application startup. The provider only sends events; the explicit client configuration APIs can register destinations, while the logger transport itself does not manage sink credentials. Modular applications may explicitly ensure their finite channel set in `Program.cs` before serving traffic.
 
 ## Registration
 
@@ -20,6 +20,7 @@ var distill = DistillClient.Create(
 builder.Logging.AddDistill(distill, options =>
 {
     options.DefaultChannel = "application.production";
+    options.DefaultVersion = "1";
     options.MinimumLevel = LogLevel.Information;
     options.BatchSize = 100;
     options.FlushInterval = TimeSpan.FromSeconds(1);
@@ -32,16 +33,18 @@ Before `app.Run()`, ensure application-owned channels with an admin-enabled `Dis
 ```csharp
 var app = builder.Build();
 
-await distill.EnsureChannelAsync(new CreateChannelRequest
+await distill.ReconcileChannelAsync(new CreateChannelRequest
 {
     Name = "application.production",
+    Version = "1",
+    SinkId = "application-receiver@1",
     Preset = ChannelPreset.RawEvents
 });
 
 app.Run();
 ```
 
-`EnsureChannelAsync` creates missing channels and leaves existing definitions unchanged. Let provisioning failures stop startup. Keep sink credentials in Distill deployment configuration, not application channel requests.
+`ReconcileChannelAsync` binds the client to the declared immutable version. Register the named sink first through `RegisterSinkAsync` (see the SDK README). Let reconciliation conflicts stop startup; use a new version for changed configuration. `EnsureChannelAsync` remains create-only.
 
 Existing logging code continues to work:
 
@@ -73,4 +76,6 @@ Set `DeliveryFailure` to observe batches that exhaust their retries:
 options.DeliveryFailure = context => Console.Error.WriteLine(context.Exception);
 ```
 
-The provider flushes accepted records during disposal. Applications should preserve stable event IDs when implementing their own retry behavior through the base client.
+The provider drains bursts continuously, snapshots timestamp/ID/payload at enqueue time, and retries only transiently rejected records from a partial response. `DeliveryDropped` and dropped/failed counters make overflow and terminal failures observable. Records accepted by the in-process queue are not yet durable server admissions.
+
+Disposal interrupts any batching delay and drains within `ShutdownTimeout` (30 seconds by default), then reports remaining failures rather than hanging indefinitely. Aspire integration drains through a hosted shutdown service before HTTP transports are disposed. Applications should preserve stable event IDs when implementing their own retry behavior through the base client.

@@ -16,9 +16,13 @@ use super::{
     channels::{
         __path_archive_channel, __path_clone_channel, __path_flush_channel, __path_get_channel,
         __path_pause_channel, __path_post_channel, __path_post_schema, __path_put_channel,
-        __path_resume_channel, __path_test_event, __path_validate_channel,
+        __path_register_sink, __path_resume_channel, __path_test_event, __path_validate_channel,
+        RegisterSinkRequest, RegisterSinkResponse,
     },
-    ingest::{__path_health, __path_ingest, __path_metrics, __path_otlp_logs, __path_post_event},
+    ingest::{
+        __path_health, __path_ingest, __path_metrics, __path_otlp_logs, __path_post_event,
+        __path_ready,
+    },
 };
 use crate::{
     core::errors::{ErrorCode, ErrorEnvelope},
@@ -38,11 +42,13 @@ use utoipa::OpenApi;
     ),
     paths(
         health,
+        ready,
         metrics,
         ingest,
         otlp_logs,
         post_event,
         post_channel,
+        register_sink,
         validate_channel,
         put_channel,
         test_event,
@@ -61,6 +67,8 @@ use utoipa::OpenApi;
         IngestItemError,
         SimpleEventRequest,
         CreateChannelRequest,
+        RegisterSinkRequest,
+        RegisterSinkResponse,
         ChannelPreset,
         ChannelConfigResponse,
         PublicChannelConfig,
@@ -103,6 +111,8 @@ mod tests {
         let document = ApiDocumentation::openapi();
         for path in [
             "/health",
+            "/ready",
+            "/sinks",
             "/metrics",
             "/ingest",
             "/v1/logs",

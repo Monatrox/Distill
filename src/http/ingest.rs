@@ -7,17 +7,15 @@ use super::{
     StatusCode, Uuid, Value, otlp_events,
 };
 
-/// Reports whether the service is ready to accept requests.
-#[utoipa::path(
-    get,
-    path = "/health",
-    tag = "operations",
-    responses(
-        (status = 200, description = "An active sink-backed channel can accept events"),
-        (status = 503, description = "No active sink-backed channel is configured")
-    )
-)]
-pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
+/// Reports process liveness, including a valid idle instance.
+#[utoipa::path(get, path = "/health", tag = "operations", responses((status = 200, description = "HTTP process is alive")))]
+pub(super) async fn health() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// Reports restored configuration and supervised broker readiness.
+#[utoipa::path(get, path = "/ready", tag = "operations", responses((status = 200), (status = 503)))]
+pub(super) async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     if state.registry.is_ready().await {
         StatusCode::OK
     } else {
@@ -44,7 +42,12 @@ pub(super) async fn metrics(
 ) -> Result<impl IntoResponse, DistillError> {
     Ok((
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.prometheus(),
+        format!(
+            "{}# TYPE distill_consumers_healthy gauge\ndistill_consumers_healthy {}\n# TYPE distill_aggregate_inputs_in_flight gauge\ndistill_aggregate_inputs_in_flight {}\n",
+            state.metrics.prometheus(),
+            u8::from(state.registry.consumers_healthy().await),
+            state.registry.aggregate_in_flight().await
+        ),
     ))
 }
 
@@ -156,7 +159,12 @@ pub(super) async fn post_event(
 ) -> Result<(StatusCode, Json<IngestResponse>), DistillError> {
     let event = request.into_event(channel_id);
     let response = submit_events(&state, vec![event]).await?;
-    Ok((StatusCode::ACCEPTED, Json(response)))
+    let status = if response.rejected == 0 {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    Ok((status, Json(response)))
 }
 
 pub(super) async fn submit_events(

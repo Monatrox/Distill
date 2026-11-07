@@ -40,6 +40,9 @@ pub struct Settings {
     pub ingest_api_key: String,
     pub admin_api_key: String,
     pub config_path: Option<PathBuf>,
+    pub state_path: PathBuf,
+    pub state_max_bytes: u64,
+    pub auto_migrate: bool,
     pub sinks_config_path: Option<PathBuf>,
     pub(crate) environment_sinks: EnvironmentSinks,
     pub(crate) environment_default_sink_id: Option<String>,
@@ -47,6 +50,7 @@ pub struct Settings {
     pub exchange_name_prefix: String,
     pub api_default_version: String,
     pub max_channels: usize,
+    pub max_sinks: usize,
     pub sink_allowlist: SinkAllowlist,
     pub shutdown_timeout: Duration,
 }
@@ -60,6 +64,9 @@ impl fmt::Debug for Settings {
             .field("ingest_api_key", &"[REDACTED]")
             .field("admin_api_key", &"[REDACTED]")
             .field("config_path", &self.config_path)
+            .field("state_path", &self.state_path)
+            .field("state_max_bytes", &self.state_max_bytes)
+            .field("auto_migrate", &self.auto_migrate)
             .field("sinks_config_path", &self.sinks_config_path)
             .field("environment_sink_count", &self.environment_sinks.len())
             .field(
@@ -76,6 +83,7 @@ impl fmt::Debug for Settings {
             .field("exchange_name_prefix", &self.exchange_name_prefix)
             .field("api_default_version", &self.api_default_version)
             .field("max_channels", &self.max_channels)
+            .field("max_sinks", &self.max_sinks)
             .field("sink_allowlist", &self.sink_allowlist)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
@@ -112,7 +120,7 @@ impl Settings {
         let ingest_api_key =
             env::var("DISTILL_INGEST_API_KEY").context("DISTILL_INGEST_API_KEY is required")?;
         let admin_api_key =
-            env::var("DISTILL_ADMIN_API_KEY").context("DISTILL_ADMIN_API_KEY is required")?;
+            env::var("DISTILL_ADMIN_API_KEY").unwrap_or_else(|_| ingest_api_key.clone());
         validate_api_keys(&ingest_api_key, &admin_api_key)?;
         let default_sink_connection_string =
             env::var("DISTILL_DEFAULT_SINK_CONNECTION_STRING").ok();
@@ -125,6 +133,10 @@ impl Settings {
             .unwrap_or_else(|_| DEFAULT_MAX_CHANNELS.to_string())
             .parse()
             .context("DISTILL_MAX_CHANNELS must be a non-negative integer")?;
+        let max_sinks = env::var("DISTILL_MAX_SINKS")
+            .unwrap_or_else(|_| DEFAULT_MAX_CHANNELS.to_string())
+            .parse()
+            .context("DISTILL_MAX_SINKS must be a non-negative integer")?;
         let shutdown_timeout_seconds = env::var("DISTILL_SHUTDOWN_TIMEOUT_SECONDS")
             .unwrap_or_else(|_| DEFAULT_SHUTDOWN_TIMEOUT_SECONDS.to_string())
             .parse::<u64>()
@@ -138,7 +150,21 @@ impl Settings {
         let (environment_sinks, environment_default_sink_id) =
             parse_environment_sinks(env::vars())?;
 
+        let state_max_bytes = env::var("DISTILL_STATE_MAX_BYTES")
+            .unwrap_or_else(|_| "1073741824".to_string())
+            .parse::<u64>()
+            .context("DISTILL_STATE_MAX_BYTES must be an integer")?;
+        if state_max_bytes < 1024 * 1024 {
+            anyhow::bail!("DISTILL_STATE_MAX_BYTES must be at least 1048576");
+        }
+        let auto_migrate = match env::var("DISTILL_AUTO_MIGRATE").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(_) => false,
+            Ok(_) => anyhow::bail!("DISTILL_AUTO_MIGRATE must be true or false"),
+        };
         Ok(Self {
+            auto_migrate,
+            state_max_bytes,
             http: HttpSettings {
                 bind_address,
                 admin_bind_address,
@@ -148,6 +174,8 @@ impl Settings {
             ingest_api_key,
             admin_api_key,
             config_path: env::var_os("DISTILL_CONFIG_PATH").map(PathBuf::from),
+            state_path: env::var_os("DISTILL_STATE_PATH")
+                .map_or_else(|| PathBuf::from("data/state.sqlite3"), PathBuf::from),
             sinks_config_path: env::var_os("DISTILL_SINKS_CONFIG_PATH").map(PathBuf::from),
             environment_sinks,
             environment_default_sink_id,
@@ -155,6 +183,7 @@ impl Settings {
             exchange_name_prefix,
             api_default_version,
             max_channels,
+            max_sinks,
             sink_allowlist,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
         })
@@ -263,8 +292,8 @@ fn parse_admin_bind_address(value: &str, allow_network: bool) -> anyhow::Result<
 }
 
 fn validate_api_keys(ingest_api_key: &str, admin_api_key: &str) -> anyhow::Result<()> {
-    if ingest_api_key == admin_api_key {
-        anyhow::bail!("DISTILL_INGEST_API_KEY and DISTILL_ADMIN_API_KEY must be different");
+    if ingest_api_key.trim().is_empty() || admin_api_key.trim().is_empty() {
+        anyhow::bail!("DISTILL_INGEST_API_KEY and DISTILL_ADMIN_API_KEY must not be empty");
     }
     Ok(())
 }
@@ -416,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn api_keys_must_be_distinct() {
+    fn shared_or_separate_api_keys_are_supported() {
         assert!(validate_api_keys("ingest", "admin").is_ok());
-        assert!(validate_api_keys("same", "same").is_err());
+        assert!(validate_api_keys("same", "same").is_ok());
     }
 
     #[test]

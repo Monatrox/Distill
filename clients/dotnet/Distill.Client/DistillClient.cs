@@ -1,4 +1,5 @@
 using System.Net;
+using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7,7 +8,7 @@ using System.Text.Json.Nodes;
 namespace Distill.Client;
 
 /// Provides a lightweight, dependency-free client for Distill's HTTP API.
-public sealed class DistillClient
+public sealed class DistillClient : IDisposable
 {
     private const int MaxDiagnosticBodyLength = 2_048;
     private const string ApiVersion = "1";
@@ -25,6 +26,9 @@ public sealed class DistillClient
     private readonly HttpClient? _adminClient;
     private readonly string? _adminApiKey;
     private readonly string _ingestApiKey;
+    private bool ownsHttpClient;
+    private bool ownsAdminClient;
+    private readonly ConcurrentDictionary<string, string> channelVersions = new(StringComparer.Ordinal);
 
     /// Initializes a client using an existing HTTP client.
     ///
@@ -57,7 +61,8 @@ public sealed class DistillClient
                     nameof(adminEndpoint));
             }
 
-            _adminClient = new HttpClient { BaseAddress = parsedAdminEndpoint };
+            _adminClient = new HttpClient { BaseAddress = parsedAdminEndpoint, Timeout = TimeSpan.FromSeconds(30) };
+            ownsAdminClient = true;
         }
 
         if (_adminApiKey is null && _adminClient is null)
@@ -80,17 +85,54 @@ public sealed class DistillClient
     public static DistillClient Create(Uri baseAddress, string apiKey, string? adminApiKey = null, string? adminEndpoint = null)
     {
         ArgumentNullException.ThrowIfNull(baseAddress);
-        return new DistillClient(new HttpClient { BaseAddress = baseAddress }, apiKey, adminApiKey, adminEndpoint);
+        return new DistillClient(new HttpClient { BaseAddress = baseAddress, Timeout = TimeSpan.FromSeconds(30) }, apiKey, adminApiKey, adminEndpoint) { ownsHttpClient = true };
     }
 
     /// Creates a client with a new HTTP client configured for the given Distill address.
     public static DistillClient Create(Uri baseAddress, string apiKey)
     {
         ArgumentNullException.ThrowIfNull(baseAddress);
-        return new DistillClient(new HttpClient { BaseAddress = baseAddress }, apiKey);
+        return Create(baseAddress, apiKey, adminApiKey: null, adminEndpoint: null);
     }
 
-    /// Creates or replaces a channel using a raw definition object.
+    /// Uses caller-owned clients for both ingestion and provisioning.
+    public DistillClient(HttpClient ingestClient, HttpClient adminClient, string apiKey, string? adminApiKey = null)
+        : this(ingestClient, apiKey, adminApiKey)
+    {
+        _adminClient = adminClient ?? throw new ArgumentNullException(nameof(adminClient));
+    }
+
+    /// Takes ownership of client wrappers, including wrappers supplied by HttpClientFactory.
+    public static DistillClient Create(HttpClient ingestClient, HttpClient adminClient, string apiKey, string? adminApiKey = null) =>
+        new(ingestClient, adminClient, apiKey, adminApiKey) { ownsHttpClient = true, ownsAdminClient = true };
+
+    /// Disposes only transport clients created by this instance.
+    public void Dispose()
+    {
+        if (ownsHttpClient) httpClient.Dispose();
+        if (ownsAdminClient) _adminClient?.Dispose();
+    }
+
+    /// Gets the version explicitly reconciled by this client for a channel.
+    public string? GetChannelVersion(string channelId) => channelVersions.GetValueOrDefault(channelId);
+
+    /// Registers a persistence destination and returns its reusable reference.
+    public Task<RegisterSinkResponse?> RegisterSinkAsync(RegisterSinkRequest request, CancellationToken cancellationToken = default) =>
+        SendAsync<RegisterSinkResponse>(HttpMethod.Post, "sinks", request, cancellationToken);
+
+    /// Creates or verifies an immutable version and binds subsequent events to it.
+    public async Task<ChannelConfigResponse?> ReconcileChannelAsync(CreateChannelRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.Version);
+        var response = await CreateChannelAsync(request, cancellationToken);
+        if (response is null || response.ChannelId != request.Name || response.Version != request.Version)
+            throw new InvalidOperationException("Distill returned a mismatched configuration identity.");
+        channelVersions[request.Name] = request.Version;
+        return response;
+    }
+
+    /// Reconciles an immutable channel version using a raw definition object.
     ///
     /// This is the advanced PUT endpoint for callers who know the full server schema.
     /// Most applications should prefer <see cref="CreateChannelAsync(CreateChannelRequest, CancellationToken)"/>
@@ -109,10 +151,16 @@ public sealed class DistillClient
             cancellationToken);
     }
 
-    /// Checks whether Distill has an active sink-backed channel.
+    /// Checks process liveness, including a valid idle configuration.
     public async Task CheckHealthAsync(CancellationToken cancellationToken = default)
     {
         _ = await SendAsync<object?>(HttpMethod.Get, "health", content: null, cancellationToken);
+    }
+
+    /// Checks admission readiness rather than process liveness.
+    public async Task CheckReadinessAsync(CancellationToken cancellationToken = default)
+    {
+        _ = await SendAsync<object?>(HttpMethod.Get, "ready", null, cancellationToken);
     }
 
     /// Creates a channel from a preset and optional overrides.
@@ -135,7 +183,7 @@ public sealed class DistillClient
         ArgumentNullException.ThrowIfNull(request);
         try
         {
-            return await GetChannelAsync(request.Name, cancellationToken)
+            return await GetChannelVersionAsync(request.Name, request.Version, cancellationToken)
                 ?? await CreateChannelAsync(request, cancellationToken);
         }
         catch (DistillApiException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
@@ -158,7 +206,7 @@ public sealed class DistillClient
         SendAsync<IngestResponse>(
             HttpMethod.Post,
             $"channels/{Uri.EscapeDataString(channelId)}/events",
-            eventToWrite,
+            eventToWrite with { Version = eventToWrite.Version ?? GetChannelVersion(channelId) },
             cancellationToken);
 
     /// Sends a batch of fully specified events through the native ingestion endpoint.
@@ -167,7 +215,8 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(events);
-        return SendAsync<IngestResponse>(HttpMethod.Post, "ingest", events, cancellationToken);
+        var bound = events.Select(item => item with { Version = item.Version ?? GetChannelVersion(item.ChannelId) }).ToArray();
+        return SendAsync<IngestResponse>(HttpMethod.Post, "ingest", bound, cancellationToken);
     }
 
     /// Tests how a simple event would be validated and routed without enqueueing it.
@@ -177,8 +226,8 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<EventTestResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(channelId)}/test",
-            eventToTest,
+            BoundChannelRoute(channelId, "test"),
+            eventToTest with { Version = eventToTest.Version ?? GetChannelVersion(channelId) },
             cancellationToken);
 
     /// Gets the sanitized effective configuration for a channel.
@@ -187,9 +236,14 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Get,
-            $"channels/{Uri.EscapeDataString(channelId)}/config",
+            BoundChannelRoute(channelId, "config"),
             content: null,
             cancellationToken);
+
+    /// Gets a particular declared configuration version without selecting another version.
+    public Task<ChannelConfigResponse?> GetChannelVersionAsync(string channelId, string? version, CancellationToken cancellationToken = default) =>
+        SendAsync<ChannelConfigResponse>(HttpMethod.Get,
+            $"channels/{Uri.EscapeDataString(channelId)}/config" + (version is null ? "" : $"?version={Uri.EscapeDataString(version)}"), null, cancellationToken);
 
     /// Pauses event acceptance for a channel.
     public Task<ChannelConfigResponse?> PauseChannelAsync(
@@ -197,7 +251,7 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(channelId)}/pause",
+            BoundChannelRoute(channelId, "pause"),
             content: null,
             cancellationToken);
 
@@ -207,7 +261,7 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(channelId)}/resume",
+            BoundChannelRoute(channelId, "resume"),
             content: null,
             cancellationToken);
 
@@ -217,7 +271,7 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(channelId)}/flush",
+            BoundChannelRoute(channelId, "flush"),
             content: null,
             cancellationToken);
 
@@ -227,7 +281,7 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(channelId)}/archive",
+            BoundChannelRoute(channelId, "archive"),
             content: null,
             cancellationToken);
 
@@ -238,9 +292,16 @@ public sealed class DistillClient
         CancellationToken cancellationToken = default) =>
         SendAsync<ChannelConfigResponse>(
             HttpMethod.Post,
-            $"channels/{Uri.EscapeDataString(sourceChannelId)}/clone",
+            BoundChannelRoute(sourceChannelId, "clone"),
             new { channel_id = targetChannelId },
             cancellationToken);
+
+    private string BoundChannelRoute(string channelId, string action)
+    {
+        var version = GetChannelVersion(channelId);
+        return $"channels/{Uri.EscapeDataString(channelId)}/{action}"
+            + (version is null ? "" : $"?version={Uri.EscapeDataString(version)}");
+    }
 
     private async Task<T?> SendAsync<T>(
         HttpMethod method,
@@ -304,7 +365,7 @@ public sealed class DistillClient
             {
                 DebugLog(
                     $"transport failure method={method.Method} target={target} route={route} "
-                    + $"exception={ex.GetType().Name}: {ex.Message}");
+                    + $"exception={ex.GetType().Name}");
             }
 
             throw;
@@ -324,9 +385,7 @@ public sealed class DistillClient
         }
 
         string body = await response.Content.ReadAsStringAsync(cancellationToken);
-        DebugLog(
-            $"error body method={method.Method} target={target} route={route} "
-            + $"body={TruncateForDiagnostics(body)}");
+        DebugLog($"request rejected method={method.Method} target={target} route={route} status={(int)response.StatusCode}");
         string? errorCode = null;
         try
         {
@@ -354,7 +413,8 @@ public sealed class DistillClient
         }
 
         path = path.TrimStart('/');
-        return path.Equals("channels", StringComparison.OrdinalIgnoreCase)
+        return path.Equals("sinks", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("channels", StringComparison.OrdinalIgnoreCase)
             || (path.StartsWith("channels/", StringComparison.OrdinalIgnoreCase)
                 && !path.EndsWith("/events", StringComparison.OrdinalIgnoreCase));
     }

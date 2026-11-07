@@ -98,12 +98,13 @@ impl EventBuffer {
         drained
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-fn estimate_event_bytes(event: &LogEvent) -> usize {
+pub(crate) fn estimate_event_bytes(event: &LogEvent) -> usize {
     event.channel_id.len()
         + event
             .metadata
@@ -123,6 +124,7 @@ mod tests {
 
     fn event() -> LogEvent {
         LogEvent {
+            version: None,
             event_id: uuid::Uuid::new_v4(),
             timestamp: Utc::now(),
             channel_id: "app.test".to_string(),

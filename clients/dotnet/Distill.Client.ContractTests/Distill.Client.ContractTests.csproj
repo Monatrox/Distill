@@ -8,5 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
+    <ProjectReference Include="..\Distill.Extensions.Logging\Distill.Extensions.Logging.csproj" />
+    <ProjectReference Include="..\Distill.Aspire\Distill.Aspire.csproj" />
   </ItemGroup>
 </Project>

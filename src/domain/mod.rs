@@ -39,6 +39,8 @@ pub struct LogEvent {
     pub event_id: EventId,
     pub timestamp: DateTime<Utc>,
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub severity_level: SeverityLevel,
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing)]

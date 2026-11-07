@@ -1,4 +1,6 @@
-# Dispatch Prompt: Broker Durability and Recovery
+# Historical Dispatch Prompt: Broker Durability and Recovery
+
+> Superseded on 2026-11-07 by the agreed V1 contract and implementation order in `docs/production-readiness-blockers.md`. Preserve the existing broker evidence, but do not use the exclusions or at-least-once assumptions in this historical dispatch to narrow the agreed runtime configuration and aggregate correctness requirements.
 
 Use the following prompt to dispatch the next production-readiness work.
 

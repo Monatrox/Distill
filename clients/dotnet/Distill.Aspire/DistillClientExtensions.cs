@@ -46,9 +46,19 @@ public static class DistillClientExtensions
             $"[Distill.Aspire] ingestKeyConfigured={!string.IsNullOrWhiteSpace(apiKey)} "
             + $"adminKeyConfigured={!string.IsNullOrWhiteSpace(adminApiKey)}");
 
-        var client = DistillClient.Create(endpoint, apiKey, adminApiKey, adminEndpoint);
-        builder.Services.AddSingleton(client);
-        builder.Logging.AddDistill(client, configureOptions);
+        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
+        builder.Services.AddHttpClient("Distill.Ingest", client => { client.BaseAddress = endpoint; client.Timeout = TimeSpan.FromSeconds(30); }).RemoveAllLoggers();
+        builder.Services.AddHttpClient("Distill.Admin", client => { client.BaseAddress = string.IsNullOrWhiteSpace(adminEndpoint) ? endpoint : new Uri(adminEndpoint); client.Timeout = TimeSpan.FromSeconds(30); }).RemoveAllLoggers();
+        builder.Services.AddSingleton(services =>
+        {
+            var factory = services.GetRequiredService<IHttpClientFactory>();
+            return DistillClient.Create(factory.CreateClient("Distill.Ingest"), factory.CreateClient("Distill.Admin"), apiKey, adminApiKey);
+        });
+        var options = new DistillLoggerOptions();
+        configureOptions?.Invoke(options);
+        builder.Services.AddSingleton(services => new DistillLoggerProvider(() => services.GetRequiredService<DistillClient>(), options));
+        builder.Services.AddSingleton<ILoggerProvider>(services => services.GetRequiredService<DistillLoggerProvider>());
+        builder.Services.AddHostedService<DistillLoggerShutdownService>();
         builder.Services.AddHealthChecks().AddCheck<DistillHealthCheck>("distill");
 
         return builder;
@@ -121,4 +131,11 @@ public static class DistillClientExtensions
         }.Uri;
         return safeUri.AbsoluteUri.TrimEnd('/');
     }
+}
+
+/// Drains queued logging before the container disposes its HTTP client wrappers.
+internal sealed class DistillLoggerShutdownService(DistillLoggerProvider provider) : IHostedService
+{
+    public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task StopAsync(CancellationToken cancellationToken) => provider.DisposeAsync().AsTask();
 }

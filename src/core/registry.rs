@@ -16,8 +16,9 @@ use crate::{
         errors::DistillError,
         metrics::Metrics,
         schema::SchemaRegistry,
+        state::{StateStore, StoredChannel},
     },
-    domain::{ChannelDefinition, LogEvent, MessageSchemaDefinition},
+    domain::{ChannelDefinition, LogEvent, MessageSchemaDefinition, SinkConfig},
     infra::config::{self, Settings},
     persistence::{Sink, SinkAllowlist, build_sink},
 };
@@ -34,7 +35,6 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{info, warn};
 use utoipa::ToSchema;
-use uuid::Uuid;
 
 /// Startup connection attempts before the process aborts.
 ///
@@ -59,11 +59,17 @@ pub(crate) struct ChannelRecord {
     pub(crate) lifecycle: ChannelLifecycle,
 }
 
+type ChannelKey = (String, Option<String>);
+type SinkCache = Arc<Mutex<HashMap<String, Arc<dyn Sink>>>>;
+
 #[derive(Clone)]
 pub(crate) struct ChannelRegistry {
-    channels: Arc<RwLock<HashMap<String, ChannelRecord>>>,
+    channels: Arc<RwLock<HashMap<ChannelKey, ChannelRecord>>>,
     sinks: Arc<RwLock<HashMap<String, Arc<dyn Sink>>>>,
-    sink_drivers: HashMap<String, String>,
+    sink_configs: Arc<RwLock<HashMap<String, SinkConfig>>>,
+    state: StateStore,
+    auto_migrate: bool,
+    sink_cache: SinkCache,
     schemas: SchemaRegistry,
     consumer: Arc<RabbitConsumer>,
     rabbit: RabbitPublisher,
@@ -74,6 +80,7 @@ pub(crate) struct ChannelRegistry {
     pub(crate) exchange_name_prefix: String,
     pub(crate) default_sink_id: Option<String>,
     max_channels: usize,
+    max_sinks: usize,
     sink_allowlist: SinkAllowlist,
     accepting_events: Arc<AtomicBool>,
     channel_mutation: Arc<Mutex<()>>,
@@ -86,7 +93,19 @@ impl ChannelRegistry {
     /// # Errors
     /// Returns an error when `RabbitMQ` or a configured sink cannot be reached, or
     /// when the channel configuration file is invalid.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup restores dependencies and all durable mappings before starting consumption"
+    )]
     pub(crate) async fn connect(settings: &Settings) -> anyhow::Result<Self> {
+        let state =
+            StateStore::open_with_limit(&settings.state_path, settings.state_max_bytes).await?;
+        let restored = state.channels().await?;
+        if settings.max_channels > 0
+            && restored.iter().filter(|record| record.active).count() > settings.max_channels
+        {
+            anyhow::bail!("restored channel versions exceed DISTILL_MAX_CHANNELS");
+        }
         let rabbit = retry_startup_connection("RabbitMQ publisher", || {
             let rabbit_uri = settings.rabbitmq_uri.clone();
             async move { RabbitPublisher::connect(&rabbit_uri).await }
@@ -102,7 +121,20 @@ impl ChannelRegistry {
             .await?,
         );
         let sinks = Arc::new(RwLock::new(HashMap::new()));
-        let mut sink_drivers = HashMap::new();
+        let sink_cache = Arc::new(Mutex::new(HashMap::new()));
+        let mut sink_configs = HashMap::new();
+        for (sink_id, config) in state.sinks().await? {
+            let sink = cached_sink(
+                &sink_cache,
+                &config,
+                &settings.sink_allowlist,
+                settings.auto_migrate,
+                true,
+            )
+            .await?;
+            sinks.write().await.insert(sink_id.clone(), sink);
+            sink_configs.insert(sink_id, config);
+        }
         let mut default_sink_id = None;
         if let Some(path) = &settings.sinks_config_path {
             let contents = tokio::fs::read_to_string(path)
@@ -113,8 +145,15 @@ impl ChannelRegistry {
             for definition in sink_file.sinks {
                 let sink_config = config::resolve_sink(&definition)?;
                 let sink_id = definition.sink_id;
-                let sink = build_sink(&sink_config, &settings.sink_allowlist).await?;
-                sink_drivers.insert(sink_id.clone(), sink_config.driver);
+                let sink = cached_sink(
+                    &sink_cache,
+                    &sink_config,
+                    &settings.sink_allowlist,
+                    settings.auto_migrate,
+                    false,
+                )
+                .await?;
+                sink_configs.insert(sink_id.clone(), sink_config.clone());
                 sinks.write().await.insert(sink_id, sink);
             }
         }
@@ -122,8 +161,15 @@ impl ChannelRegistry {
             if sinks.read().await.contains_key(sink_id) {
                 anyhow::bail!("sink '{sink_id}' is configured more than once");
             }
-            let sink = build_sink(sink_config, &settings.sink_allowlist).await?;
-            sink_drivers.insert(sink_id.clone(), sink_config.driver.clone());
+            let sink = cached_sink(
+                &sink_cache,
+                sink_config,
+                &settings.sink_allowlist,
+                settings.auto_migrate,
+                false,
+            )
+            .await?;
+            sink_configs.insert(sink_id.clone(), sink_config.clone());
             sinks.write().await.insert(sink_id.clone(), sink);
         }
         if settings.environment_default_sink_id.is_some() {
@@ -134,10 +180,16 @@ impl ChannelRegistry {
         {
             anyhow::bail!("default sink '{sink_id}' is not configured");
         }
+        if settings.max_sinks > 0 && sink_configs.len() > settings.max_sinks {
+            anyhow::bail!("restored sinks exceed DISTILL_MAX_SINKS");
+        }
         let registry = Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             sinks,
-            sink_drivers,
+            sink_configs: Arc::new(RwLock::new(sink_configs)),
+            state,
+            auto_migrate: settings.auto_migrate,
+            sink_cache,
             schemas: SchemaRegistry::default(),
             consumer,
             rabbit,
@@ -150,11 +202,15 @@ impl ChannelRegistry {
             exchange_name_prefix: settings.exchange_name_prefix.clone(),
             default_sink_id,
             max_channels: settings.max_channels,
+            max_sinks: settings.max_sinks,
             sink_allowlist: settings.sink_allowlist.clone(),
             accepting_events: Arc::new(AtomicBool::new(true)),
             channel_mutation: Arc::new(Mutex::new(())),
             shutdown_timeout: settings.shutdown_timeout,
         };
+        for record in restored {
+            registry.restore_channel(record).await?;
+        }
         if let Some(path) = &settings.config_path {
             let contents = tokio::fs::read_to_string(path).await.with_context(|| {
                 format!("reading channel configuration from {}", path.display())
@@ -165,16 +221,95 @@ impl ChannelRegistry {
                 registry.register_channel(definition).await?;
             }
         }
+        registry.consumer.start().await;
         Ok(registry)
+    }
+
+    async fn restore_channel(&self, record: StoredChannel) -> Result<(), DistillError> {
+        let definition = record.definition;
+        definition
+            .validate()
+            .map_err(DistillError::InvalidConfiguration)?;
+        let sink = cached_sink(
+            &self.sink_cache,
+            &definition.sink_config,
+            &self.sink_allowlist,
+            self.auto_migrate,
+            true,
+        )
+        .await?;
+        let schema = definition
+            .message_schema
+            .as_ref()
+            .map(SchemaRegistry::prepare)
+            .transpose()?;
+        self.schemas
+            .check_capacity(
+                &schema_key(&definition.channel_id, definition.version.as_deref()),
+                schema.as_ref(),
+            )
+            .await?;
+        self.consumer
+            .register_exchange(&definition.rabbitmq_config.exchange_name)
+            .await?;
+        let proposed = channel::spawn(
+            definition.clone(),
+            Some(record.generation),
+            self.rabbit.clone(),
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.budget),
+            self.state.clone(),
+        )
+        .await?;
+        let prepared = self
+            .consumer
+            .prepare_channel(
+                definition.channel_id.clone(),
+                record.generation,
+                sink,
+                proposed,
+                definition.aggregator.is_some(),
+            )
+            .await?;
+        let handle = self.consumer.activate_channel(prepared).await;
+        if record.active {
+            self.schemas
+                .activate(
+                    &schema_key(&definition.channel_id, definition.version.as_deref()),
+                    schema,
+                )
+                .await;
+            self.channels.write().await.insert(
+                (definition.channel_id.clone(), definition.version.clone()),
+                ChannelRecord {
+                    definition,
+                    handle,
+                    lifecycle: record.lifecycle,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Returns whether an active, sink-backed channel can accept events.
     pub(crate) async fn is_ready(&self) -> bool {
-        self.channels
-            .read()
-            .await
-            .values()
-            .any(|record| record.lifecycle == ChannelLifecycle::Active)
+        self.accepting_events.load(Ordering::Acquire)
+            && self
+                .channels
+                .read()
+                .await
+                .values()
+                .any(|record| record.lifecycle == ChannelLifecycle::Active)
+            && self.consumer.consumers_healthy().await
+            && self.rabbit.healthy().await
+    }
+
+    pub(crate) async fn consumers_healthy(&self) -> bool {
+        self.consumer.consumers_healthy().await
+    }
+
+    pub(crate) async fn aggregate_in_flight(&self) -> usize {
+        self.consumer.aggregate_in_flight().await
     }
 
     /// Flushes all active channel buffers before process shutdown.
@@ -209,36 +344,92 @@ impl ChannelRegistry {
         Arc::clone(&self.metrics)
     }
 
-    /// Registers or replaces a channel, wiring its sink, schema, and actor.
+    pub(crate) async fn register_sink(
+        &self,
+        sink_id: &str,
+        config: SinkConfig,
+    ) -> Result<(), DistillError> {
+        let _mutation = self.channel_mutation.lock().await;
+        config
+            .validate()
+            .map_err(DistillError::InvalidConfiguration)?;
+        if let Some(existing) = self.sink_configs.read().await.get(sink_id) {
+            if serde_json::to_value(existing).ok() == serde_json::to_value(&config).ok() {
+                return Ok(());
+            }
+            return Err(DistillError::ConfigurationConflict);
+        }
+        if self.max_sinks > 0 && self.sink_configs.read().await.len() >= self.max_sinks {
+            return Err(DistillError::InvalidConfiguration(
+                "DISTILL_MAX_SINKS capacity reached".to_string(),
+            ));
+        }
+        let sink = cached_sink(
+            &self.sink_cache,
+            &config,
+            &self.sink_allowlist,
+            self.auto_migrate,
+            false,
+        )
+        .await?;
+        self.state.register_sink(sink_id, &config).await?;
+        self.sink_configs
+            .write()
+            .await
+            .insert(sink_id.to_string(), config);
+        self.sinks.write().await.insert(sink_id.to_string(), sink);
+        Ok(())
+    }
+
+    /// Reconciles an immutable channel version, wiring its sink, schema, and actor.
     ///
     /// # Errors
     /// Returns an error when the definition is invalid, its sink is undefined,
     /// or broker or sink setup fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "registration stages resources, commits recovery state and activates in that order"
+    )]
     pub(crate) async fn register_channel(
         &self,
-        definition: ChannelDefinition,
+        mut definition: ChannelDefinition,
     ) -> Result<(), DistillError> {
         let _mutation = self.channel_mutation.lock().await;
         definition
             .validate()
             .map_err(DistillError::InvalidConfiguration)?;
+        if let Some(sink_id) = &definition.sink_id {
+            definition.sink_config = self
+                .sink_configs
+                .read()
+                .await
+                .get(sink_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DistillError::InvalidConfiguration("named sink is not registered".to_string())
+                })?;
+        }
         let channel_id = definition.channel_id.clone();
-        let sink_driver = if let Some(sink_id) = &definition.sink_id {
-            self.sink_drivers.get(sink_id).ok_or_else(|| {
-                DistillError::InvalidConfiguration(format!(
-                    "channel '{channel_id}' references undefined sink '{sink_id}'"
-                ))
-            })?
-        } else {
-            &definition.sink_config.driver
-        };
+        let key = (channel_id.clone(), definition.version.clone());
+        if let Some(existing) = self.channels.read().await.get(&key) {
+            if serde_json::to_value(&existing.definition)
+                .map_err(|_| DistillError::ConfigurationConflict)?
+                == serde_json::to_value(&definition)
+                    .map_err(|_| DistillError::ConfigurationConflict)?
+            {
+                return Ok(());
+            }
+            return Err(DistillError::ConfigurationConflict);
+        }
+
         definition
-            .validate_for_sink(sink_driver)
+            .sink_config
+            .validate()
             .map_err(DistillError::InvalidConfiguration)?;
         {
             let channels = self.channels.read().await;
             if self.max_channels > 0
-                && !channels.contains_key(&channel_id)
+                && !channels.contains_key(&key)
                 && channels.len() >= self.max_channels
             {
                 return Err(DistillError::InvalidConfiguration(format!(
@@ -252,6 +443,12 @@ impl ChannelRegistry {
             .as_ref()
             .map(SchemaRegistry::prepare)
             .transpose()?;
+        self.schemas
+            .check_capacity(
+                &schema_key(&definition.channel_id, definition.version.as_deref()),
+                schema.as_ref(),
+            )
+            .await?;
         let sink: Arc<dyn Sink> = if let Some(sink_id) = &definition.sink_id {
             self.sinks
                 .read()
@@ -264,20 +461,28 @@ impl ChannelRegistry {
                     ))
                 })?
         } else {
-            build_sink(&definition.sink_config, &self.sink_allowlist).await?
+            cached_sink(
+                &self.sink_cache,
+                &definition.sink_config,
+                &self.sink_allowlist,
+                self.auto_migrate,
+                false,
+            )
+            .await?
         };
-        let old = self.channels.read().await.get(&channel_id).cloned();
         self.consumer
             .register_exchange(&definition.rabbitmq_config.exchange_name)
             .await?;
-        let generation = old.as_ref().map(|_| Uuid::new_v4());
+        let generation = None;
         let proposed_handle = channel::spawn(
             definition.clone(),
             generation,
             self.rabbit.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.budget),
-        );
+            self.state.clone(),
+        )
+        .await?;
         let generation = proposed_handle.generation();
         let aggregate_enabled = definition.aggregator.is_some();
         let prepared = self
@@ -290,24 +495,29 @@ impl ChannelRegistry {
                 aggregate_enabled,
             )
             .await?;
-        if let Some(previous) = &old {
-            previous.handle.stop_event_actor().await?;
-            previous.handle.flush().await?;
-        }
-        self.schemas.activate(&channel_id, schema).await;
+        self.state
+            .activate(&StoredChannel {
+                generation,
+                definition: definition.clone(),
+                lifecycle: ChannelLifecycle::Active,
+                active: true,
+            })
+            .await?;
+        self.schemas
+            .activate(
+                &schema_key(&channel_id, definition.version.as_deref()),
+                schema,
+            )
+            .await;
         let handle = self.consumer.activate_channel(prepared).await;
         self.channels.write().await.insert(
-            channel_id.clone(),
+            key,
             ChannelRecord {
                 definition,
                 handle,
                 lifecycle: ChannelLifecycle::Active,
             },
         );
-        if let Some(previous) = old {
-            self.consumer
-                .retire_generation(previous.handle.generation(), previous.handle);
-        }
         info!(event.name = "distill.channel.registered", channel.id = %channel_id, "channel registered");
         Ok(())
     }
@@ -328,7 +538,7 @@ impl ChannelRegistry {
             .channels
             .read()
             .await
-            .get(&event.channel_id)
+            .get(&(event.channel_id.clone(), event.version.clone()))
             .cloned()
             .ok_or_else(|| DistillError::ChannelNotFound(event.channel_id.clone()))?;
         match record.lifecycle {
@@ -346,9 +556,12 @@ impl ChannelRegistry {
                 )));
             }
         }
+        self.state
+            .duplicate(record.handle.generation(), &event)
+            .await?;
         self.schemas
             .validate_json(
-                &event.channel_id,
+                &schema_key(&event.channel_id, event.version.as_deref()),
                 &event.payload,
                 event.payload_bytes.as_deref(),
             )
@@ -363,28 +576,30 @@ impl ChannelRegistry {
     pub(crate) async fn set_lifecycle(
         &self,
         channel_id: &str,
+        version: Option<&str>,
         lifecycle: ChannelLifecycle,
     ) -> Result<ChannelRecord, DistillError> {
+        let _mutation = self.channel_mutation.lock().await;
         let mut channels = self.channels.write().await;
         let record = channels
-            .get_mut(channel_id)
+            .get_mut(&(channel_id.to_string(), version.map(ToOwned::to_owned)))
             .ok_or_else(|| DistillError::ChannelNotFound(channel_id.to_string()))?;
+        self.state
+            .set_lifecycle(record.handle.generation(), lifecycle)
+            .await?;
         record.lifecycle = lifecycle;
         Ok(record.clone())
     }
 
-    /// Returns a copy of a channel's record.
-    ///
-    /// # Errors
-    /// Returns an error when the channel does not exist.
-    pub(crate) async fn channel_record(
+    pub(crate) async fn channel_record_versioned(
         &self,
         channel_id: &str,
+        version: Option<&str>,
     ) -> Result<ChannelRecord, DistillError> {
         self.channels
             .read()
             .await
-            .get(channel_id)
+            .get(&(channel_id.to_string(), version.map(ToOwned::to_owned)))
             .cloned()
             .ok_or_else(|| DistillError::ChannelNotFound(channel_id.to_string()))
     }
@@ -399,14 +614,35 @@ impl ChannelRegistry {
         definition: MessageSchemaDefinition,
     ) -> Result<(), DistillError> {
         let _mutation = self.channel_mutation.lock().await;
-        if !self.channels.read().await.contains_key(channel_id) {
+        if !self
+            .channels
+            .read()
+            .await
+            .contains_key(&(channel_id.to_string(), None))
+        {
             return Err(DistillError::ChannelNotFound(channel_id.to_string()));
         }
         let schema = SchemaRegistry::prepare(&definition)?;
-        self.schemas.activate(channel_id, Some(schema)).await;
-        if let Some(record) = self.channels.write().await.get_mut(channel_id) {
-            record.definition.message_schema = Some(definition);
+        self.schemas
+            .check_capacity(&schema_key(channel_id, None), Some(&schema))
+            .await?;
+        let mut channels = self.channels.write().await;
+        if let Some(record) = channels.get_mut(&(channel_id.to_string(), None)) {
+            let mut updated = record.definition.clone();
+            updated.message_schema = Some(definition);
+            self.state
+                .activate(&StoredChannel {
+                    generation: record.handle.generation(),
+                    definition: updated.clone(),
+                    lifecycle: record.lifecycle,
+                    active: true,
+                })
+                .await?;
+            record.definition = updated;
         }
+        self.schemas
+            .activate(&schema_key(channel_id, None), Some(schema))
+            .await;
         Ok(())
     }
 
@@ -417,11 +653,12 @@ impl ChannelRegistry {
     pub(crate) async fn validate_payload(
         &self,
         channel_id: &str,
+        version: Option<&str>,
         payload: &serde_json::Value,
         payload_bytes: Option<&[u8]>,
     ) -> Result<(), DistillError> {
         self.schemas
-            .validate_json(channel_id, payload, payload_bytes)
+            .validate_json(&schema_key(channel_id, version), payload, payload_bytes)
             .await
     }
 }
@@ -451,6 +688,42 @@ where
     }
     Err(anyhow::anyhow!(
         "{label} did not become available after {STARTUP_CONNECTION_ATTEMPTS} attempts: {}",
-        last_error.expect("startup attempts always record an error")
+        last_error
+            .expect("startup attempts always record an error")
+            .error_code()
     ))
+}
+
+fn schema_key(channel_id: &str, version: Option<&str>) -> String {
+    format!("{channel_id}@{}", version.unwrap_or_default())
+}
+
+async fn cached_sink(
+    cache: &SinkCache,
+    config: &SinkConfig,
+    allowlist: &SinkAllowlist,
+    auto_migrate: bool,
+    restoring: bool,
+) -> Result<Arc<dyn Sink>, DistillError> {
+    use sha2::{Digest, Sha256};
+    let canonical =
+        serde_json::to_value(config).map_err(|_| DistillError::ConfigurationConflict)?;
+    let identity = format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()));
+    let mut cache = cache.lock().await;
+    if let Some(sink) = cache.get(&identity) {
+        return Ok(Arc::clone(sink));
+    }
+    let sink = if restoring {
+        let config = config.clone();
+        let allowlist = allowlist.clone();
+        tokio::task::spawn_blocking(move || crate::persistence::restore_sink(&config, &allowlist))
+            .await
+            .map_err(|_| {
+                DistillError::Persistence("sink recovery preparation failed".to_string())
+            })??
+    } else {
+        build_sink(config, allowlist, auto_migrate).await?
+    };
+    cache.insert(identity, Arc::clone(&sink));
+    Ok(sink)
 }

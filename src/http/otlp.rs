@@ -71,7 +71,22 @@ pub(super) fn otlp_events(
                     metadata.insert("span_id".to_string(), span_id.to_string());
                 }
                 events.push(LogEvent {
-                    event_id: Uuid::new_v4(),
+                    version: attributes
+                        .get("distill.version")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    event_id: attributes
+                        .get("distill.event_id")
+                        .and_then(Value::as_str)
+                        .map(|id| {
+                            Uuid::parse_str(id).map_err(|_| {
+                                DistillError::InvalidRequest(
+                                    "distill.event_id must be a UUID".to_string(),
+                                )
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or_else(Uuid::new_v4),
                     timestamp,
                     channel_id: channel.clone(),
                     severity_level: otlp_severity(

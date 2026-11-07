@@ -16,19 +16,43 @@ During development, use `cargo run --` before the command:
 cargo run -- sink list --file sinks.json
 ```
 
-Running `distill` with no subcommand starts the Distill server. Administrative commands are local file operations and do not require RabbitMQ, PostgreSQL, or the server to be running.
+Running `distill` with no subcommand starts the Distill server. Manifest and secret commands are local operations. `sink migrate` connects to the named database; DLQ commands connect to RabbitMQ.
 
 ```text
 distill sink create ...
 distill sink list ...
+distill sink migrate <sink-id> --file sinks.json
 distill secret file-write ...
 distill secret env-write ...
 distill dlq list
 distill dlq replay --id <message-id>
+distill dlq export --id <message-id> --file protected.jsonl
 distill
 ```
 
 The CLI never requires secrets as positional arguments. Sink manifests contain either a non-secret endpoint or a reference to an environment variable or secret file.
+
+## Runtime configuration and migrations
+
+The preferred application deployment workflow is `POST /sinks` followed by versioned `POST /channels`; neither needs a logger redeploy. See the root README for request contracts. The manifest below is an optional operator-provided startup path. Changing the manifest itself takes effect at restart; runtime registrations persist independently in SQLite.
+
+Database DDL is disabled during normal startup/registration by default. Resolve manifest secret references and explicitly apply the current schema before registering a database sink:
+
+```sh
+distill sink migrate postgres-primary --file sinks.json
+```
+
+The command is idempotent and records schema version 1. `DISTILL_AUTO_MIGRATE=true` enables automatic DDL for disposable development fixtures. It is not required in production.
+
+## Protected DLQ export
+
+```sh
+distill dlq export --id <message-id> --file /private/recovery.jsonl
+# Or explicitly select every item:
+distill dlq export --all --file /private/recovery.jsonl
+```
+
+Export creates a new owner-only JSONL file containing raw original broker bytes encoded for recovery. It never prints bodies or acknowledges/deletes broker records. Protect the containing directory and exported file as sensitive application data. Export does not authorize unchanged poison or aggregate-input replay.
 
 ## Sink manifest
 
@@ -153,7 +177,7 @@ distill dlq replay --all
 
 DLQ commands require `RABBITMQ_URI` with read access to the DLQ and write access to original destination exchanges. They inspect the existing DLQ passively and do not redeclare unrelated application queues, so they remain usable during queue-upgrade recovery. Output contains DLQ ID, timestamp, failure category, retry count, envelope version, original record ID when known, original exchange, and routing key—never original event payload, failure text, or credentials.
 
-Only structurally valid, retry-exhausted direct event and aggregate-output records are eligible. Malformed, unsupported-version, and aggregate-input records remain in the DLQ because replaying unchanged poison data or an aggregate input without durable source-event deduplication is unsafe. Listing and replay scan without retaining message bodies in process memory. Replay reports confirmed, intentionally retained, and invalid record counts. `--all` succeeds when every eligible record was confirmed even if intentionally ineligible records remain; malformed DLQ wrappers produce a non-zero exit for repair. An explicit `--id` also exits non-zero when that record is missing or ineligible.
+Only structurally valid, retry-exhausted direct event and aggregate-output records are eligible. Malformed, unsupported-version, and aggregate-input records remain in the DLQ because replaying unchanged poison data or an aggregate input without the separately validated aggregate replay contract is unsupported. Listing and replay scan without retaining message bodies in process memory. Replay reports confirmed, intentionally retained, and invalid record counts. `--all` succeeds when every eligible record was confirmed even if intentionally ineligible records remain; malformed DLQ wrappers produce a non-zero exit for repair. An explicit `--id` also exits non-zero when that record is missing or ineligible.
 
 ## Local secret helpers
 

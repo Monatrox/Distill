@@ -47,13 +47,13 @@ mod otlp;
 use auth::authenticate;
 use channels::{
     archive_channel, clone_channel, flush_channel, get_channel, pause_channel, post_channel,
-    post_schema, put_channel, resume_channel, test_event, validate_channel,
+    post_schema, put_channel, register_sink, resume_channel, test_event, validate_channel,
 };
 use dto::{
     ChannelConfigResponse, ChannelValidationResponse, CloneChannelRequest, CreateChannelRequest,
     EventTestResponse, IngestItemError, IngestResponse, PublicChannelConfig, SimpleEventRequest,
 };
-use ingest::{health, ingest, metrics, otlp_logs, post_event};
+use ingest::{health, ingest, metrics, otlp_logs, post_event, ready};
 use openapi::swagger_ui;
 use otlp::otlp_events;
 use uuid::Uuid;
@@ -210,6 +210,7 @@ pub fn public_router(state: AppState) -> Router {
     build_router(
         Router::new()
             .route("/health", get(health))
+            .route("/ready", get(ready))
             .merge(ingest_routes),
         state,
     )
@@ -219,6 +220,7 @@ pub fn public_router(state: AppState) -> Router {
 pub fn admin_router(state: AppState) -> Router {
     let authenticated = authenticated_routes(
         Router::new()
+            .route("/sinks", post(register_sink))
             .route("/channels", post(post_channel))
             .route("/channels/validate", post(validate_channel))
             .route("/channels/{channel_id}", put(put_channel))
@@ -341,7 +343,7 @@ async fn enforce_request_controls(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
+    if matches!(request.uri().path(), "/health" | "/ready") {
         return next.run(request).await;
     }
     match state.request_controls.acquire() {

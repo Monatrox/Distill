@@ -3,20 +3,27 @@
 // Rust guideline compliant 2026-02-21
 use crate::domain::{AggregatedLog, AggregationFunction, AggregatorSpec, LogEvent};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AggregatorState {
     spec: AggregatorSpec,
     channel_id: String,
-    events: Vec<LogEvent>,
+    events: Vec<TimedEvent>,
     sum: f64,
     count: u64,
     minimum: Option<f64>,
     maximum: Option<f64>,
     late_event_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TimedEvent {
+    timestamp: DateTime<Utc>,
+    event_id: Uuid,
 }
 
 impl AggregatorState {
@@ -33,7 +40,7 @@ impl AggregatorState {
         }
     }
 
-    pub fn update(&mut self, event: LogEvent) -> Result<(), String> {
+    pub fn update(&mut self, event: &LogEvent) -> Result<(), String> {
         if matches!(
             self.spec.function,
             AggregationFunction::Count | AggregationFunction::AverageDurationBetweenEvents
@@ -64,13 +71,14 @@ impl AggregatorState {
             self.maximum = Some(self.maximum.map_or(value, |maximum| maximum.max(value)));
         }
 
-        if matches!(self.spec.granularity, crate::domain::Granularity::PerTTime)
-            || matches!(
-                self.spec.function,
-                AggregationFunction::Average | AggregationFunction::AverageDurationBetweenEvents
-            )
-        {
-            self.events.push(event);
+        if matches!(
+            self.spec.function,
+            AggregationFunction::AverageDurationBetweenEvents
+        ) {
+            self.events.push(TimedEvent {
+                timestamp: event.timestamp,
+                event_id: event.event_id,
+            });
         }
         Ok(())
     }
@@ -135,6 +143,8 @@ impl AggregatorState {
             }
         };
         AggregatedLog {
+            update_revision: 0,
+            version: None,
             aggregate_id: aggregate_id(&self.channel_id, &self.spec),
             channel_id: self.channel_id.clone(),
             window_start,
@@ -201,7 +211,7 @@ impl AggregatorState {
     }
 }
 
-fn average_duration_seconds(events: &[LogEvent]) -> f64 {
+fn average_duration_seconds(events: &[TimedEvent]) -> f64 {
     if events.len() < 2 {
         return 0.0;
     }
@@ -229,7 +239,10 @@ fn aggregate_id(channel_id: &str, spec: &AggregatorSpec) -> Uuid {
     }
 }
 
-fn duration_metadata(events: &[LogEvent], function: AggregationFunction) -> HashMap<String, Value> {
+fn duration_metadata(
+    events: &[TimedEvent],
+    function: AggregationFunction,
+) -> HashMap<String, Value> {
     if function != AggregationFunction::AverageDurationBetweenEvents || events.is_empty() {
         return HashMap::new();
     }
@@ -302,39 +315,36 @@ pub(crate) fn merge_aggregate_values(
             }
         }
         AggregationFunction::AverageDurationBetweenEvents => {
-            let existing_sum = metadata_f64(&existing_metadata, "interval_sum_seconds");
-            let existing_intervals = metadata_u64(&existing_metadata, "interval_count");
-            let incoming_sum = metadata_f64(&incoming_metadata_map, "interval_sum_seconds");
-            let incoming_intervals = metadata_u64(&incoming_metadata_map, "interval_count");
-            let boundary = match (
-                metadata_timestamp(&existing_metadata, "last_event_timestamp"),
-                metadata_timestamp(&incoming_metadata_map, "first_event_timestamp"),
-            ) {
-                (Some(previous), Some(next)) => next
-                    .signed_duration_since(previous)
-                    .to_std()
-                    .map_or(0.0, |duration| duration.as_secs_f64()),
-                _ => 0.0,
-            };
-            let total_intervals = existing_intervals
-                .saturating_add(incoming_intervals)
-                .saturating_add(u64::from(boundary > 0.0));
-            let total_sum = existing_sum + incoming_sum + boundary;
-            existing_metadata.insert("interval_count".to_string(), json!(total_intervals));
-            existing_metadata.insert("interval_sum_seconds".to_string(), json!(total_sum));
-            if let Some(last) = incoming_metadata_map.get("last_event_timestamp") {
-                existing_metadata.insert("last_event_timestamp".to_string(), last.clone());
-            }
-            if total_intervals == 0 {
-                0.0
-            } else {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "duration interval counts are represented as f64 in the aggregate"
-                )]
-                let total_intervals_f64 = total_intervals as f64;
-                total_sum / total_intervals_f64
-            }
+            let previous_first = metadata_timestamp(&existing_metadata, "first_event_timestamp")
+                .ok_or("duration snapshot is missing its first timestamp")?;
+            let previous_last = metadata_timestamp(&existing_metadata, "last_event_timestamp")
+                .ok_or("duration snapshot is missing its last timestamp")?;
+            let incoming_first =
+                metadata_timestamp(&incoming_metadata_map, "first_event_timestamp")
+                    .ok_or("duration snapshot is missing its first timestamp")?;
+            let incoming_last = metadata_timestamp(&incoming_metadata_map, "last_event_timestamp")
+                .ok_or("duration snapshot is missing its last timestamp")?;
+            let first = previous_first.min(incoming_first);
+            let last = previous_last.max(incoming_last);
+            let intervals = u64::try_from(existing_count)
+                .map_err(|_| "negative existing count")?
+                .checked_add(incoming_count)
+                .ok_or("duration count overflow")?
+                .saturating_sub(1);
+            let sum = last
+                .signed_duration_since(first)
+                .to_std()
+                .map_or(0.0, |span| span.as_secs_f64());
+            existing_metadata.insert("first_event_timestamp".to_string(), json!(first));
+            existing_metadata.insert("last_event_timestamp".to_string(), json!(last));
+            existing_metadata.insert("interval_count".to_string(), json!(intervals));
+            existing_metadata.insert("interval_sum_seconds".to_string(), json!(sum));
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the aggregate wire value is a floating point duration"
+            )]
+            let divisor = intervals.max(1) as f64;
+            sum / divisor
         }
         AggregationFunction::Count | AggregationFunction::Sum => existing_value + incoming_value,
         AggregationFunction::Min => existing_value.min(incoming_value),
@@ -347,14 +357,6 @@ pub(crate) fn merge_aggregate_values(
         value,
         serde_json::to_value(existing_metadata).map_err(|error| error.to_string())?,
     ))
-}
-
-fn metadata_f64(metadata: &HashMap<String, Value>, key: &str) -> f64 {
-    metadata.get(key).and_then(Value::as_f64).unwrap_or(0.0)
-}
-
-fn metadata_u64(metadata: &HashMap<String, Value>, key: &str) -> u64 {
-    metadata.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 fn metadata_timestamp(metadata: &HashMap<String, Value>, key: &str) -> Option<DateTime<Utc>> {
@@ -383,9 +385,9 @@ mod tests {
             rolling: false,
         };
         let mut first = AggregatorState::new("app.test".to_string(), spec.clone());
-        first.update(event(2.0)).expect("valid event");
+        first.update(&event(2.0)).expect("valid event");
         let mut second = AggregatorState::new("app.test".to_string(), spec);
-        second.update(event(4.0)).expect("valid event");
+        second.update(&event(4.0)).expect("valid event");
         first.merge(second).expect("compatible aggregators");
         let result = first.flush(Utc::now(), Utc::now());
         assert!((result.aggregated_value - 3.0).abs() < f64::EPSILON);
@@ -402,17 +404,72 @@ mod tests {
         };
         let start = Utc::now();
         let mut state = AggregatorState::new("app.test".to_string(), spec);
-        state.update(event_at(start)).expect("valid event");
+        state.update(&event_at(start)).expect("valid event");
         state
-            .update(event_at(start + chrono::Duration::seconds(4)))
+            .update(&event_at(start + chrono::Duration::seconds(4)))
             .expect("valid event");
         state
-            .update(event_at(start + chrono::Duration::seconds(10)))
+            .update(&event_at(start + chrono::Duration::seconds(10)))
             .expect("valid event");
 
         let result = state.flush(start, start + chrono::Duration::seconds(10));
         assert!((result.aggregated_value - 5.0).abs() < f64::EPSILON);
         assert_eq!(result.count, 3);
+    }
+
+    #[test]
+    fn rolling_functions_match_a_single_window_with_overlapping_timestamps() {
+        let start = Utc::now();
+        // Each partition overlaps in event time and includes equal timestamps.
+        let mut events = Vec::new();
+        for (seconds, value) in [(10, 4.0), (0, 2.0), (10, 8.0), (4, 6.0)] {
+            let mut item = event_at(start + chrono::Duration::seconds(seconds));
+            item.payload = json!({"value": value});
+            events.push(item);
+        }
+        for function in [
+            AggregationFunction::Count,
+            AggregationFunction::Sum,
+            AggregationFunction::Average,
+            AggregationFunction::Min,
+            AggregationFunction::Max,
+            AggregationFunction::AverageDurationBetweenEvents,
+        ] {
+            let spec = AggregatorSpec {
+                function,
+                granularity: Granularity::Overall,
+                parameter: None,
+                rolling: true,
+            };
+            let mut whole = AggregatorState::new("app.test".to_string(), spec.clone());
+            let mut left = AggregatorState::new("app.test".to_string(), spec.clone());
+            let mut right = AggregatorState::new("app.test".to_string(), spec);
+            for (index, item) in events.iter().enumerate() {
+                whole.update(item).expect("valid input");
+                if index < 2 {
+                    left.update(item).expect("valid input");
+                } else {
+                    right.update(item).expect("valid input");
+                }
+            }
+            let expected = whole.flush(start, start);
+            let first = left.flush(start, start);
+            let second = right.flush(start, start);
+            let (actual, _) = merge_aggregate_values(
+                function,
+                first.aggregated_value,
+                count_as_i64(first.count),
+                serde_json::to_value(first.custom_metadata).expect("metadata"),
+                second.aggregated_value,
+                second.count,
+                serde_json::to_value(second.custom_metadata).expect("metadata"),
+            )
+            .expect("compatible windows");
+            assert!(
+                (actual - expected.aggregated_value).abs() < 1e-12,
+                "{function:?}"
+            );
+        }
     }
 
     fn event(value: f64) -> LogEvent {
@@ -423,6 +480,7 @@ mod tests {
 
     fn event_at(timestamp: chrono::DateTime<Utc>) -> LogEvent {
         LogEvent {
+            version: None,
             event_id: Uuid::new_v4(),
             timestamp,
             channel_id: "app.test".to_string(),
