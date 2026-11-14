@@ -5,3 +5,24 @@
 **/obj/
 **/__pycache__/
 /artifacts/
+/docs/portfolio/
+
+# Local planning, handoffs and historical documentation.
+/docs/archive/
+
+# Local credentials and recovery state; keep the example environment public.
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/sinks.json
+/channels.json

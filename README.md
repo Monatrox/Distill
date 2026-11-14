@@ -558,7 +558,7 @@ Deduplication history currently has no automatic age eviction. Its guarantee las
 
 SQLite WAL requires local-disk-compatible persistence. Azure Container Apps/Azure Files compatibility is **not validated** and remains a production release gate. Multiple logger replicas, automatic revision retirement, retention/compression, and cross-version aggregate merging are deferred. Old channel versions and their queues remain retained and count toward configured caps. Credential rotation and stronger secret storage are a fast follow; current confidentiality relies on protected transport, private storage and safe diagnostics.
 
-The current changes are under verification. See [the readiness handoff](docs/production-readiness-handoff.md) for executed evidence and remaining gates before declaring V1 production ready. Existing pre-V1 rolling delta messages are incompatible with cumulative snapshots: drain them with the old revision before upgrading. There is no automatic queue/schema/data downgrade.
+V1 has passed local qualification; production release gates remain open for target storage and restore, hosted CI on the release revision, remaining fault/soak coverage, and target-specific operations. Existing pre-V1 rolling delta messages are incompatible with cumulative snapshots: drain them with the old revision before upgrading. There is no automatic queue/schema/data downgrade.
 
 ## Build and test locally
 
@@ -588,7 +588,7 @@ After starting the updated AppHost, run:
 python3 scripts/test-aspire-application.py --endpoints /private/endpoints.json --output /private/evidence.json
 ```
 
-The driver validates both producer versions and persisted values, restarts the isolated logger/broker, and exercises concurrent registration/ingestion. `--previous-output` additionally checks recovered data and retries old IDs. The optional Playwright driver `scripts/test-aspire-ui.cjs` clicks the actual counter and renders weather; it requires an installed Playwright module/browser. See the [qualification handoff](docs/production-readiness-handoff.md) and [safe evidence summary](docs/production-readiness-local-evidence.json) for the executed local scenarios and remaining release gates.
+The driver validates both producer versions and persisted values, restarts the isolated logger/broker, and exercises concurrent registration/ingestion. `--previous-output` additionally checks recovered data and retries old IDs. The optional Playwright driver `scripts/test-aspire-ui.cjs` clicks the actual counter and renders weather; it requires an installed Playwright module/browser. The DistillTesting sample is a separate local checkout and is not included in this repository. Local qualification does not establish hosted CI or production-target readiness.
 
 Back up broker, SQLite state, destinations and stable credential configuration coherently. A tested local procedure stops the deployment, exports the volumes, saves their **container UID/GID/mode**, and imports into new volumes before restoring that metadata and starting the same resource identities. The tested Podman export omitted volume-root metadata; preserve it separately. Keep archives and credential backups private. Production-target/off-host restore still needs its own rehearsal.
 
@@ -628,9 +628,8 @@ The guiding goal is simple:
 
 - [.NET SDK](clients/dotnet/README.md)
 - [.NET `ILogger` provider](clients/dotnet/Distill.Extensions.Logging/README.md)
-- [Communication surface improvements](docs/communication_surface_improvements.md)
+- [Aspire integration](clients/dotnet/Distill.Aspire/README.md)
+- [CLI guide](docs/cli.md)
 - [C#/.NET integration guide](docs/csharp_integration.md)
-- [Technical specification](docs/technical_specification.md)
-- [Architecture overview](docs/architecture_overview.md)
-- [Error handling](docs/error_handling.md)
-- [Development guidelines](docs/development_guidelines.md)
+- [Security and credential handling](docs/security.md)
+- [Documentation index](docs/README.md)
