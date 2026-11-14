@@ -14,10 +14,10 @@
   <ItemGroup>
     <ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
     <ProjectReference Include="..\Distill.Extensions.Logging\Distill.Extensions.Logging.csproj" />
-    <PackageReference Include="Aspire.Hosting" Version="13.6.0" />
-    <PackageReference Include="Aspire.Hosting.RabbitMQ" Version="13.6.0" />
+    <PackageReference Include="Aspire.Hosting" Version="13.6.5" />
+    <PackageReference Include="Aspire.Hosting.RabbitMQ" Version="13.6.5" />
     <!-- Pin the patched transitive dependency for GHSA-qhrr-8q5h-9q3h. -->
-    <PackageReference Include="MessagePack" Version="2.5.303" />
-    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.13" />
+    <PackageReference Include="MessagePack" Version="2.5.307" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.14" />
   </ItemGroup>
 </Project>
