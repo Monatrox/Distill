@@ -31,6 +31,10 @@ use mysql::MySqlSink;
 use postgres::PostgresSink;
 use sql_server::SqlServerSink;
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on already must-use boxed futures"
+)]
 #[async_trait]
 pub trait Sink: Send + Sync {
     async fn persist_event(&self, event: &LogEvent) -> Result<(), DistillError>;

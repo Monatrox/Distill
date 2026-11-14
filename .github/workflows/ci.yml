@@ -51,6 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fetch --locked
       - run: bash scripts/test-sink-contracts.sh
         env:
           DISTILL_CONTAINER_ENGINE: docker
