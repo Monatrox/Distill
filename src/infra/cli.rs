@@ -2,12 +2,14 @@
 
 // Rust guideline compliant 2026-02-21
 use crate::{
+    broker::DeadLetterClient,
     domain::SinkDefinition,
     infra::config::{HttpLimits, SinkFile},
 };
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+use std::{collections::HashMap, env, fs, path::PathBuf, time::Duration};
+use uuid::Uuid;
 
 /// Default maximum HTTP request body size in bytes.
 ///
@@ -62,6 +64,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SecretCommand,
     },
+    /// Inspect or replay broker dead-letter messages without printing payloads.
+    Dlq {
+        #[command(subcommand)]
+        command: DlqCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,6 +103,72 @@ pub enum SinkCommand {
     Create(CreateSink),
     /// List sink definitions without resolving or displaying secrets.
     List(ListSinks),
+    /// Apply versioned database migrations explicitly before production use.
+    Migrate(MigrateSink),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DlqCommand {
+    /// List safe dead-letter metadata. Payloads are never printed.
+    List(ListDlq),
+    /// Replay one selected message or every eligible message after sink recovery.
+    Replay(ReplayDlq),
+    /// Export original bytes into a new owner-only file; broker records remain retained.
+    Export(ExportDlq),
+}
+
+#[derive(Debug, Args)]
+pub struct ListDlq {
+    /// Maximum metadata records to print.
+    #[arg(long, default_value_t = 100)]
+    pub limit: u16,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  distill dlq replay --id 6cdd38e0-3bd4-47fb-b014-4a4791d228ad\n  distill dlq replay --all\n\nMessages are acknowledged only after RabbitMQ confirms republish. Poison and aggregate-input records remain retained."
+)]
+pub struct ReplayDlq {
+    /// Dead-letter message ID from `distill dlq list`.
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub id: Option<Uuid>,
+    /// Replay every eligible dead-letter message. Confirm sink recovery first.
+    #[arg(long, conflicts_with = "id", required_unless_present = "id")]
+    pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportDlq {
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub id: Option<Uuid>,
+    #[arg(long, conflicts_with = "id", required_unless_present = "id")]
+    pub all: bool,
+    /// New JSONL output file. Contains protected original bytes; never written to stdout.
+    #[arg(long)]
+    pub file: PathBuf,
+}
+
+impl ExportDlq {
+    async fn run(self) -> anyhow::Result<()> {
+        let uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required for DLQ commands")?;
+        let client = DeadLetterClient::connect(&uri).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&self.file)
+            .await
+            .context("creating a new protected DLQ export file")?;
+        let count = client.export(&mut file, self.id).await.context(
+            "DLQ export incomplete; partial file retained and broker records remain recoverable",
+        )?;
+        if self.id.is_some() && count == 0 {
+            bail!("selected record was not found; broker records remain retained");
+        }
+        println!("exported: {count}; broker records remain retained");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +202,41 @@ pub struct CreateSink {
 }
 
 #[derive(Debug, Args)]
+pub struct MigrateSink {
+    pub sink_id: String,
+    #[arg(long, default_value = "sinks.json")]
+    pub file: PathBuf,
+}
+
+impl MigrateSink {
+    async fn run(self) -> anyhow::Result<()> {
+        let manifest = read_manifest(&self.file)?;
+        let definition = manifest
+            .sinks
+            .iter()
+            .find(|sink| sink.sink_id == self.sink_id)
+            .context("selected sink is not present in the manifest")?;
+        let config = crate::infra::config::resolve_sink(definition)?;
+        if config.driver == "http" {
+            bail!("HTTP receiver migrations are managed by the receiver");
+        }
+        crate::persistence::build_sink(
+            &config,
+            &crate::persistence::SinkAllowlist::default(),
+            true,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "sink migration failed; check migration credentials and target database"
+            )
+        })?;
+        println!("sink schema version 1 applied");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct ListSinks {
     /// Sink manifest to inspect.
     #[arg(long, default_value = "sinks.json")]
@@ -149,17 +257,74 @@ impl Cli {
         }
     }
 
-    pub fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
         match self.command.context("a CLI command is required")? {
             Command::Sink { command } => match command {
                 SinkCommand::Create(command) => command.run(),
                 SinkCommand::List(command) => command.run(),
+                SinkCommand::Migrate(command) => command.run().await,
             },
             Command::Secret { command } => match command {
                 SecretCommand::FileWrite(command) => command.run(),
                 SecretCommand::EnvWrite(command) => command.run(),
             },
+            Command::Dlq { command } => match command {
+                DlqCommand::List(command) => command.run().await,
+                DlqCommand::Replay(command) => command.run().await,
+                DlqCommand::Export(command) => command.run().await,
+            },
         }
+    }
+}
+
+impl ListDlq {
+    async fn run(self) -> anyhow::Result<()> {
+        let uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required for DLQ commands")?;
+        let client = DeadLetterClient::connect(&uri).await?;
+        let count = client.count().await?;
+        let records = client.list(self.limit).await?;
+        println!("dead-letter count: {count}");
+        for record in records {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                record.id,
+                record.failed_at.to_rfc3339(),
+                record.failure_category,
+                record
+                    .retry_count
+                    .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+                record
+                    .envelope_version
+                    .map_or_else(|| "unknown".to_string(), |version| version.to_string()),
+                record
+                    .original_message_id
+                    .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+                record.original_exchange,
+                record.original_routing_key,
+            );
+        }
+        Ok(())
+    }
+}
+
+impl ReplayDlq {
+    async fn run(self) -> anyhow::Result<()> {
+        let uri = env::var("RABBITMQ_URI").context("RABBITMQ_URI is required for DLQ commands")?;
+        let client = DeadLetterClient::connect(&uri).await?;
+        let summary = client.replay(self.id).await?;
+        println!(
+            "replayed: {}; retained: {}; invalid: {}",
+            summary.replayed, summary.retained, summary.invalid
+        );
+        if self.id.is_some() && summary.replayed == 0 {
+            bail!("selected dead-letter message was not found or is not eligible for replay");
+        }
+        if summary.invalid > 0 {
+            bail!(
+                "one or more dead-letter records are malformed; eligible records were replayed, but invalid records remain for repair"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -296,4 +461,37 @@ fn write_manifest(path: &PathBuf, manifest: &SinkFile) -> anyhow::Result<()> {
     let contents = serde_json::to_string_pretty(manifest).context("serializing sink manifest")?;
     fs::write(path, format!("{contents}\n"))
         .with_context(|| format!("writing sink manifest {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn dlq_replay_requires_exactly_one_selector() {
+        assert!(Cli::try_parse_from(["distill", "dlq", "replay"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "distill",
+                "dlq",
+                "replay",
+                "--all",
+                "--id",
+                "00000000-0000-0000-0000-000000000001",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["distill", "dlq", "replay", "--all"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "distill",
+                "dlq",
+                "replay",
+                "--id",
+                "00000000-0000-0000-0000-000000000001",
+            ])
+            .is_ok()
+        );
+    }
 }

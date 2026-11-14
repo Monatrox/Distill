@@ -39,6 +39,8 @@ pub struct LogEvent {
     pub event_id: EventId,
     pub timestamp: DateTime<Utc>,
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub severity_level: SeverityLevel,
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing)]
@@ -84,11 +86,6 @@ pub const MAX_MAILBOX_CAPACITY: usize = 65_536;
 ///
 /// Bound the TTL so a misconfiguration cannot suppress flushes indefinitely.
 pub const MAX_TTL_SECONDS: u64 = 86_400;
-/// Maximum configured retention period, in hours.
-///
-/// 900 days is a generous hard ceiling for on-demand logging without
-/// accepting values that are clearly mistakes.
-pub const MAX_RETENTION_HOURS: u32 = 21_600;
 /// Maximum channel identifier length.
 ///
 /// Channel IDs are embedded in `RabbitMQ` exchange and routing-key names; the

@@ -51,8 +51,8 @@ const FORBIDDEN_V6_RANGES: [(Ipv6Addr, u8); 9] = [
 /// default ports. Entries are `host[:port]`, `cidr[:port]`, or `:port`.
 #[derive(Debug, Clone, Default)]
 pub struct SinkAllowlist {
-    hosts: Vec<String>,
-    cidrs: Vec<(IpAddr, u8)>,
+    hosts: Vec<(String, Option<u16>)>,
+    cidrs: Vec<(IpAddr, u8, Option<u16>)>,
     ports: Vec<u16>,
 }
 
@@ -80,10 +80,9 @@ impl SinkAllowlist {
                 continue;
             }
             if spec.contains('/') {
-                allowlist.cidrs.push(
-                    parse_cidr(spec)
-                        .map_err(|error| format!("invalid allowlist entry '{entry}': {error}"))?,
-                );
+                let (network, prefix) = parse_cidr(spec)
+                    .map_err(|error| format!("invalid allowlist entry '{entry}': {error}"))?;
+                allowlist.cidrs.push((network, prefix, port));
             } else if spec.parse::<IpAddr>().is_ok() {
                 return Err(format!(
                     "invalid allowlist entry '{entry}': raw IP addresses must use CIDR notation"
@@ -91,27 +90,60 @@ impl SinkAllowlist {
             } else if !is_valid_hostname(spec) {
                 return Err(format!("invalid allowlist entry '{entry}'"));
             } else {
-                allowlist.hosts.push(spec.to_ascii_lowercase());
-            }
-            if let Some(port) = port {
-                allowlist.ports.push(port);
+                allowlist.hosts.push((spec.to_ascii_lowercase(), port));
             }
         }
         Ok(allowlist)
     }
 
-    fn allows_host(&self, host: &str) -> bool {
-        self.hosts.iter().any(|allowed| allowed == host)
-    }
-
-    fn allows_ip(&self, ip: IpAddr) -> bool {
-        self.cidrs
+    fn allows_host(&self, host: &str, port: u16) -> bool {
+        self.hosts
             .iter()
-            .any(|(network, prefix)| ip_in_cidr(ip, *network, *prefix))
+            .any(|(allowed, rule_port)| allowed == host && self.matches_port(*rule_port, port))
     }
 
-    fn allows_port(&self, port: u16) -> bool {
-        self.ports.contains(&port)
+    fn allows_ip(&self, ip: IpAddr, port: u16) -> bool {
+        self.cidrs.iter().any(|(network, prefix, rule_port)| {
+            ip_in_cidr(ip, *network, *prefix) && self.matches_port(*rule_port, port)
+        })
+    }
+
+    fn matches_port(&self, rule_port: Option<u16>, port: u16) -> bool {
+        rule_port.map_or_else(
+            || DEFAULT_HTTP_SINK_PORTS.contains(&port) || self.ports.contains(&port),
+            |allowed| allowed == port,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PolicyResolver {
+    allowlist: SinkAllowlist,
+    port: u16,
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.clone();
+        Box::pin(async move {
+            let host = name.as_str();
+            let addresses: Vec<_> = tokio::net::lookup_host((host, policy.port))
+                .await?
+                .collect();
+            if addresses.is_empty()
+                || (!policy.allowlist.allows_host(host, policy.port)
+                    && addresses.iter().any(|address| {
+                        is_forbidden_ip(address.ip())
+                            && !policy.allowlist.allows_ip(address.ip(), policy.port)
+                    }))
+            {
+                return Err(std::io::Error::other(
+                    "HTTP sink DNS resolved to a prohibited destination",
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -124,52 +156,54 @@ impl SinkAllowlist {
 ///
 /// # Errors
 /// Returns an error when the endpoint violates the policy.
-pub fn validate_sink_url(endpoint: &str, allowlist: &SinkAllowlist) -> Result<(), String> {
-    let url =
-        reqwest::Url::parse(endpoint).map_err(|error| format!("invalid HTTP sink URL: {error}"))?;
+#[cfg(test)]
+fn validate_sink_url(endpoint: &str, allowlist: &SinkAllowlist) -> Result<(), String> {
+    resolve_sink_url(endpoint, allowlist).map(|_| ())
+}
+
+pub(super) fn resolve_sink_url(
+    endpoint: &str,
+    allowlist: &SinkAllowlist,
+) -> Result<PolicyResolver, String> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid HTTP sink URL".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("HTTP sink URL scheme must be http or https".to_string());
     }
     let port = url.port_or_known_default().unwrap_or(80);
-    if !DEFAULT_HTTP_SINK_PORTS.contains(&port) && !allowlist.allows_port(port) {
-        return Err(format!(
-            "HTTP sink port {port} is not allowed; add it to the sink allowlist"
-        ));
-    }
     let host = url
         .host_str()
-        .ok_or_else(|| "HTTP sink URL must include a host".to_string())?;
-    match host.parse::<IpAddr>() {
-        Ok(ip) => {
-            if allowlist.allows_ip(ip) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "HTTP sink URL uses IP address {ip}; raw addresses require an allowlisted CIDR"
-                ))
-            }
-        }
-        Err(_) => validate_hostname(host, allowlist),
+        .ok_or("HTTP sink URL must include a host")?
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    let resolver = PolicyResolver {
+        allowlist: allowlist.clone(),
+        port,
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if allowlist.allows_ip(ip, port) {
+            Ok(resolver)
+        } else {
+            Err("raw addresses require an allowlisted CIDR and port".to_string())
+        };
     }
-}
-
-fn validate_hostname(host: &str, allowlist: &SinkAllowlist) -> Result<(), String> {
-    let normalized = host.to_ascii_lowercase();
-    if allowlist.allows_host(&normalized) {
-        return Ok(());
+    if allowlist.allows_host(&host, port) {
+        return Ok(resolver);
     }
-    let addresses = (normalized.as_str(), 0)
+    if !DEFAULT_HTTP_SINK_PORTS.contains(&port) && !allowlist.ports.contains(&port) {
+        return Err("HTTP sink destination port is not allowed".to_string());
+    }
+    let addresses: Vec<_> = (host.as_str(), port)
         .to_socket_addrs()
-        .map_err(|error| format!("HTTP sink host '{host}' could not be resolved: {error}"))?;
-    for address in addresses {
-        let ip = address.ip();
-        if is_forbidden_ip(ip) && !allowlist.allows_ip(ip) {
-            return Err(format!(
-                "HTTP sink host '{host}' resolves to {ip}, which is not an allowed destination; add it to the sink allowlist"
-            ));
-        }
+        .map_err(|_| "HTTP sink host could not be resolved".to_string())?
+        .collect();
+    if addresses.is_empty()
+        || addresses.iter().any(|address| {
+            is_forbidden_ip(address.ip()) && !allowlist.allows_ip(address.ip(), port)
+        })
+    {
+        return Err("HTTP sink resolves to a destination that is not allowed".to_string());
     }
-    Ok(())
+    Ok(resolver)
 }
 
 fn is_forbidden_ip(ip: IpAddr) -> bool {
@@ -310,8 +344,18 @@ mod tests {
     #[test]
     fn allowlist_parsing_accepts_ipv6_cidrs() {
         let allowlist = SinkAllowlist::parse("2001:db8::/32,fe80::/10:8080").unwrap();
-        assert!(allowlist.allows_ip("2001:db8::1".parse().unwrap()));
-        assert!(!allowlist.allows_ip("2001:db9::1".parse().unwrap()));
+        assert!(allowlist.allows_ip("2001:db8::1".parse().unwrap(), 80));
+        assert!(!allowlist.allows_ip("2001:db9::1".parse().unwrap(), 80));
+    }
+
+    #[test]
+    fn host_and_cidr_ports_do_not_cross_authorize_each_other() {
+        let allowlist = SinkAllowlist::parse("first:9090,second:9091,10.20.0.0/16:9092").unwrap();
+        assert!(allowlist.allows_host("first", 9090));
+        assert!(!allowlist.allows_host("first", 9091));
+        assert!(!allowlist.allows_host("second", 9092));
+        assert!(!allowlist.allows_ip("10.20.1.1".parse().unwrap(), 9090));
+        assert!(allowlist.allows_ip("10.20.1.1".parse().unwrap(), 9092));
     }
 
     #[test]

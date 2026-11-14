@@ -27,7 +27,7 @@ Distill lets you decide, channel by channel, what deserves a permanent seat at t
 
 - Keep every error and critical event for investigation.
 - Preserve warnings while turning routine activity into compact counts.
-- Track latency, size, temperature, or throughput with rolling averages.
+- Track latency, size, temperature, or throughput with rolling averages across all supported sinks.
 - Measure the minimum, maximum, sum, or average of a numeric property.
 - Calculate the average time between events.
 - Store everything for an audit stream when completeness matters more than compression.
@@ -104,7 +104,7 @@ Channels select their sink when they are created:
 }
 ```
 
-The HTTP driver posts each event or aggregate as JSON to the configured URL. Custom headers can be supplied for authentication. A `2xx` response, or `409 Conflict` for an already-known record, acknowledges delivery; other responses are retried or dead-lettered by the normal delivery path.
+The HTTP driver posts each event or aggregate as JSON to the configured URL. Custom headers can be supplied for authentication. Only a `2xx` response acknowledges delivery. `409 Conflict` means an identity/revision conflict and is never a duplicate-success response. See the receiver contract below.
 
 ```json
 {
@@ -119,7 +119,7 @@ The HTTP driver posts each event or aggregate as JSON to the configured URL. Cus
 }
 ```
 
-HTTP receivers should deduplicate using `X-Distill-Record-Id`. The record type is supplied in `X-Distill-Record-Type` as either `event` or `aggregate`.
+HTTP receivers atomically apply the contract below using `X-Distill-Record-Id`, `X-Distill-Record-Type`, and `X-Distill-Update-Revision`. Distill computes rolling snapshots; receivers do not merge windows themselves.
 
 The service also uses bounded mailboxes, buffers, and process memory accounting. A database outage should create controlled backpressure and a visible delivery problem—not an unbounded memory spiral.
 
@@ -175,75 +175,50 @@ The Compose file uses separate development keys for ingestion and administration
 
 Compose intentionally includes no database or default sink. It remains unready and rejects logs until a sink-backed channel is configured.
 
-### 2. Configure a sink with the CLI
+### 2. Register a sink and channel at runtime
 
-The CLI writes a sink manifest without storing database credentials in it. Create it before starting Distill, or mount it and restart Distill after configuration. Set the secret in the environment used by the Distill process:
+Applications can provision configuration during deployment/startup through the private admin listener. No Distill restart is required. This HTTP example needs an existing conforming receiver; its host/port must pass the configured outbound destination policy.
 
-```powershell
-$env:DISTILL_POSTGRES_URL = "postgresql://distill:password@host.docker.internal:5432/logs"
-distill sink create postgres-primary `
-  --driver postgres `
-  --connection-string-env DISTILL_POSTGRES_URL `
-  --file sinks.json `
-  --default
-```
+```http
+POST http://127.0.0.1:8081/sinks
+X-API-Key: your-config-key
+Content-Type: application/json
 
-Set `DISTILL_SINKS_CONFIG_PATH` and mount the manifest plus its secret into the Distill container before startup. Changing either requires a restart.
-
-For an advanced/custom integration, use the HTTP sink and keep its bearer token outside the manifest:
-
-```powershell
-$env:DISTILL_COLLECTOR_TOKEN = "replace-me"
-distill sink create custom-http `
-  --driver http `
-  --url https://collector.example.com/distill `
-  --bearer-token-env DISTILL_COLLECTOR_TOKEN `
-  --file sinks.json `
-  --default
-```
-
-See [the complete CLI guide](docs/cli.md) for secret files, deployment manifests, sink listing, and security guidance.
-
-### 3. Create a channel
-
-Channels reference a named sink, or use the configured default when `sink_id` is omitted. Credentials and connection strings do not belong in channel definitions.
-
-```powershell
-$channel = @'
 {
-  "channel_id": "orders.production",
-  "severity_threshold": "warning",
-  "rabbitmq_config": {
-    "connection_string": "amqp://guest:guest@rabbitmq:5672/%2f",
-    "exchange_name": "distill.orders.production",
-    "routing_key_prefix": "orders."
-  },
-  "sink_id": "postgres-primary",
-  "aggregator": {
-    "function": "count",
-    "granularity": "per_t_time",
-    "parameter": 60,
-    "rolling": false
-  },
-  "retention_hours": 720,
-  "compression_enabled": false,
-  "buffer_bytes": 52428800,
-  "ttl_seconds": 3600,
-  "mailbox_capacity": 1024,
-  "ordering": "first_come_first_served",
-  "allowed_lateness_ms": 5000
+  "name": "payments-receiver",
+  "version": "1",
+  "config": {
+    "driver": "http",
+    "connection_string": "https://collector.example.com/records",
+    "headers": { "Authorization": "Bearer receiver-secret" }
+  }
 }
-'@
-
-Invoke-WebRequest `
-  -Method Put `
-  -Uri http://127.0.0.1:8081/channels/orders.production `
-  -Headers @{ "X-API-Key" = "change-me-admin-in-development" } `
-  -ContentType "application/json" `
-  -Body $channel
 ```
 
-The channel setup connects to the named sink, initializes the required tables when applicable, registers the RabbitMQ exchange, and starts the channel actor.
+The response contains `sink_id: "payments-receiver@1"`. Submit secrets over a protected connection; they are not returned by configuration reads. The receiver must be reachable from the Distill container. Registering identical content again succeeds; changing content under the same sink identity returns `409`. Use a new version for a new destination.
+
+```http
+POST http://127.0.0.1:8081/channels
+X-API-Key: your-config-key
+Content-Type: application/json
+
+{
+  "name": "orders.production",
+  "version": "2026.11",
+  "preset": "count",
+  "sink_id": "payments-receiver@1"
+}
+```
+
+Channel name plus version is immutable. Identical declarations reconcile safely; changed configuration requires a new version. Producers explicitly send `version` alongside `channel_id`; old and new versions coexist. Use `?version=2026.11` on channel configuration/lifecycle/flush admin routes. Unversioned channels remain supported as a separate identity, without implicit latest-version routing.
+
+For database sinks, run explicit schema migrations before registration:
+
+```sh
+distill sink migrate postgres-primary --file sinks.json
+```
+
+See [the CLI guide](docs/cli.md) for optional startup manifests and secret references. There is no required default sink. Runtime configuration is persisted in Distill's internal state store.
 
 ### A simpler channel request
 
@@ -258,8 +233,7 @@ Then create a channel with only its intent and any overrides you need:
 ```powershell
 $request = '{
   "name": "checkout.latency",
-  "preset": "metrics",
-  "retention_hours": 720
+  "preset": "metrics"
 }'
 
 Invoke-RestMethod `
@@ -270,7 +244,7 @@ Invoke-RestMethod `
   -Body $request
 ```
 
-Available presets are `raw_events`, `errors_only`, `metrics`, `audit`, and `count`. Presets are starting points, not restrictions: send `severity_threshold`, `aggregator`, buffering, ordering, retention, or other supported properties to override them. Set `"aggregator": null` explicitly when a preset’s aggregation should be disabled.
+Available presets are `raw_events`, `errors_only`, `metrics`, `audit`, and `count`. Presets are starting points, not restrictions: send `severity_threshold`, `aggregator`, buffering, ordering, or other supported properties to override them. Set `"aggregator": null` explicitly when a preset’s aggregation should be disabled. Startup configuration is optional. Runtime definitions, versions and lifecycle state survive process/container replacement when the state volume is retained.
 
 Use `POST /channels/validate` with the same request shape to resolve and validate a channel without registering it.
 
@@ -283,6 +257,7 @@ $event = @'
     "event_id": "0c0c8e36-0f93-4d42-8c2d-b4faec8d6f17",
     "timestamp": "2026-08-02T15:04:05Z",
     "channel_id": "orders.production",
+    "version": "2026.11",
     "severity_level": "info",
     "payload": {
       "message": "Order created",
@@ -409,22 +384,24 @@ That gives you a compact view of normal behavior and a detailed trail when somet
 
 ## HTTP API
 
-Ingestion and metrics requests require the ingest key and use the public listener. Management requests require the separate admin key and are only served by the loopback-only administrative listener. Invalid or missing credentials return `401 Unauthorized`.
+Ingestion and metrics requests require the ingest key and use the public listener. Management requests require the configured admin key (the ingest key by default) and are only served by the loopback-only administrative listener. Invalid or missing credentials return `401 Unauthorized`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Process liveness, including idle startup |
+| `GET` | `/ready` | Active channel and broker-consumer/publisher readiness |
+| `POST` | `http://127.0.0.1:8081/sinks` | Register an immutable versioned destination |
 | `GET` | `/metrics` | Prometheus-style service metrics; requires the ingest key |
 | `POST` | `/ingest` | Ingest one or more JSON events |
 | `POST` | `/ingest` with Protobuf | Ingest a Protobuf `IngestRequest` |
 | `POST` | `/v1/logs` | Ingest OTLP/HTTP JSON log records |
 | `POST` | `http://127.0.0.1:8081/channels` | Create a channel from a preset and overrides |
 | `POST` | `http://127.0.0.1:8081/channels/validate` | Validate and resolve a channel request |
-| `PUT` | `http://127.0.0.1:8081/channels/{channel_id}` | Create or replace a channel |
+| `PUT` | `http://127.0.0.1:8081/channels/{channel_id}` | Reconcile an immutable channel definition |
 | `GET` | `http://127.0.0.1:8081/channels/{channel_id}/config` | Inspect sanitized effective configuration |
 | `POST` | `https://localhost/channels/{channel_id}/events` | Ingest one simple event for a channel |
 | `POST` | `http://127.0.0.1:8081/channels/{channel_id}/test` | Preview validation and routing for an event |
-| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/schema` | Register or replace a runtime schema |
+| `POST` | `http://127.0.0.1:8081/channels/{channel_id}/schema` | Legacy unversioned schema registration; include schema in versioned declarations |
 | `POST` | `http://127.0.0.1:8081/channels/{channel_id}/pause` | Stop accepting events while retaining the channel |
 | `POST` | `http://127.0.0.1:8081/channels/{channel_id}/resume` | Resume a paused channel |
 | `POST` | `http://127.0.0.1:8081/channels/{channel_id}/flush` | Flush the active aggregate window |
@@ -440,11 +417,11 @@ Ingestion and metrics requests require the ingest key and use the public listene
 - `severity_level` — `unknown`, `trace`, `debug`, `info`, `warning`, `error`, or `critical`;
 - `payload` — any JSON value.
 
-`event_id` is optional, but stable UUIDs are strongly recommended. They allow idempotent retries when a response is lost after successful admission. `metadata` is optional and is a string-to-string map.
+`event_id` is optional, but a stable UUID is required for retry-safe contributions. Reuse the entire original event, including timestamp, on retry. They allow idempotent retries when a response is lost after successful admission. `metadata` is optional and is a string-to-string map.
 
 ### OpenTelemetry Logs
 
-Distill also accepts OTLP/HTTP JSON at `POST /v1/logs`. Supply the destination through `X-Distill-Channel` or the OTLP resource attribute `distill.channel`. OTLP resource and record attributes are preserved as structured event properties, and trace/span identifiers are retained in metadata.
+Distill also accepts OTLP/HTTP JSON at `POST /v1/logs`. Supply the destination through `X-Distill-Channel` or the OTLP resource attribute `distill.channel`. Set `distill.version` for versioned channels and `distill.event_id` to a stable UUID for retry-safe OTLP requests. OTLP resource and record attributes are preserved as structured event properties, and trace/span identifiers are retained in metadata.
 
 ```http
 POST /v1/logs
@@ -457,7 +434,7 @@ The adapter feeds the same validation, severity routing, aggregation, RabbitMQ d
 
 ### Protobuf ingestion
 
-Send `application/protobuf` or `application/x-protobuf` containing the `IngestRequest` envelope defined in `src/proto.rs`. Protobuf is useful when producers already use generated contracts or when compact wire representation matters.
+Send `application/protobuf` or `application/x-protobuf` containing the `IngestRequest` envelope defined in `src/core/proto.rs`. Protobuf is useful when producers already use generated contracts or when compact wire representation matters.
 
 ### Runtime schemas
 
@@ -478,11 +455,13 @@ Distill is designed around a clear handoff contract:
 3. Distill publishes the event or aggregate to RabbitMQ.
 4. RabbitMQ confirms durable publication.
 5. The internal consumer writes to the channel’s configured sink.
-6. The consumer acknowledges only after an idempotent sink write succeeds.
+6. The consumer acknowledges after an idempotent sink write succeeds or after a confirmed handoff to retry/DLQ storage.
 
-If the configured sink is temporarily unavailable, messages are retried with bounded backoff. Exhausted messages are sent to the durable `distill.dead-letter` exchange and queue for operator investigation.
+If the configured sink is temporarily unavailable, messages move through durable quorum TTL retry queues configured for RabbitMQ at-least-once dead-lettering; consumer tasks never sleep while holding the shared delivery path. Exhausted or malformed deliveries move to the durable `distill.dead-letter` exchange and queue with bounded failure metadata and original broker bytes. Use `distill dlq list` to inspect metadata and `distill dlq replay --id <message-id>` or `--all` only after destination recovery. Replay is intentionally limited to valid, exhausted direct-persistence records; poison and aggregate-input records remain retained because replaying their unchanged bytes is unsafe. Default CLI output never prints payloads.
 
-Because writes are idempotent, producers should retry an event using the same `event_id` when a request times out.
+Delivery, retry, dead-letter, and aggregate-generation queues cap at 1,000,000 messages or 1 GiB with `reject-publish`. A full queue rejects publication, so ingest returns non-success instead of `202`. Configure RabbitMQ disk alarms and alert on queue depth, oldest-message age, DLQ count, and broker disk watermark; a full DLQ leaves original delivery recoverable rather than discarding failure.
+
+Direct event and aggregate-output sink writes are idempotent by their stable record IDs. Producers should retry an event using the same `event_id` when a request times out. Source IDs and content fingerprints are committed atomically with aggregate checkpoints in SQLite before source acknowledgement. Pending aggregate snapshots use a durable outbox and duplicate-safe sink updates. Aggregate-input CLI replay remains disabled pending its separate recovery contract; export is available.
 
 ## Configuration
 
@@ -509,11 +488,18 @@ Distill requires:
 |---|---:|---|
 | `RABBITMQ_URI` | Yes | Process-level RabbitMQ connection |
 | `DISTILL_INGEST_API_KEY` | Yes | API key for public ingestion endpoints |
-| `DISTILL_ADMIN_API_KEY` | Yes | Separate API key for loopback-only management endpoints; must differ from the ingest key |
+| `DISTILL_ADMIN_API_KEY` | No | Management key; defaults to the ingest key. A separate key is optional. |
+| `DISTILL_STATE_PATH` | No | Durable internal SQLite path; default `data/state.sqlite3`, image `/var/lib/distill/state.sqlite3` |
+| `DISTILL_STATE_MAX_BYTES` | No | Main SQLite DB cap, default 1 GiB; WAL/journal and filesystem overhead require additional disk |
+| `DISTILL_MAX_CHANNELS` / `DISTILL_MAX_SINKS` | No | Retained channel/version and registered-sink ceilings; default 500 each |
+| `DISTILL_AUTO_MIGRATE` | No | Default `false`; explicit migrations required. `true` is for development fixtures. |
+| `DISTILL_SINK_ALLOWLIST` | No | Explicit HTTP destination host:port/CIDR policy for private targets |
 | `DISTILL_BIND_ADDRESS` | No | Public ingestion/metrics bind address; defaults to `127.0.0.1:8080` |
-| `DISTILL_ADMIN_BIND_ADDRESS` | No | Loopback-only administrative bind address; defaults to `127.0.0.1:8081` and rejects non-loopback addresses |
+| `DISTILL_ADMIN_BIND_ADDRESS` | No | Administrative bind address; defaults to loopback `127.0.0.1:8081` |
+| `DISTILL_ALLOW_ADMIN_NETWORK` | No | Set `true` only for a private network endpoint such as Aspire service discovery; permits a non-loopback administrative bind |
 | `DISTILL_REQUEST_BODY_LIMIT_BYTES` | No | Maximum HTTP request body size; defaults to `2097152`, `0` disables |
 | `DISTILL_REQUEST_TIMEOUT_SECONDS` | No | Maximum HTTP request duration; defaults to `30`, `0` disables |
+| `DISTILL_SHUTDOWN_TIMEOUT_SECONDS` | No | Maximum confirmed aggregate flush duration; defaults to `30` and must be positive |
 | `DISTILL_MAX_CONCURRENT_REQUESTS` | No | Maximum simultaneous HTTP requests; defaults to `128`, `0` disables |
 | `DISTILL_MAX_REQUESTS_PER_MINUTE` | No | Process-wide rolling request allowance; defaults to `6000`, `0` disables |
 | `DISTILL_CONFIG_PATH` | No | JSON file containing startup channel definitions |
@@ -536,8 +522,6 @@ Startup configuration uses this shape:
       },
       "sink_id": "postgres-primary",
       "aggregator": null,
-      "retention_hours": 2160,
-      "compression_enabled": false,
       "buffer_bytes": 52428800,
       "ttl_seconds": 3600,
       "mailbox_capacity": 1024,
@@ -549,6 +533,32 @@ Startup configuration uses this shape:
 ```
 
 Keep API keys and database credentials in environment variables, secret stores, or deployment configuration. Do not commit them to source control or place them in event payloads.
+
+## HTTP receiver contract
+
+All deliveries carry `X-Distill-Contract-Version: 1`, a record type (`event` or `aggregate`), record ID, and update revision. The JSON body is the event or aggregate. A receiver must commit before returning success:
+
+- Events: first ID stores the event; identical repeated content succeeds; different content under the same ID returns `409`. Use globally unique event UUIDs, including across channels sharing a destination.
+- Aggregates: `aggregate_id` is stable for a rolling series, `update_revision` increases, and the body is a complete cumulative snapshot. Atomically replace only with a newer revision. Equal revision/equal content and older revisions succeed without changing stored state. Equal revision/different content returns `409`.
+- Return `2xx` only after these effects are durable. `408`, `429`, transport failures and `5xx` are retried; other `4xx` fail into the DLQ. A receiver must never return success for an unapplied required write.
+
+Run the standard-library reference receiver:
+
+```sh
+DISTILL_RECEIVER_TOKEN=dev-token python3 examples/http_receiver.py --help
+```
+
+It provides authenticated `POST /records` and `GET /records/{id}` plus `/health` using SQLite. GET is a reference/testing inspection endpoint; Distill's current write contract does not require receivers to host its configuration or recovery catalog. Developer-owned implementations can use any storage that meets the observable contract. Run `scripts/test-sink-contracts.sh` for the PostgreSQL, MySQL, SQL Server and reference HTTP contract suite. `scripts/test-http-only.sh` exercises the actual server with runtime registration, rolling snapshots and restart/deduplication using only RabbitMQ and the HTTP receiver.
+
+## State, recovery and V1 deployment limits
+
+Run one active Distill instance per dedicated RabbitMQ vhost. Retain both RabbitMQ data and Distill's private state volume during container replacement. The state directory must be owned by the service user with no group/other access; new directories/files are created with restrictive permissions. It contains resolved sink credentials, configuration, processed event identities, checkpoints and pending outputs. Back it up as sensitive transactional state together with the broker; do not delete it as a cache. A file lock rejects concurrent processes sharing the same SQLite state.
+
+Deduplication history currently has no automatic age eviction. Its guarantee lasts while that state is retained; restoring an older database or deleting state ends that guarantee for omitted IDs. Capacity exhaustion fails processing visibly and keeps source work recoverable through broker retry/DLQ. Monitor state size and broker/DLQ depth. The 1 GiB main-database ceiling is a safety limit, not a measured workload recommendation; allow extra WAL/journal and disk headroom.
+
+SQLite WAL requires local-disk-compatible persistence. Azure Container Apps/Azure Files compatibility is **not validated** and remains a production release gate. Multiple logger replicas, automatic revision retirement, retention/compression, and cross-version aggregate merging are deferred. Old channel versions and their queues remain retained and count toward configured caps. Credential rotation and stronger secret storage are a fast follow; current confidentiality relies on protected transport, private storage and safe diagnostics.
+
+V1 has passed local qualification; production release gates remain open for target storage and restore, hosted CI on the release revision, remaining fault/soak coverage, and target-specific operations. Existing pre-V1 rolling delta messages are incompatible with cumulative snapshots: drain them with the old revision before upgrading. There is no automatic queue/schema/data downgrade.
 
 ## Build and test locally
 
@@ -568,6 +578,20 @@ podman build -t distill .
 
 The container listens on port `8080` and runs as an unprivileged `distill` user.
 
+### Real Aspire application qualification
+
+The local DistillTesting sample can run managed PostgreSQL, application-registered HTTP-only, and external-reference scenarios. Its AppHost requires `UserSecretsId` so generated credentials survive local runs. Set a unique `VerificationRun` for isolated test volumes and `VerificationOutput` to a JSON path inside a private directory. `VerificationSink=http` selects HTTP-only mode. The sample enables verification endpoints only in Development.
+
+After starting the updated AppHost, run:
+
+```sh
+python3 scripts/test-aspire-application.py --endpoints /private/endpoints.json --output /private/evidence.json
+```
+
+The driver validates both producer versions and persisted values, restarts the isolated logger/broker, and exercises concurrent registration/ingestion. `--previous-output` additionally checks recovered data and retries old IDs. The optional Playwright driver `scripts/test-aspire-ui.cjs` clicks the actual counter and renders weather; it requires an installed Playwright module/browser. The DistillTesting sample is a separate local checkout and is not included in this repository. Local qualification does not establish hosted CI or production-target readiness.
+
+Back up broker, SQLite state, destinations and stable credential configuration coherently. A tested local procedure stops the deployment, exports the volumes, saves their **container UID/GID/mode**, and imports into new volumes before restoring that metadata and starting the same resource identities. The tested Podman export omitted volume-root metadata; preserve it separately. Keep archives and credential backups private. Production-target/off-host restore still needs its own rehearsal.
+
 ## When Distill is a good fit
 
 Choose Distill when you want:
@@ -576,7 +600,7 @@ Choose Distill when you want:
 - explicit control over what is stored in detail;
 - compact aggregate metrics derived from high-volume event streams;
 - per-channel processing policies;
-- PostgreSQL ownership of the persisted data;
+- ownership of persisted data in a supported sink;
 - a self-hosted deployment with familiar infrastructure;
 - durable handoff and bounded behavior during downstream failures.
 
@@ -604,9 +628,8 @@ The guiding goal is simple:
 
 - [.NET SDK](clients/dotnet/README.md)
 - [.NET `ILogger` provider](clients/dotnet/Distill.Extensions.Logging/README.md)
-- [Communication surface improvements](docs/communication_surface_improvements.md)
+- [Aspire integration](clients/dotnet/Distill.Aspire/README.md)
+- [CLI guide](docs/cli.md)
 - [C#/.NET integration guide](docs/csharp_integration.md)
-- [Technical specification](docs/technical_specification.md)
-- [Architecture overview](docs/architecture_overview.md)
-- [Error handling](docs/error_handling.md)
-- [Development guidelines](docs/development_guidelines.md)
+- [Security and credential handling](docs/security.md)
+- [Documentation index](docs/README.md)

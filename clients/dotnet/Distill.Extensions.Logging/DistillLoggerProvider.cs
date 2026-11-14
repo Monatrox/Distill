@@ -1,158 +1,163 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text.Json;
 using System.Threading.Channels;
 using Distill.Client;
 using Microsoft.Extensions.Logging;
 
 namespace Distill.Extensions.Logging;
 
-/// Provides Microsoft.Extensions.Logging integration for Distill.
+/// Provides bounded, observable delivery through Microsoft.Extensions.Logging.
 public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalScope, IAsyncDisposable
 {
-    private readonly Distill.Client.DistillClient client;
+    private readonly Lazy<DistillClient> client;
     private readonly DistillLoggerOptions options;
-    private readonly ConcurrentDictionary<string, Channel<QueuedLog>> channelQueues = new();
-    private readonly Channel<byte> wakeSignal;
-    private readonly CancellationTokenSource shutdown = new();
-    private readonly Task worker;
+    private readonly ConcurrentDictionary<string, Channel<DistillEvent>> channelQueues = new();
     private readonly ConcurrentDictionary<string, DistillLogger> loggers = new();
-    private IExternalScopeProvider scopeProvider = new LoggerExternalScopeProvider();
-
-    /// Initializes a provider that batches log records through the supplied Distill client.
-    public DistillLoggerProvider(
-        Distill.Client.DistillClient client,
-        DistillLoggerOptions? options = null)
+    private readonly Channel<byte> wakeSignal = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
     {
-        this.client = client ?? throw new ArgumentNullException(nameof(client));
+        FullMode = BoundedChannelFullMode.DropWrite, SingleReader = true, SingleWriter = false
+    });
+    private readonly CancellationTokenSource shutdown = new();
+    private readonly CancellationTokenSource stopBatching = new();
+    private readonly object lifecycleGate = new();
+    private readonly Task worker;
+    private IExternalScopeProvider scopeProvider = new LoggerExternalScopeProvider();
+    private int disposed;
+    private long dropped;
+    private long failed;
+    private int inFlight;
+
+    public DistillLoggerProvider(DistillClient client, DistillLoggerOptions? options = null)
+        : this(client is null ? throw new ArgumentNullException(nameof(client)) : () => client, options)
+    {
+    }
+
+    /// Defers HTTP transport resolution until delivery, after the host logger factory exists.
+    public DistillLoggerProvider(Func<DistillClient> clientFactory, DistillLoggerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(clientFactory);
+        client = new Lazy<DistillClient>(clientFactory);
         this.options = options ?? new DistillLoggerOptions();
         this.options.Validate();
-        wakeSignal = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
-        {
-            FullMode = BoundedChannelFullMode.DropWrite,
-            SingleReader = true,
-            SingleWriter = false,
-        });
         worker = Task.Run(ProcessQueueAsync);
     }
 
-    /// Creates a logger for the specified category.
-    public ILogger CreateLogger(string categoryName) =>
-        loggers.GetOrAdd(categoryName, category => new DistillLogger(this, category));
-
-    /// Sets the scope provider used to capture structured logging scopes.
-    public void SetScopeProvider(IExternalScopeProvider scopeProvider) =>
-        this.scopeProvider = scopeProvider ?? throw new ArgumentNullException(nameof(scopeProvider));
-
-    /// Stops the provider and flushes records already accepted into its queue.
+    public long DroppedCount => Interlocked.Read(ref dropped);
+    public long DeliveryFailureCount => Interlocked.Read(ref failed);
+    public ILogger CreateLogger(string categoryName) => loggers.GetOrAdd(categoryName, category => new DistillLogger(this, category));
+    public void SetScopeProvider(IExternalScopeProvider provider) => scopeProvider = provider ?? throw new ArgumentNullException(nameof(provider));
     public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
 
-    /// Stops the provider and flushes records already accepted into its queue.
     public async ValueTask DisposeAsync()
     {
-        CompleteAllChannelWriters();
-        wakeSignal.Writer.TryComplete();
-        try
+        lock (lifecycleGate)
         {
-            await worker;
+            if (disposed != 0) return;
+            Volatile.Write(ref disposed, 1);
+            foreach (var queue in channelQueues.Values) queue.Writer.TryComplete();
+            wakeSignal.Writer.TryComplete();
         }
-        catch (OperationCanceledException)
+        stopBatching.Cancel();
+        try { await worker.WaitAsync(options.ShutdownTimeout).ConfigureAwait(false); }
+        catch (TimeoutException)
         {
+            shutdown.Cancel();
+            int pending = Volatile.Read(ref inFlight);
+            if (pending > 0) Drop("shutdown.in_flight", pending);
+            // A transport that ignores cancellation cannot hold application shutdown forever.
+            _ = worker.ContinueWith(_ => { shutdown.Dispose(); stopBatching.Dispose(); }, TaskScheduler.Default);
+            return;
         }
         finally
         {
-            shutdown.Cancel();
-            shutdown.Dispose();
+            if (worker.IsCompleted) { shutdown.Dispose(); stopBatching.Dispose(); }
         }
     }
 
-    internal bool IsEnabled(string category, LogLevel logLevel) =>
-        logLevel != LogLevel.None && logLevel >= options.GetCategoryLevel(category);
+    internal bool IsEnabled(string category, LogLevel level) =>
+        Volatile.Read(ref disposed) == 0 && level != LogLevel.None && level >= options.GetCategoryLevel(category);
 
-    internal void Enqueue(
-        string category,
-        LogLevel logLevel,
-        EventId eventId,
-        string message,
-        Exception? exception,
-        IReadOnlyDictionary<string, object?> attributes,
-        IReadOnlyDictionary<string, string> metadata)
+    internal void Enqueue(string category, LogLevel level, EventId eventId, string message, Exception? exception,
+        IReadOnlyDictionary<string, object?> attributes, IReadOnlyDictionary<string, string> metadata)
     {
         string channel = ResolveChannel(category);
-        var channelQueue = GetOrCreateChannelQueue(channel);
-        var channelOpts = options.GetChannelOptions(channel);
-        var overflow = channelOpts.OverflowPolicy ?? options.OverflowPolicy;
-
-        var record = new QueuedLog(channel, category, logLevel, eventId, message, exception, attributes, metadata);
-
-        bool admitted;
-        if (overflow == DistillOverflowPolicy.Block)
+        Channel<DistillEvent> queue;
+        lock (lifecycleGate)
         {
-            channelQueue.Writer.WriteAsync(record, shutdown.Token).AsTask().GetAwaiter().GetResult();
-            admitted = true;
+            if (disposed != 0) { Drop(channel, 1); return; }
+            queue = channelQueues.GetOrAdd(channel, CreateQueue);
         }
-        else
+        var channelOptions = options.GetChannelOptions(channel);
+        var payload = new Dictionary<string, object?>(attributes, StringComparer.Ordinal) { ["message"] = message };
+        if (exception is not null)
         {
-            admitted = channelQueue.Writer.TryWrite(record);
+            payload["exception_type"] = exception.GetType().FullName;
+            payload["exception_message"] = exception.Message;
+            payload["exception_stacktrace"] = exception.ToString();
         }
+        var tags = new Dictionary<string, string>(metadata, StringComparer.Ordinal)
+        {
+            ["category"] = category, ["log_level"] = level.ToString()
+        };
+        if (eventId.Id != 0) tags["event_id"] = eventId.Id.ToString();
+        if (!string.IsNullOrWhiteSpace(eventId.Name)) tags["event_name"] = eventId.Name;
+        var timestamp = DateTimeOffset.UtcNow;
+        DistillEvent record;
+        try
+        {
+            record = new DistillEvent
+            {
+                EventId = Guid.NewGuid(), Timestamp = timestamp, ChannelId = channel,
+                Version = channelOptions.Version ?? options.DefaultVersion ?? client.Value.GetChannelVersion(channel),
+                SeverityLevel = ToSeverity(level), Payload = JsonSerializer.SerializeToElement(payload), Metadata = tags
+            };
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException)
+        {
+            ReportFailure(channel, 1, 0, error);
+            return;
+        }
+        try
+        {
+            bool admitted;
+            if ((channelOptions.OverflowPolicy ?? options.OverflowPolicy) == DistillOverflowPolicy.Block)
+            {
+                queue.Writer.WriteAsync(record, shutdown.Token).AsTask().GetAwaiter().GetResult();
+                admitted = true;
+            }
+            else admitted = queue.Writer.TryWrite(record);
+            if (admitted) wakeSignal.Writer.TryWrite(0);
+            else Drop(channel, 1);
+        }
+        catch (Exception error) when (error is OperationCanceledException or ChannelClosedException or ObjectDisposedException)
+        {
+            Drop(channel, 1);
+        }
+    }
 
-        if (admitted)
+    private Channel<DistillEvent> CreateQueue(string channel)
+    {
+        var config = options.GetChannelOptions(channel);
+        var mode = (config.OverflowPolicy ?? options.OverflowPolicy) switch
         {
-            wakeSignal.Writer.TryWrite(0);
-        }
+            DistillOverflowPolicy.DropOldest => BoundedChannelFullMode.DropOldest,
+            DistillOverflowPolicy.Block => BoundedChannelFullMode.Wait,
+            _ => BoundedChannelFullMode.DropWrite
+        };
+        return Channel.CreateBounded<DistillEvent>(new BoundedChannelOptions(config.QueueCapacity ?? options.QueueCapacity)
+        {
+            FullMode = mode, SingleReader = true, SingleWriter = false
+        }, _ => Drop(channel, 1));
     }
 
     private string ResolveChannel(string category)
     {
-        try
+        try { return options.ChannelResolver?.Invoke(category) is { Length: > 0 } channel ? channel : options.DefaultChannel; }
+        catch
         {
-            string? channel = options.ChannelResolver?.Invoke(category);
-            if (!string.IsNullOrWhiteSpace(channel))
-            {
-                return channel;
-            }
-
-            if (!string.IsNullOrWhiteSpace(options.DefaultChannel))
-            {
-                options.ChannelResolutionFailed?.Invoke(category, "Resolver returned null or whitespace");
-                return options.DefaultChannel;
-            }
-        }
-        catch (Exception ex)
-        {
-            options.ChannelResolutionFailed?.Invoke(category, $"Resolver threw: {ex.Message}");
-        }
-
-        return options.DefaultChannel;
-    }
-
-    private Channel<QueuedLog> GetOrCreateChannelQueue(string channelId)
-    {
-        return channelQueues.GetOrAdd(channelId, static (key, self) =>
-        {
-            var channelOpts = self.options.GetChannelOptions(key);
-            int capacity = channelOpts.QueueCapacity ?? self.options.QueueCapacity;
-            var fullMode = (channelOpts.OverflowPolicy ?? self.options.OverflowPolicy) switch
-            {
-                DistillOverflowPolicy.DropNewest => BoundedChannelFullMode.DropWrite,
-                DistillOverflowPolicy.DropOldest => BoundedChannelFullMode.DropOldest,
-                DistillOverflowPolicy.Block => BoundedChannelFullMode.Wait,
-                _ => BoundedChannelFullMode.DropWrite,
-            };
-            return Channel.CreateBounded<QueuedLog>(new BoundedChannelOptions(capacity)
-            {
-                FullMode = fullMode,
-                SingleReader = false,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false,
-            });
-        }, this);
-    }
-
-    private void CompleteAllChannelWriters()
-    {
-        foreach (var kvp in channelQueues)
-        {
-            kvp.Value.Writer.TryComplete();
+            try { options.ChannelResolutionFailed?.Invoke(category, "Channel resolver failed"); } catch { }
+            return options.DefaultChannel;
         }
     }
 
@@ -160,256 +165,119 @@ public sealed class DistillLoggerProvider : ILoggerProvider, ISupportExternalSco
     {
         try
         {
-            await ValidateAndCreateChannelsAsync();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            var signalReader = wakeSignal.Reader;
-            while (await signalReader.WaitToReadAsync(shutdown.Token))
+            while (await wakeSignal.Reader.WaitToReadAsync(shutdown.Token))
             {
-                while (signalReader.TryRead(out _))
+                while (wakeSignal.Reader.TryRead(out _)) { }
+                bool processed;
+                do
                 {
-                }
-
-                foreach (var (channelId, channel) in channelQueues.ToArray())
-                {
-                    var channelOpts = options.GetChannelOptions(channelId);
-                    int batchSize = channelOpts.BatchSize ?? options.BatchSize;
-
-                    var batch = new List<QueuedLog>(batchSize);
-                    while (batch.Count < batchSize && channel.Reader.TryRead(out var record))
+                    processed = false;
+                    foreach (var (channel, queue) in channelQueues.ToArray())
                     {
-                        batch.Add(record);
-                    }
-
-                    if (batch.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    if (batch.Count < batchSize)
-                    {
-                        var flushInterval = channelOpts.FlushInterval ?? options.FlushInterval;
-                        await Task.Delay(flushInterval, shutdown.Token);
-                        while (batch.Count < batchSize && channel.Reader.TryRead(out var record))
+                        var config = options.GetChannelOptions(channel);
+                        int size = config.BatchSize ?? options.BatchSize;
+                        var batch = new List<DistillEvent>(size);
+                        while (batch.Count < size && queue.Reader.TryRead(out var record)) batch.Add(record);
+                        if (batch.Count == 0) continue;
+                        processed = true;
+                        Volatile.Write(ref inFlight, batch.Count);
+                        if (batch.Count < size && Volatile.Read(ref disposed) == 0)
                         {
-                            batch.Add(record);
+                            try { await Task.Delay(config.FlushInterval ?? options.FlushInterval, stopBatching.Token); }
+                            catch (OperationCanceledException) when (stopBatching.IsCancellationRequested) { }
+                            while (batch.Count < size && queue.Reader.TryRead(out var record)) batch.Add(record);
                         }
+                        Volatile.Write(ref inFlight, batch.Count);
+                        await FlushAsync(channel, batch.ToArray(), shutdown.Token);
+                        Volatile.Write(ref inFlight, 0);
                     }
-
-                    await FlushAsync(batch, shutdown.Token);
-                }
+                } while (processed);
             }
         }
-        catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-        {
-        }
+        catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
+        catch (Exception error) { ReportFailure("worker", Volatile.Read(ref inFlight), 0, error); }
         finally
         {
-            var remaining = new List<QueuedLog>();
-            foreach (var kvp in channelQueues)
+            foreach (var (channel, queue) in channelQueues)
             {
-                while (kvp.Value.Reader.TryRead(out var record))
-                {
-                    remaining.Add(record);
-                }
-            }
-
-            if (remaining.Count > 0)
-            {
-                try
-                {
-                    await FlushAsync(remaining, CancellationToken.None);
-                }
-                catch
-                {
-                }
+                int count = 0;
+                while (queue.Reader.TryRead(out _)) count++;
+                if (count > 0) Drop(channel, count);
             }
         }
     }
 
-    private async Task ValidateAndCreateChannelsAsync()
+    private async Task FlushAsync(string channel, DistillEvent[] pending, CancellationToken cancellationToken)
     {
-        var channels = new HashSet<string>(StringComparer.Ordinal) { options.DefaultChannel };
-
-        if (options.ChannelOptions is not null)
-        {
-            foreach (var key in options.ChannelOptions.Keys)
-            {
-                channels.Add(key);
-            }
-        }
-
-        foreach (var channelId in channels)
-        {
-            CancellationToken ct = shutdown.Token;
-
-            try
-            {
-                var config = await client.GetChannelAsync(channelId, ct);
-                if (config is not null)
-                {
-                    continue;
-                }
-            }
-            catch (DistillApiException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-            }
-            catch
-            {
-                continue;
-            }
-
-            var channelOpts = options.GetChannelOptions(channelId);
-            CreateChannelRequest? request = null;
-            if (channelOpts.ChannelFactory is not null)
-            {
-                request = channelOpts.ChannelFactory();
-            }
-            else if (options.ChannelFactory is not null)
-            {
-                request = options.ChannelFactory(channelId);
-            }
-
-            if (request is null)
-            {
-                continue;
-            }
-
-            // Retry aggressively on 503 (ServiceUnavailable). Distill returns this
-            // when its backend connections (PostgreSQL, RabbitMQ) are not yet ready.
-            var maxAttempts = 10;
-            var attempt = 0;
-            while (attempt < maxAttempts)
-            {
-                attempt++;
-                try
-                {
-                    await client.CreateChannelAsync(request, ct);
-                    break; // Success
-                }
-                catch (DistillApiException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < maxAttempts)
-                {
-                    Console.WriteLine($"[DistillLogger] Channel '{channelId}' not yet available (503), retrying ({attempt}/{maxAttempts})...");
-                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
-                }
-                catch (Exception ex)
-                {
-                    options.ChannelProvisioningFailure?.Invoke(channelId, ex);
-                    break; // Non-retryable error
-                }
-            }
-        }
-    }
-
-    private async Task FlushAsync(IReadOnlyList<QueuedLog> batch, CancellationToken ct)
-    {
-        if (batch.Count == 0)
-        {
-            return;
-        }
-
-        string channel = batch[0].Channel;
-        var channelOpts = options.GetChannelOptions(channel);
-        int maxRetries = channelOpts.MaxRetries ?? options.MaxRetries;
-        TimeSpan retryDelay = channelOpts.RetryDelay ?? options.RetryDelay;
-
-        var events = batch.Select(ToDistillEvent).ToArray();
-
-        for (var attempt = 0; ; attempt++)
+        var config = options.GetChannelOptions(channel);
+        int retries = config.MaxRetries ?? options.MaxRetries;
+        for (int attempt = 0; ; attempt++)
         {
             try
             {
-                IngestResponse? response = await client.IngestAsync(events, ct);
-                options.DeliverySuccess?.Invoke(new DeliverySuccessContext
+                var response = await client.Value.IngestAsync(pending, cancellationToken)
+                    ?? throw new InvalidOperationException("Distill returned an empty ingest response.");
+                var errors = response.Errors;
+                if (response.Accepted + response.Rejected != pending.Length || response.Rejected != errors.Count
+                    || errors.Any(error => error.Index < 0 || error.Index >= pending.Length)
+                    || errors.Select(error => error.Index).Distinct().Count() != errors.Count)
+                    throw new InvalidOperationException("Distill returned inconsistent per-item ingestion results.");
+                if (response.Accepted > 0)
                 {
-                    Channel = channel,
-                    EventCount = batch.Count,
-                    Response = response!
-                });
-                break;
-            }
-            catch (Exception) when (attempt < maxRetries && !ct.IsCancellationRequested)
-            {
-                await Task.Delay(retryDelay, ct);
-            }
-            catch (Exception ex)
-            {
-                options.DeliveryFailure?.Invoke(new DeliveryFailureContext
+                    try { options.DeliverySuccess?.Invoke(new DeliverySuccessContext { Channel = channel, EventCount = response.Accepted, Response = response }); } catch { }
+                }
+                var retry = errors.Where(error => IsRetryable(error.ErrorCode)).Select(error => pending[error.Index]).ToArray();
+                int terminal = response.Rejected - retry.Length;
+                if (terminal > 0) ReportFailure(channel, terminal, attempt + 1, new InvalidOperationException("Distill permanently rejected records in the batch."));
+                if (retry.Length == 0) return;
+                pending = retry;
+                if (attempt >= retries)
                 {
-                    Channel = channel,
-                    EventCount = batch.Count,
-                    Attempts = attempt + 1,
-                    Exception = ex
-                });
-                break;
+                    ReportFailure(channel, pending.Length, attempt + 1, new InvalidOperationException("Distill admission retries exhausted."));
+                    return;
+                }
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception error)
+            {
+                if (attempt >= retries || !IsRetryable(error))
+                {
+                    ReportFailure(channel, pending.Length, attempt + 1, error);
+                    return;
+                }
+            }
+            Volatile.Write(ref inFlight, pending.Length);
+            await Task.Delay(config.RetryDelay ?? options.RetryDelay, cancellationToken);
         }
     }
 
-    private static Distill.Client.DistillEvent ToDistillEvent(QueuedLog record)
+    private static bool IsRetryable(string code) => code is "BUFFER_FULL" or "SERVICE_UNAVAILABLE" or "REQUEST_THROTTLED";
+    private static bool IsRetryable(Exception error) => error switch
     {
-        var payload = new Dictionary<string, object?>(record.Attributes, StringComparer.Ordinal)
-        {
-            ["message"] = record.Message
-        };
-        if (record.Exception is not null)
-        {
-            payload["exception_type"] = record.Exception.GetType().FullName;
-            payload["exception_message"] = record.Exception.Message;
-            payload["exception_stacktrace"] = record.Exception.ToString();
-        }
-
-        var metadata = new Dictionary<string, string>(record.Metadata, StringComparer.Ordinal)
-        {
-            ["category"] = record.Category,
-            ["log_level"] = record.LogLevel.ToString()
-        };
-        if (record.EventId.Id != 0)
-        {
-            metadata["event_id"] = record.EventId.Id.ToString();
-        }
-
-        if (!string.IsNullOrWhiteSpace(record.EventId.Name))
-        {
-            metadata["event_name"] = record.EventId.Name;
-        }
-
-        return new Distill.Client.DistillEvent
-        {
-            EventId = Guid.NewGuid(),
-            Timestamp = DateTimeOffset.UtcNow,
-            ChannelId = record.Channel,
-            SeverityLevel = ToSeverity(record.LogLevel),
-            Payload = payload,
-            Metadata = metadata
-        };
-    }
-
-    private static string ToSeverity(LogLevel level) => level switch
-    {
-        LogLevel.Trace => "trace",
-        LogLevel.Debug => "debug",
-        LogLevel.Information => "info",
-        LogLevel.Warning => "warning",
-        LogLevel.Error => "error",
-        LogLevel.Critical => "critical",
-        _ => "unknown"
+        DistillApiException api => (int)api.StatusCode >= 500 || api.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests,
+        HttpRequestException or TaskCanceledException => true,
+        _ => false
     };
 
-    private sealed record QueuedLog(
-        string Channel,
-        string Category,
-        LogLevel LogLevel,
-        EventId EventId,
-        string Message,
-        Exception? Exception,
-        IReadOnlyDictionary<string, object?> Attributes,
-        IReadOnlyDictionary<string, string> Metadata);
+    private void Drop(string channel, long count)
+    {
+        Interlocked.Add(ref dropped, count);
+        try { options.DeliveryDropped?.Invoke(channel, count); } catch { }
+    }
+
+    private void ReportFailure(string channel, int count, int attempts, Exception error)
+    {
+        Interlocked.Add(ref failed, count);
+        try { options.DeliveryFailure?.Invoke(new DeliveryFailureContext { Channel = channel, EventCount = count, Attempts = attempts, Exception = error }); } catch { }
+    }
+
+    private static DistillSeverity ToSeverity(LogLevel level) => level switch
+    {
+        LogLevel.Trace => DistillSeverity.Trace, LogLevel.Debug => DistillSeverity.Debug,
+        LogLevel.Information => DistillSeverity.Info, LogLevel.Warning => DistillSeverity.Warning,
+        LogLevel.Error => DistillSeverity.Error, LogLevel.Critical => DistillSeverity.Critical,
+        _ => DistillSeverity.Unknown
+    };
 
     private sealed class DistillLogger : ILogger
     {

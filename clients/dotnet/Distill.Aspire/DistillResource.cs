@@ -17,6 +17,8 @@ public class DistillResource : ContainerResource, IResourceWithConnectionString
     internal const string ApiKeyConfigKey = "Distill__ApiKey";
 
     internal Uri? ExplicitEndpoint { get; set; }
+    internal ParameterResource? ApiKeyParameter { get; set; }
+    internal string? ApiKeyLiteral { get; set; }
 
     /// Initializes a new Distill resource with the given name.
     public DistillResource(string name) : base(name)
@@ -38,4 +40,13 @@ public class DistillResource : ContainerResource, IResourceWithConnectionString
             return ReferenceExpression.Create($"{endpoint.Property(EndpointProperty.Url)}");
         }
     }
+}
+
+/// References an existing Distill installation without creating a container.
+public sealed class DistillExternalResource(string name, Uri endpoint, Uri adminEndpoint, object apiKey)
+    : Resource(name), IResourceWithConnectionString, IResourceWithEnvironment
+{
+    internal Uri AdminEndpoint { get; } = adminEndpoint;
+    internal object ApiKey { get; } = apiKey;
+    public ReferenceExpression ConnectionStringExpression => ReferenceExpression.Create($"{endpoint.ToString()}");
 }

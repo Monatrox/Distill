@@ -9,7 +9,7 @@
 // Rust guideline compliant 2026-02-21
 use anyhow::Context;
 use clap::Parser;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 use tracing::info;
 
 mod broker;
@@ -28,7 +28,7 @@ mod persistence;
 pub async fn run() -> anyhow::Result<()> {
     let command = infra::cli::Cli::parse();
     if command.command.is_some() {
-        return command.run();
+        return command.run().await;
     }
     let http_limits = command.http_limits();
 
@@ -50,7 +50,7 @@ pub async fn run() -> anyhow::Result<()> {
         .context("binding administrative HTTP listener")?;
     let state = http::AppState::connect(settings).await?;
     let app = http::public_router(state.clone());
-    let admin_app = http::admin_router(state);
+    let admin_app = http::admin_router(state.clone());
 
     info!(
         event.name = "distill.http.started",
@@ -62,13 +62,40 @@ pub async fn run() -> anyhow::Result<()> {
         address = %admin_listener.local_addr()?,
         "Distill loopback administrative HTTP server started"
     );
-    tokio::try_join!(
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
-        axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal()),
-    )
-    .context("running HTTP servers")?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let servers = async {
+        tokio::try_join!(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone())),
+            axum::serve(admin_listener, admin_app)
+                .with_graceful_shutdown(wait_for_shutdown(shutdown_rx)),
+        )
+    };
+    tokio::pin!(servers);
+    let result = tokio::select! {
+        result = &mut servers => result,
+        () = shutdown_signal() => {
+            state.stop_admission();
+            let _ = shutdown_tx.send(true);
+            match tokio::time::timeout(state.shutdown_timeout(), &mut servers).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP graceful shutdown exceeded the configured timeout",
+                )),
+            }
+        }
+    };
+    state.shutdown().await.context("flushing channel buffers")?;
+    result.context("running HTTP servers")?;
 
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if !*shutdown.borrow() {
+        let _ = shutdown.changed().await;
+    }
 }
 
 async fn shutdown_signal() {

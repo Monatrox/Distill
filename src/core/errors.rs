@@ -13,6 +13,8 @@ pub enum DistillError {
     Unauthorized,
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("configuration conflicts with an existing version")]
+    ConfigurationConflict,
     #[error("channel not found: {0}")]
     ChannelNotFound(String),
     #[error("channel configuration is invalid: {0}")]
@@ -36,6 +38,7 @@ pub enum ErrorCode {
     Unauthorized,
     InvalidRequest,
     ChannelNotFound,
+    ConfigurationConflict,
     InvalidConfiguration,
     SchemaValidation,
     BufferFull,
@@ -50,6 +53,7 @@ impl ErrorCode {
             Self::Unauthorized => "UNAUTHORIZED",
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::ChannelNotFound => "CHANNEL_NOT_FOUND",
+            Self::ConfigurationConflict => "CONFIGURATION_CONFLICT",
             Self::InvalidConfiguration => "INVALID_CONFIGURATION",
             Self::SchemaValidation => "SCHEMA_VALIDATION",
             Self::BufferFull => "BUFFER_FULL",
@@ -77,9 +81,10 @@ impl DistillError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::InvalidRequest(_) | Self::SchemaValidation(_) | Self::UnsupportedApiVersion(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::ConfigurationConflict => StatusCode::CONFLICT,
+            Self::InvalidRequest(_)
+            | Self::SchemaValidation(_)
+            | Self::UnsupportedApiVersion(_) => StatusCode::BAD_REQUEST,
             Self::ChannelNotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidConfiguration(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BufferFull(_) | Self::Persistence(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -91,6 +96,7 @@ impl DistillError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
+            Self::ConfigurationConflict => ErrorCode::ConfigurationConflict,
             Self::InvalidRequest(_) => ErrorCode::InvalidRequest,
             Self::ChannelNotFound(_) => ErrorCode::ChannelNotFound,
             Self::InvalidConfiguration(_) => ErrorCode::InvalidConfiguration,

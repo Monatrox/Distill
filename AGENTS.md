@@ -8,3 +8,7 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 
 If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
 <!-- CODEGRAPH_END -->
+
+## Local continuation context
+
+If present, read `docs/archive/production-readiness-handoff.md` before resuming production-readiness work. The agreed V1 contract is in `docs/archive/production-readiness-blockers.md`; its historical numbered backlog and the older dispatch are superseded where they conflict with that contract. The archive is local-only and absent from fresh clones. Public setup and deployment limits are documented in `README.md` and `docs/`.

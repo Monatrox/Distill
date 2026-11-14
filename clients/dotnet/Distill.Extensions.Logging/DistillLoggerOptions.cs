@@ -9,6 +9,15 @@ public sealed class DistillLoggerOptions
     /// Gets or sets the channel used when no resolver is configured.
     public string DefaultChannel { get; set; } = "application";
 
+    /// Gets or sets a declared version; reconciliation bindings are used when omitted.
+    public string? DefaultVersion { get; set; }
+
+    /// Gets or sets the maximum time allowed to finish shutdown delivery.
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// Gets or sets an observable notification for SDK queue/overflow drops.
+    public Action<string, long>? DeliveryDropped { get; set; }
+
     /// Gets or sets the minimum level forwarded to Distill.
     public LogLevel MinimumLevel { get; set; } = LogLevel.Information;
 
@@ -39,9 +48,6 @@ public sealed class DistillLoggerOptions
     /// Gets or sets category-specific minimum log levels.
     public Dictionary<string, LogLevel> CategoryLevels { get; set; } = new(StringComparer.Ordinal);
 
-    /// Gets or sets a factory that creates a channel definition for a given channel name.
-    public Func<string, CreateChannelRequest>? ChannelFactory { get; set; }
-
     /// Gets or sets a callback invoked after a batch exhausts its retry attempts.
     public Action<DeliveryFailureContext>? DeliveryFailure { get; set; }
 
@@ -51,12 +57,10 @@ public sealed class DistillLoggerOptions
     /// Gets or sets a callback invoked when the channel resolver returns null or whitespace.
     public Action<string, string>? ChannelResolutionFailed { get; set; }
 
-    /// Gets or sets a callback invoked when automatic channel provisioning fails.
-    public Action<string, Exception>? ChannelProvisioningFailure { get; set; }
-
     internal void Validate()
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(DefaultChannel);
+        if (ShutdownTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(ShutdownTimeout));
         if (QueueCapacity <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(QueueCapacity));
@@ -81,6 +85,19 @@ public sealed class DistillLoggerOptions
         {
             throw new ArgumentOutOfRangeException(nameof(RetryDelay));
         }
+        if (ChannelOptions is not null)
+        {
+            foreach (var (channel, value) in ChannelOptions)
+            {
+                ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+                ArgumentNullException.ThrowIfNull(value);
+                if (value.BatchSize is <= 0 || value.QueueCapacity is <= 0 || value.MaxRetries is < 0
+                    || value.FlushInterval is { } flush && flush <= TimeSpan.Zero
+                    || value.RetryDelay is { } delay && delay <= TimeSpan.Zero)
+                    throw new ArgumentException("Per-channel batching, queue and retry settings must be valid.", nameof(ChannelOptions));
+            }
+        }
+
     }
 
     internal PerChannelOptions GetChannelOptions(string channelId)
@@ -121,6 +138,7 @@ public sealed class DistillLoggerOptions
 /// Per-channel overrides for the Distill logging provider.
 public sealed class PerChannelOptions
 {
+    public string? Version { get; set; }
     public int? BatchSize { get; set; }
     public TimeSpan? FlushInterval { get; set; }
     public int? MaxRetries { get; set; }
@@ -128,7 +146,6 @@ public sealed class PerChannelOptions
     public int? QueueCapacity { get; set; }
     public DistillOverflowPolicy? OverflowPolicy { get; set; }
     public LogLevel? MinimumLevel { get; set; }
-    public Func<CreateChannelRequest>? ChannelFactory { get; set; }
 }
 
 /// Context provided to the delivery-failure callback.

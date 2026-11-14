@@ -1,0 +1,30 @@
+name: Broker durability
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  durable-handoff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker info
+      - run: bash -n scripts/test-durable-aggregate-input.sh
+      - name: Run durable handoff integration tests
+        env:
+          DISTILL_CONTAINER_ENGINE: docker
+          DISTILL_TEST_ARTIFACT_DIR: ${{ runner.temp }}/distill-broker-diagnostics
+        run: bash scripts/test-durable-aggregate-input.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-durability-diagnostics
+          path: ${{ runner.temp }}/distill-broker-diagnostics
+          if-no-files-found: warn
+          retention-days: 7

@@ -19,7 +19,7 @@ var myService = builder.AddProject<Projects.MyService>("my-service")
 
 ### Container-mode Distill
 
-Launch a Distill container. The image defaults to `distill:latest`.
+Launch Distill with a managed RabbitMQ resource, non-default broker user, generated credentials, and persistent broker/state volumes. A generated shared Distill key is used if `apiKey` is omitted. Configure a `UserSecretsId` in the AppHost project so generated broker/API credentials persist across local runs when their data volumes are retained. Production supplies stable credentials through its secret configuration. The image defaults to private `ghcr.io/monatrox/distill:0.1.0`; authenticate your container runtime to the registry.
 Override with `.WithImage(...)` for a custom image.
 
 #### Automatic local build (recommended for development)
@@ -89,7 +89,7 @@ var distill = builder.AddDistill("distill", apiKey: "dev-key")
 
 `WithSink` passes the connection expression only to the Distill container at startup. The value is never sent to consuming applications. Distill connects it before becoming ready; logs remain rejected until an active channel references the sink.
 
-`WithSink` configures container-mode Distill. For an externally managed Distill instance, use its deployment sink manifest and secret store instead.
+`WithSink` configures container-mode Distill. For an externally managed instance, consuming applications can register sinks through the runtime API; `.WithSink` remains a container startup helper.
 
 ### Register a custom sink (HTTP, etc.)
 
@@ -127,15 +127,33 @@ builder.AddDistillClient("distill", options =>
 });
 ```
 
-This registers `DistillClient` as a singleton, adds the Distill `ILogger` provider, and registers a health check for the Aspire dashboard.
+This registers `DistillClient` with factory-managed HTTP transports, adds the `ILogger` provider, and registers a readiness health check. Reconcile the application's destinations/channels explicitly before serving traffic. Configure `DefaultVersion` or let the client bind versions through reconciliation.
 
-When using `.WithReference(distill)`, Aspire sets `ConnectionStrings__distill` to the Distill endpoint automatically. The API key should be set on the consumer project via `WithEnvironment`:
+When using `.WithReference(distill)`, Aspire sets `ConnectionStrings__distill` to the Distill endpoint automatically. The concrete `.WithReference(distill)` extension also supplies the shared ingest/configuration key and private admin endpoint. Consumers do not need to derive or repeat an admin key:
 
 ```csharp
 var myService = builder.AddProject<Projects.MyService>("my-service")
-    .WithReference(distill)
-    .WithEnvironment("Distill__ApiKey", "dev-key");
+    .WithReference(distill);
 ```
+
+In the consuming application's `Program.cs`, provision channels after `Build()` and before serving traffic:
+
+```csharp
+var app = builder.Build();
+var distill = app.Services.GetRequiredService<DistillClient>();
+
+await distill.ReconcileChannelAsync(new CreateChannelRequest
+{
+    Name = "production.errors",
+    Version = "1",
+    SinkId = "primary",
+    Preset = ChannelPreset.RawEvents
+});
+
+app.Run();
+```
+
+Provisioning is explicit and fail-fast. `DistillLoggerProvider` remains an ingest-only transport and never creates channels from arbitrary logger categories.
 
 ### Standalone usage (without Aspire hosting)
 
@@ -145,14 +163,15 @@ The extension reads configuration directly from environment variables or `appset
 {
   "Distill": {
     "Endpoint": "http://localhost:8080",
-    "ApiKey": "change-me"
+    "ApiKey": "change-me-ingest",
+    "AdminApiKey": "change-me-admin"
   }
 }
 ```
 
 ## Health check
 
-`DistillHealthCheck` calls `/health`. It is healthy only when Distill has an active channel backed by a connected sink. The check is visible in the Aspire dashboard.
+`DistillHealthCheck` calls `/ready`, which requires active channel configuration and healthy broker paths. The container startup dependency uses `/health` so idle Distill can start before applications reconcile their channels; this avoids a provisioning deadlock. Sink outages are visible through delivery failures/retry/DLQ rather than a universal live database probe.
 
 ## Sink environment variables
 
@@ -163,3 +182,11 @@ When sinks are registered via `.WithSink(...)`, the integration sets the followi
 - `DISTILL_SINK__{NAME}__URL` — endpoint URL (for HTTP sinks)
 - `DISTILL_SINK__{NAME}__BEARER_TOKEN` — bearer token (for HTTP sinks)
 - `DISTILL_DEFAULT_SINK` — name of the default sink
+
+## Runtime registration and deployment limits
+
+`WithSink` is optional; application startup can call `RegisterSinkAsync` and `ReconcileChannelAsync` without changing the logger deployment. External mode also accepts an Aspire secret `ParameterResource` for the shared key and an explicit `adminEndpoint`. Ensure that destination addresses are reachable from Distill, and explicitly allowlist private HTTP receiver hosts/ports through `DISTILL_SINK_ALLOWLIST`. Native database schemas require the explicit `distill sink migrate` workflow unless development-only auto-migration is enabled.
+
+Run only one active Distill instance per dedicated broker vhost. Persist `/var/lib/distill` on local-disk-compatible storage. An actual deployed Aspire/Azure end-to-end run and Azure SQLite storage compatibility remain release gates; local resource-model tests do not establish deployment compatibility.
+
+The client resolves its HTTP transports lazily so the logging provider can be constructed alongside HttpClientFactory/resilience defaults without a logger-factory dependency cycle. Distill transport HTTP loggers are disabled to avoid logging its own delivery requests. A hosted shutdown service drains logging before dependency injection disposes the HTTP client wrappers.

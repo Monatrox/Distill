@@ -20,3 +20,4 @@ pub(crate) mod proto;
 pub(crate) mod registry;
 pub(crate) mod routing;
 pub(crate) mod schema;
+pub(crate) mod state;

@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    schemas: Arc<RwLock<HashMap<String, RegisteredSchema>>>,
+    schemas: Arc<RwLock<HashMap<String, PreparedSchema>>>,
 }
 
 /// Caps descriptor memory so schema registration cannot exhaust the process budget.
@@ -23,21 +23,15 @@ const MAX_SCHEMA_CACHE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_SCHEMA_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
-struct RegisteredSchema {
+pub(crate) struct PreparedSchema {
     descriptor: MessageDescriptor,
     encoded_size: usize,
 }
 
 impl SchemaRegistry {
-    pub async fn remove(&self, channel_id: &str) {
-        self.schemas.write().await.remove(channel_id);
-    }
-
-    pub async fn register(
-        &self,
-        channel_id: &str,
-        definition: MessageSchemaDefinition,
-    ) -> Result<(), DistillError> {
+    pub(crate) fn prepare(
+        definition: &MessageSchemaDefinition,
+    ) -> Result<PreparedSchema, DistillError> {
         if definition.message_type.is_empty() || definition.version.is_empty() {
             return Err(DistillError::InvalidConfiguration(
                 "message_type and version are required".to_string(),
@@ -61,27 +55,39 @@ impl SchemaRegistry {
                     definition.message_type
                 ))
             })?;
-        let key = channel_id.to_string();
-        let mut schemas = self.schemas.write().await;
-        schemas.insert(
-            key,
-            RegisteredSchema {
-                descriptor,
-                encoded_size: bytes.len(),
-            },
-        );
-        while schemas
-            .values()
-            .map(|schema| schema.encoded_size)
-            .sum::<usize>()
+        Ok(PreparedSchema {
+            descriptor,
+            encoded_size: bytes.len(),
+        })
+    }
+
+    /// Rejects schema growth rather than silently disabling existing validation.
+    pub(crate) async fn check_capacity(
+        &self,
+        channel_id: &str,
+        schema: Option<&PreparedSchema>,
+    ) -> Result<(), DistillError> {
+        let schemas = self.schemas.read().await;
+        let bytes: usize = schemas
+            .iter()
+            .filter(|(key, _)| key.as_str() != channel_id)
+            .map(|(_, schema)| schema.encoded_size)
+            .sum();
+        if bytes.saturating_add(schema.map_or(0, |schema| schema.encoded_size))
             > MAX_SCHEMA_CACHE_BYTES
         {
-            let Some(key) = schemas.keys().next().cloned() else {
-                break;
-            };
-            schemas.remove(&key);
+            return Err(DistillError::BufferFull("schema registry".to_string()));
         }
         Ok(())
+    }
+
+    pub(crate) async fn activate(&self, channel_id: &str, schema: Option<PreparedSchema>) {
+        let mut schemas = self.schemas.write().await;
+        if let Some(schema) = schema {
+            schemas.insert(channel_id.to_string(), schema);
+        } else {
+            schemas.remove(channel_id);
+        }
     }
 
     pub async fn validate_json(
@@ -99,16 +105,102 @@ impl SchemaRegistry {
                 .map_err(|error| DistillError::SchemaValidation(error.to_string()))?;
             return Ok(());
         }
-        let object = payload.as_object().ok_or_else(|| {
-            DistillError::SchemaValidation("payload must be a JSON object".to_string())
-        })?;
-        for field in object.keys() {
-            if schema.descriptor.get_field_by_name(field).is_none() {
-                return Err(DistillError::SchemaValidation(format!(
-                    "unknown field in schema payload: {field}"
-                )));
-            }
-        }
+        prost_reflect::DynamicMessage::deserialize(schema.descriptor.clone(), payload).map_err(
+            |_| {
+                DistillError::SchemaValidation(
+                    "payload does not match the registered schema".to_string(),
+                )
+            },
+        )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
+
+    fn schema() -> MessageSchemaDefinition {
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Counter".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("value".to_string()),
+                        number: Some(1),
+                        label: Some(1),
+                        r#type: Some(5),
+                        ..FieldDescriptorProto::default()
+                    }],
+                    ..DescriptorProto::default()
+                }],
+                ..FileDescriptorProto::default()
+            }],
+        };
+        MessageSchemaDefinition {
+            message_type: "test.Counter".to_string(),
+            version: "1".to_string(),
+            descriptor_set_base64: STANDARD.encode(descriptor.encode_to_vec()),
+        }
+    }
+
+    #[tokio::test]
+    async fn schemas_validate_types_and_capacity_does_not_disable_validation() {
+        let registry = SchemaRegistry::default();
+        let mut prepared = SchemaRegistry::prepare(&schema()).unwrap();
+        prepared.encoded_size = MAX_SCHEMA_CACHE_BYTES;
+        registry
+            .check_capacity("counter@1", Some(&prepared))
+            .await
+            .unwrap();
+        registry.activate("counter@1", Some(prepared.clone())).await;
+        assert!(
+            registry
+                .validate_json("counter@1", &serde_json::json!({"value": 7}), None)
+                .await
+                .is_ok()
+        );
+        assert!(
+            registry
+                .validate_json(
+                    "counter@1",
+                    &serde_json::json!({"value": "not-an-integer"}),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .check_capacity("counter@2", Some(&prepared))
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_json(
+                    "counter@1",
+                    &serde_json::json!({"secret": "must-not-appear"}),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let error = registry
+            .validate_json(
+                "counter@1",
+                &serde_json::json!({"value": "must-not-appear"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("must-not-appear"));
     }
 }

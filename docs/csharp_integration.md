@@ -77,9 +77,9 @@ Channels must exist before ingestion. The channel identifier must contain only l
 var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "raw_events",
+    Preset = ChannelPreset.RawEvents,
     SinkId = "postgres-primary",
-    Aggregator = null   // null = disable preset aggregator; omit = use preset default
+    DisableAggregation = true // omit to use preset default
 });
 ```
 
@@ -112,7 +112,7 @@ IngestResponse? response = await distill.WriteAsync(
     "orders.production",
     new SimpleEvent
     {
-        Severity = "error",
+        Severity = DistillSeverity.Error,
         Message = "Payment authorization failed",
         Payload = new { order_id = "ord-123", provider = "stripe" },
         Attributes = new Dictionary<string, object?>
@@ -133,7 +133,7 @@ IngestResponse? response = await distill.IngestAsync(new[]
         EventId = Guid.NewGuid(),
         Timestamp = DateTimeOffset.UtcNow,
         ChannelId = "orders.production",
-        SeverityLevel = "info",
+        SeverityLevel = DistillSeverity.Info,
         Payload = new { order_id = "ord-123", operation = "created" },
         Metadata = new Dictionary<string, string>
         {
@@ -287,29 +287,49 @@ options.DeliveryFailure = context =>
 };
 ```
 
-### 4.7 Auto-channel creation
+### 4.7 Application-owned channel provisioning
 
-The provider validates channels at startup and can create missing channels automatically:
+The logging provider only sends events; it never creates channels implicitly. Applications that own a finite channel set can provision it explicitly in `Program.cs` with `EnsureChannelAsync`:
 
 ```csharp
-// Global factory — receives the channel ID
-options.ChannelFactory = channelId => new CreateChannelRequest
+builder.AddDistillClient("distill", options =>
 {
-    Name = channelId,
-    Preset = "raw_events"
+    options.DefaultChannel = "application.production";
+    options.ChannelResolver = category =>
+        category.StartsWith("Orders.", StringComparison.Ordinal)
+            ? "orders.production"
+            : null!;
+});
+
+var channels = new[]
+{
+    new CreateChannelRequest { Name = "application.production", Preset = ChannelPreset.RawEvents },
+    new CreateChannelRequest
+    {
+        Name = "orders.production",
+        Preset = ChannelPreset.RawEvents,
+        Aggregator = new AggregatorSpec
+        {
+            Function = AggregationFunction.Count,
+            Granularity = AggregationGranularity.PerTTime,
+            Parameter = 60
+        }
+    }
 };
 
-// Per-channel factory — overrides the global one for specific channels
-options.ChannelOptions["errors.critical"].ChannelFactory = () => new CreateChannelRequest
+var app = builder.Build();
+var distill = app.Services.GetRequiredService<DistillClient>();
+foreach (var channel in channels)
 {
-    Name = "errors.critical",
-    Preset = "errors_only"
-};
+    await distill.EnsureChannelAsync(channel);
+}
 
-// Observe provisioning failures
-options.ChannelProvisioningFailure =
-    (channelId, ex) => Console.Error.WriteLine($"Failed to provision '{channelId}': {ex.Message}");
+app.Run();
 ```
+
+`EnsureChannelAsync` creates missing channels and leaves existing channels unchanged. Provisioning failures fail application startup, preventing the logger from targeting missing channels. The application needs `Distill__AdminApiKey` for this startup step; normal event delivery continues to use `Distill__ApiKey`. Keep definitions finite, reference operator-provisioned sink IDs/defaults, and never place sink credentials in application channel definitions.
+
+This pattern suits modular monoliths where the application owns its logging contract. Aspire-owned provisioning can be added later without coupling provisioning to `DistillLoggerProvider`.
 
 ### 4.8 Batching and retries
 
@@ -374,7 +394,9 @@ builder.AddDistillClient("distill");  // reads ConnectionStrings__distill
 `AddDistillClient` registers `DistillClient` as a singleton, adds the
 `ILogger` provider, and registers a health check. Configuration is read
 from `Distill__Endpoint` / `ConnectionStrings__distill` with a fallback
-to `http://localhost:8080`, and `Distill__ApiKey` for the API key.
+to `http://localhost:8080`, `Distill__ApiKey` for ingestion, and optional
+`Distill__AdminApiKey` / `Distill__AdminEndpoint` for explicit application-owned
+startup provisioning.
 
 ---
 
@@ -434,14 +456,14 @@ response.EnsureSuccessStatusCode();
 
 ### 7.1 Disabling aggregation
 
-Set `Aggregator` to `null` to persist every event:
+Set `DisableAggregation` to persist every event instead of using a preset aggregator:
 
 ```csharp
 var channel = await distill.CreateChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "raw_events",
-    Aggregator = null
+    Preset = ChannelPreset.Metrics,
+    DisableAggregation = true
 });
 ```
 
@@ -460,7 +482,7 @@ Supported v1 aggregators:
 
 Granularity options: `overall`, `per_n_events` (with `parameter`), `per_t_time` (with `parameter` in seconds).
 
-Add `"rolling": true` to merge windows into one expanding aggregate record.
+Add `"rolling": true` only for PostgreSQL sinks to merge windows into one expanding aggregate record. Other v1 sinks reject rolling aggregates.
 
 ### 7.3 Aggregation and severity together
 

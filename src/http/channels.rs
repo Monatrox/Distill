@@ -7,7 +7,14 @@ use super::{
     ErrorEnvelope, EventTestResponse, Json, MessageSchemaDefinition, Path, PublicChannelConfig,
     RouteDecision, SimpleEventRequest, State, StatusCode, classify,
 };
+use axum::extract::Query;
+use serde::Deserialize;
 use tracing::error;
+
+#[derive(Default, Deserialize)]
+pub(super) struct VersionQuery {
+    pub(super) version: Option<String>,
+}
 
 /// Creates a channel from a simple request or preset.
 #[utoipa::path(
@@ -18,6 +25,7 @@ use tracing::error;
     responses(
         (status = 201, body = ChannelConfigResponse, description = "Channel created"),
         (status = 400, body = ErrorEnvelope, description = "The request was invalid"),
+        (status = 409, body = ErrorEnvelope, description = "Configuration version conflicts"),
         (status = 422, body = ErrorEnvelope, description = "The channel configuration is invalid")
     )
 )]
@@ -27,11 +35,15 @@ pub(super) async fn post_channel(
 ) -> Result<(StatusCode, Json<ChannelConfigResponse>), DistillError> {
     let definition = state.build_channel_definition(&request)?;
     let channel_id = request.name.clone();
+    let version = definition.version.clone();
     if let Err(error) = state.registry.register_channel(definition).await {
         log_registration_failure(&channel_id, &error);
         return Err(error);
     }
-    let record = state.registry.channel_record(&channel_id).await?;
+    let record = state
+        .registry
+        .channel_record_versioned(&channel_id, version.as_deref())
+        .await?;
     let response = ChannelConfigResponse::from_record(&record);
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -64,7 +76,7 @@ pub(super) async fn validate_channel(
     }))
 }
 
-/// Replaces an existing channel with a complete explicit definition.
+/// Reconciles an immutable channel version with a complete explicit definition.
 #[utoipa::path(
     put,
     path = "/channels/{channel_id}",
@@ -72,7 +84,8 @@ pub(super) async fn validate_channel(
     params(("channel_id", Path, description = "Channel identifier")),
     request_body = ChannelDefinition,
     responses(
-        (status = 204, description = "Channel replaced"),
+        (status = 204, description = "Channel version reconciled"),
+        (status = 409, body = ErrorEnvelope, description = "Configuration version conflicts"),
         (status = 422, body = ErrorEnvelope, description = "The channel definition is invalid")
     )
 )]
@@ -98,7 +111,10 @@ pub(super) async fn put_channel(
     post,
     path = "/channels/{channel_id}/test",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     request_body = SimpleEventRequest,
     responses(
         (status = 200, body = EventTestResponse, description = "The event is valid and its route is reported"),
@@ -109,14 +125,25 @@ pub(super) async fn put_channel(
 pub(super) async fn test_event(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
     Json(request): Json<SimpleEventRequest>,
 ) -> Result<Json<EventTestResponse>, DistillError> {
-    let record = state.registry.channel_record(&channel_id).await?;
-    let event = request.into_event(channel_id);
+    let version = request.version.clone().or(query.version);
+    let record = state
+        .registry
+        .channel_record_versioned(&channel_id, version.as_deref())
+        .await?;
+    let mut event = request.into_event(channel_id);
+    event.version = version;
     event.validate().map_err(DistillError::InvalidRequest)?;
     state
         .registry
-        .validate_payload(&event.channel_id, &event.payload, None)
+        .validate_payload(
+            &event.channel_id,
+            event.version.as_deref(),
+            &event.payload,
+            None,
+        )
         .await?;
     let route = match classify(&event, &record.definition) {
         RouteDecision::DirectPersist => "direct_persist",
@@ -137,7 +164,10 @@ pub(super) async fn test_event(
     post,
     path = "/channels/{channel_id}/schema",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     request_body = MessageSchemaDefinition,
     responses(
         (status = 204, description = "Schema registered"),
@@ -148,8 +178,12 @@ pub(super) async fn test_event(
 pub(super) async fn post_schema(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
     Json(definition): Json<MessageSchemaDefinition>,
 ) -> Result<StatusCode, DistillError> {
+    if query.version.is_some() {
+        return Err(DistillError::ConfigurationConflict);
+    }
     state
         .registry
         .register_schema(&channel_id, definition)
@@ -162,7 +196,10 @@ pub(super) async fn post_schema(
     get,
     path = "/channels/{channel_id}/config",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     responses(
         (status = 200, body = ChannelConfigResponse, description = "The channel configuration"),
         (status = 404, body = ErrorEnvelope, description = "The channel does not exist")
@@ -171,8 +208,12 @@ pub(super) async fn post_schema(
 pub(super) async fn get_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    let record = state.registry.channel_record(&channel_id).await?;
+    let record = state
+        .registry
+        .channel_record_versioned(&channel_id, query.version.as_deref())
+        .await?;
     Ok(Json(ChannelConfigResponse::from_record(&record)))
 }
 
@@ -181,7 +222,10 @@ pub(super) async fn get_channel(
     post,
     path = "/channels/{channel_id}/pause",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     responses(
         (status = 200, body = ChannelConfigResponse, description = "Channel paused"),
         (status = 404, body = ErrorEnvelope, description = "The channel does not exist")
@@ -190,10 +234,15 @@ pub(super) async fn get_channel(
 pub(super) async fn pause_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
     let record = state
         .registry
-        .set_lifecycle(&channel_id, ChannelLifecycle::Paused)
+        .set_lifecycle(
+            &channel_id,
+            query.version.as_deref(),
+            ChannelLifecycle::Paused,
+        )
         .await?;
     Ok(Json(ChannelConfigResponse::from_record(&record)))
 }
@@ -203,7 +252,10 @@ pub(super) async fn pause_channel(
     post,
     path = "/channels/{channel_id}/resume",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     responses(
         (status = 200, body = ChannelConfigResponse, description = "Channel resumed"),
         (status = 404, body = ErrorEnvelope, description = "The channel does not exist")
@@ -212,10 +264,15 @@ pub(super) async fn pause_channel(
 pub(super) async fn resume_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
     let record = state
         .registry
-        .set_lifecycle(&channel_id, ChannelLifecycle::Active)
+        .set_lifecycle(
+            &channel_id,
+            query.version.as_deref(),
+            ChannelLifecycle::Active,
+        )
         .await?;
     Ok(Json(ChannelConfigResponse::from_record(&record)))
 }
@@ -225,7 +282,10 @@ pub(super) async fn resume_channel(
     post,
     path = "/channels/{channel_id}/flush",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     responses(
         (status = 200, body = ChannelConfigResponse, description = "Channel flushed"),
         (status = 404, body = ErrorEnvelope, description = "The channel does not exist")
@@ -234,8 +294,12 @@ pub(super) async fn resume_channel(
 pub(super) async fn flush_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    let record = state.registry.channel_record(&channel_id).await?;
+    let record = state
+        .registry
+        .channel_record_versioned(&channel_id, query.version.as_deref())
+        .await?;
     record.handle.flush().await?;
     Ok(Json(ChannelConfigResponse::from_record(&record)))
 }
@@ -245,7 +309,10 @@ pub(super) async fn flush_channel(
     post,
     path = "/channels/{channel_id}/archive",
     tag = "channels",
-    params(("channel_id", Path, description = "Channel identifier")),
+    params(
+        ("channel_id", Path, description = "Channel identifier"),
+        ("version" = Option<String>, Query, description = "Explicit configuration version; omitted selects the unversioned channel")
+    ),
     responses(
         (status = 200, body = ChannelConfigResponse, description = "Channel archived"),
         (status = 404, body = ErrorEnvelope, description = "The channel does not exist")
@@ -254,12 +321,20 @@ pub(super) async fn flush_channel(
 pub(super) async fn archive_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<ChannelConfigResponse>, DistillError> {
-    let record = state.registry.channel_record(&channel_id).await?;
+    let record = state
+        .registry
+        .channel_record_versioned(&channel_id, query.version.as_deref())
+        .await?;
     record.handle.flush().await?;
     let archived = state
         .registry
-        .set_lifecycle(&channel_id, ChannelLifecycle::Archived)
+        .set_lifecycle(
+            &channel_id,
+            query.version.as_deref(),
+            ChannelLifecycle::Archived,
+        )
         .await?;
     Ok(Json(ChannelConfigResponse::from_record(&archived)))
 }
@@ -280,9 +355,13 @@ pub(super) async fn archive_channel(
 pub(super) async fn clone_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
+    Query(query): Query<VersionQuery>,
     Json(request): Json<CloneChannelRequest>,
 ) -> Result<(StatusCode, Json<ChannelConfigResponse>), DistillError> {
-    let source = state.registry.channel_record(&channel_id).await?;
+    let source = state
+        .registry
+        .channel_record_versioned(&channel_id, query.version.as_deref())
+        .await?;
     let mut definition = source.definition;
     definition.channel_id = request.channel_id.clone();
     definition.rabbitmq_config.exchange_name = format!(
@@ -291,11 +370,15 @@ pub(super) async fn clone_channel(
     );
     definition.rabbitmq_config.routing_key_prefix = format!("{}.", definition.channel_id);
     let target_channel_id = request.channel_id.clone();
+    let version = definition.version.clone();
     if let Err(error) = state.registry.register_channel(definition).await {
         log_registration_failure(&target_channel_id, &error);
         return Err(error);
     }
-    let record = state.registry.channel_record(&target_channel_id).await?;
+    let record = state
+        .registry
+        .channel_record_versioned(&target_channel_id, version.as_deref())
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(ChannelConfigResponse::from_record(&record)),
@@ -307,7 +390,43 @@ fn log_registration_failure(channel_id: &str, error: &DistillError) {
         event.name = "distill.channel.registration_failed",
         channel.id = %channel_id,
         error.code = %error.error_code(),
-        error = %error,
         "channel registration failed"
     );
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub(super) struct RegisterSinkRequest {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) config: crate::domain::SinkConfig,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub(super) struct RegisterSinkResponse {
+    pub(super) sink_id: String,
+}
+
+/// Registers an immutable sink destination without returning submitted credentials.
+#[utoipa::path(post, path = "/sinks", tag = "channels", request_body = RegisterSinkRequest,
+    responses((status = 201, body = RegisterSinkResponse), (status = 409, body = ErrorEnvelope), (status = 422, body = ErrorEnvelope)))]
+pub(super) async fn register_sink(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterSinkRequest>,
+) -> Result<(StatusCode, Json<RegisterSinkResponse>), DistillError> {
+    for component in [&request.name, &request.version] {
+        if component.is_empty()
+            || component.len() > 64
+            || !component
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        {
+            return Err(DistillError::InvalidConfiguration("sink name/version must contain 1-64 ASCII letters, digits, dots, hyphens, underscores or plus signs".to_string()));
+        }
+    }
+    let sink_id = format!("{}@{}", request.name, request.version);
+    state
+        .registry
+        .register_sink(&sink_id, request.config)
+        .await?;
+    Ok((StatusCode::CREATED, Json(RegisterSinkResponse { sink_id })))
 }

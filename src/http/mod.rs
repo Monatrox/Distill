@@ -47,13 +47,13 @@ mod otlp;
 use auth::authenticate;
 use channels::{
     archive_channel, clone_channel, flush_channel, get_channel, pause_channel, post_channel,
-    post_schema, put_channel, resume_channel, test_event, validate_channel,
+    post_schema, put_channel, register_sink, resume_channel, test_event, validate_channel,
 };
 use dto::{
     ChannelConfigResponse, ChannelValidationResponse, CloneChannelRequest, CreateChannelRequest,
     EventTestResponse, IngestItemError, IngestResponse, PublicChannelConfig, SimpleEventRequest,
 };
-use ingest::{health, ingest, metrics, otlp_logs, post_event};
+use ingest::{health, ingest, metrics, otlp_logs, post_event, ready};
 use openapi::swagger_ui;
 use otlp::otlp_events;
 use uuid::Uuid;
@@ -169,6 +169,18 @@ impl AppState {
         })
     }
 
+    pub async fn shutdown(&self) -> Result<(), DistillError> {
+        self.registry.shutdown().await
+    }
+
+    pub fn stop_admission(&self) {
+        self.registry.stop_admission();
+    }
+
+    pub fn shutdown_timeout(&self) -> std::time::Duration {
+        self.registry.shutdown_timeout()
+    }
+
     fn build_channel_definition(
         &self,
         request: &CreateChannelRequest,
@@ -195,30 +207,11 @@ pub fn public_router(state: AppState) -> Router {
         }),
         &state.http_limits,
     );
-    let admin_routes = authenticated_routes(
-        Router::new()
-            .route("/channels", post(post_channel))
-            .route("/channels/validate", post(validate_channel))
-            .route("/channels/{channel_id}", put(put_channel))
-            .route("/channels/{channel_id}/test", post(test_event))
-            .route("/channels/{channel_id}/config", get(get_channel))
-            .route("/channels/{channel_id}/schema", post(post_schema))
-            .route("/channels/{channel_id}/pause", post(pause_channel))
-            .route("/channels/{channel_id}/resume", post(resume_channel))
-            .route("/channels/{channel_id}/flush", post(flush_channel))
-            .route("/channels/{channel_id}/archive", post(archive_channel))
-            .route("/channels/{channel_id}/clone", post(clone_channel)),
-        Arc::new(AuthGuard {
-            key: (*state.admin_api_key).clone(),
-            failures: Arc::clone(&state.admin_auth_window),
-        }),
-        &state.http_limits,
-    );
     build_router(
         Router::new()
             .route("/health", get(health))
-            .merge(ingest_routes)
-            .merge(admin_routes),
+            .route("/ready", get(ready))
+            .merge(ingest_routes),
         state,
     )
 }
@@ -227,6 +220,7 @@ pub fn public_router(state: AppState) -> Router {
 pub fn admin_router(state: AppState) -> Router {
     let authenticated = authenticated_routes(
         Router::new()
+            .route("/sinks", post(register_sink))
             .route("/channels", post(post_channel))
             .route("/channels/validate", post(validate_channel))
             .route("/channels/{channel_id}", put(put_channel))
@@ -349,7 +343,7 @@ async fn enforce_request_controls(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
+    if matches!(request.uri().path(), "/health" | "/ready") {
         return next.run(request).await;
     }
     match state.request_controls.acquire() {

@@ -43,10 +43,11 @@ futures-util = "0.3"
 lapin = { version = "2.5", default-features = false, features = ["rustls"] }
 mimalloc = "0.1"
 prost = "0.13"
-prost-reflect = "0.14"
+prost-reflect = { version = "0.14", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "json", "uuid"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "chrono", "json", "uuid"] }
 tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls", "tds73", "tokio"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -62,6 +63,7 @@ utoipa = { version = "5.5.0", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
+prost-types = "0.13"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.bench]

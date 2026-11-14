@@ -6,16 +6,23 @@
 
 // Rust guideline compliant 2026-02-21
 
+use super::dto::{
+    ChannelConfigResponse, ChannelPreset, ChannelValidationResponse, CloneChannelRequest,
+    CreateChannelRequest, EventTestResponse, IngestItemError, IngestResponse, PublicChannelConfig,
+    SimpleEventRequest,
+};
 use super::{
+    ChannelLifecycle,
     channels::{
         __path_archive_channel, __path_clone_channel, __path_flush_channel, __path_get_channel,
         __path_pause_channel, __path_post_channel, __path_post_schema, __path_put_channel,
-        __path_resume_channel, __path_test_event, __path_validate_channel,
+        __path_register_sink, __path_resume_channel, __path_test_event, __path_validate_channel,
+        RegisterSinkRequest, RegisterSinkResponse,
     },
     ingest::{
         __path_health, __path_ingest, __path_metrics, __path_otlp_logs, __path_post_event,
+        __path_ready,
     },
-    ChannelLifecycle,
 };
 use crate::{
     core::errors::{ErrorCode, ErrorEnvelope},
@@ -23,11 +30,6 @@ use crate::{
         AggregationFunction, AggregatorSpec, ChannelDefinition, Granularity, LogEvent,
         MessageSchemaDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig,
     },
-};
-use super::dto::{
-    ChannelConfigResponse, ChannelPreset, ChannelValidationResponse, CloneChannelRequest,
-    CreateChannelRequest, EventTestResponse, IngestItemError, IngestResponse,
-    PublicChannelConfig, SimpleEventRequest,
 };
 use utoipa::OpenApi;
 
@@ -40,11 +42,13 @@ use utoipa::OpenApi;
     ),
     paths(
         health,
+        ready,
         metrics,
         ingest,
         otlp_logs,
         post_event,
         post_channel,
+        register_sink,
         validate_channel,
         put_channel,
         test_event,
@@ -63,6 +67,8 @@ use utoipa::OpenApi;
         IngestItemError,
         SimpleEventRequest,
         CreateChannelRequest,
+        RegisterSinkRequest,
+        RegisterSinkResponse,
         ChannelPreset,
         ChannelConfigResponse,
         PublicChannelConfig,
@@ -91,7 +97,8 @@ pub(super) struct ApiDocumentation;
 
 /// Builds the Swagger UI router exposing the contract at `/openapi.json`.
 pub(super) fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
-    utoipa_swagger_ui::SwaggerUi::new("/swagger-ui").url("/openapi.json", ApiDocumentation::openapi())
+    utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
+        .url("/openapi.json", ApiDocumentation::openapi())
 }
 
 #[cfg(test)]
@@ -104,6 +111,8 @@ mod tests {
         let document = ApiDocumentation::openapi();
         for path in [
             "/health",
+            "/ready",
+            "/sinks",
             "/metrics",
             "/ingest",
             "/v1/logs",

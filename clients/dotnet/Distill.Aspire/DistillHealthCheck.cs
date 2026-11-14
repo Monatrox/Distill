@@ -5,7 +5,7 @@ namespace Distill.Aspire;
 
 /// Checks that Distill is ready to accept events.
 ///
-/// Distill is healthy only after an active channel has connected to its sink.
+/// Readiness requires loaded channels and functioning broker consumers.
 public class DistillHealthCheck : IHealthCheck
 {
     private readonly DistillClient client;
@@ -23,7 +23,7 @@ public class DistillHealthCheck : IHealthCheck
     {
         try
         {
-            await client.CheckHealthAsync(cancellationToken);
+            await client.CheckReadinessAsync(cancellationToken);
             return HealthCheckResult.Healthy();
         }
         catch (DistillApiException ex)

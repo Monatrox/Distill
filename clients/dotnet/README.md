@@ -6,7 +6,7 @@ For drop-in integration with existing `ILogger` applications, see the companion 
 
 It targets .NET 8 and supports:
 
-- simplified channel creation with presets and overrides;
+- runtime sink registration and versioned startup reconciliation;
 - full advanced channel definitions;
 - simple channel-bound event writes;
 - batch event ingestion;
@@ -19,25 +19,34 @@ It targets .NET 8 and supports:
 ```csharp
 using Distill.Client;
 
-var client = DistillClient.Create(
+using var client = DistillClient.Create(
     new Uri("http://localhost:8080/"),
-    apiKey: "change-me-in-development");
+    apiKey: "change-me-ingest");
 
-await client.CreateChannelAsync(new CreateChannelRequest
+// Use a protected admin endpoint when it differs from the ingest endpoint.
+await client.RegisterSinkAsync(new RegisterSinkRequest
+{
+    Name = "orders-receiver",
+    Version = "1",
+    Config = new SinkConfig
+    {
+        Driver = "http",
+        ConnectionString = "https://collector.example.com/records"
+    }
+});
+await client.ReconcileChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
-    Preset = "errors_only",
-    RetentionHours = 720
+    Version = "1",
+    SinkId = "orders-receiver@1",
+    Preset = ChannelPreset.RawEvents
 });
-
-// To disable a preset aggregator and persist every event, set Aggregator to null:
-// Aggregator = null
 
 IngestResponse? response = await client.WriteAsync(
     "orders.production",
     new SimpleEvent
     {
-        Severity = "error",
+        Severity = DistillSeverity.Error,
         Message = "Payment authorization failed",
         Payload = new
         {
@@ -54,7 +63,11 @@ IngestResponse? response = await client.WriteAsync(
 Console.WriteLine($"Accepted: {response?.Accepted}");
 ```
 
-For high-volume producers, use `IngestAsync` with stable `EventId` values. If a request times out after admission, retrying the same event ID allows Distill’s idempotent sink write to absorb duplicate delivery.
+`ReconcileChannelAsync` requires an explicit configuration version, creates or verifies an identical immutable definition, and binds subsequent writes from that client to that version. Different content under the same identity returns a conflict. `EnsureChannelAsync` remains create-only; it does not reconcile changes. A different version must be reconciled by the corresponding producer instance. Include `MessageSchema` (fully qualified `MessageType`, schema `Version`, and base64 `FileDescriptorSet` in `DescriptorSetBase64`) to deploy payload schema changes with that immutable channel version. Configuration/lifecycle methods automatically target the bound version.
+
+For high-volume producers, use `IngestAsync` with stable `EventId`, timestamp and payload values. Retry the original event after an ambiguous failure; changing content under the same ID is a conflict. `SimpleEvent` generates its timestamp and ID when constructed, so reuse the object on retry. Inspect rejected indexes on partial responses rather than resending accepted items.
+
+Clients constructed from caller-provided `HttpClient` instances leave them owned by the caller. `DistillClient.Create(...)` owns and disposes the transports it creates or explicitly takes ownership of. Use separate ingest/admin transports when the listeners differ. `CheckReadinessAsync` checks `/ready`; `/health` means only process liveness.
 
 ## Add the project
 
@@ -76,7 +89,7 @@ $consumerDirectory = Split-Path -Parent $consumerProject
 Test-Path (Join-Path $consumerDirectory $reference)
 ```
 
-The final command must return `True`. The reference should be a `ProjectReference`, not a `Reference` or `PackageReference`:
+The final command must return `True`. For local source development use a `ProjectReference`. Release CI also produces `Distill.Client`, `Distill.Extensions.Logging`, and `Distill.Aspire` packages at version `0.1.0`; these can be restored from a private feed. Publication to NuGet is not automatic:
 
 ```xml
 <ProjectReference Include="..\..\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj" />

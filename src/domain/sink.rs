@@ -50,7 +50,7 @@ impl SinkConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SinkDefinition {
     pub sink_id: String,
     pub driver: String,
@@ -64,4 +64,22 @@ pub struct SinkDefinition {
     pub bearer_token_env: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+impl fmt::Debug for SinkDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SinkDefinition")
+            .field("sink_id", &self.sink_id)
+            .field("driver", &self.driver)
+            .field(
+                "connection_string",
+                &self.connection_string.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("connection_string_env", &self.connection_string_env)
+            .field("connection_string_file", &self.connection_string_file)
+            .field("bearer_token_env", &self.bearer_token_env)
+            .field("headers", &"[REDACTED]")
+            .finish()
+    }
 }

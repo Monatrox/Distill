@@ -14,13 +14,15 @@ public static class DistillClientExtensions
     /// Adds a Distill client and logging provider to the application.
     ///
     /// Reads the Distill URI from <c>ConnectionStrings__{connectionName}</c>
-    /// (or <c>Distill__Endpoint</c> as a fallback), and the
-    /// API key from configuration key <c>Distill__ApiKey</c>. Falls back to
-    /// <c>http://localhost:8080</c> with an empty API key.
+    /// (or <c>Distill__Endpoint</c> as a fallback), the ingest key from
+    /// <c>Distill__ApiKey</c>, and optional startup-provisioning credentials from
+    /// <c>Distill__AdminApiKey</c> and <c>Distill__AdminEndpoint</c>. Falls back to
+    /// <c>http://localhost:8080</c> with an empty ingest key.
     ///
     /// Registers <see cref="DistillClient"/> as a singleton, wires the
     /// Distill logging provider, and adds a health check for the Aspire
-    /// dashboard.
+    /// dashboard. Applications may resolve the client after <c>Build()</c> and call
+    /// <see cref="DistillClient.EnsureChannelAsync"/> before serving traffic.
     public static IHostApplicationBuilder AddDistillClient(
         this IHostApplicationBuilder builder,
         string connectionName = "distill",
@@ -44,9 +46,19 @@ public static class DistillClientExtensions
             $"[Distill.Aspire] ingestKeyConfigured={!string.IsNullOrWhiteSpace(apiKey)} "
             + $"adminKeyConfigured={!string.IsNullOrWhiteSpace(adminApiKey)}");
 
-        var client = DistillClient.Create(endpoint, apiKey, adminApiKey, adminEndpoint);
-        builder.Services.AddSingleton(client);
-        builder.Logging.AddDistill(client, configureOptions);
+        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
+        builder.Services.AddHttpClient("Distill.Ingest", client => { client.BaseAddress = endpoint; client.Timeout = TimeSpan.FromSeconds(30); }).RemoveAllLoggers();
+        builder.Services.AddHttpClient("Distill.Admin", client => { client.BaseAddress = string.IsNullOrWhiteSpace(adminEndpoint) ? endpoint : new Uri(adminEndpoint); client.Timeout = TimeSpan.FromSeconds(30); }).RemoveAllLoggers();
+        builder.Services.AddSingleton(services =>
+        {
+            var factory = services.GetRequiredService<IHttpClientFactory>();
+            return DistillClient.Create(factory.CreateClient("Distill.Ingest"), factory.CreateClient("Distill.Admin"), apiKey, adminApiKey);
+        });
+        var options = new DistillLoggerOptions();
+        configureOptions?.Invoke(options);
+        builder.Services.AddSingleton(services => new DistillLoggerProvider(() => services.GetRequiredService<DistillClient>(), options));
+        builder.Services.AddSingleton<ILoggerProvider>(services => services.GetRequiredService<DistillLoggerProvider>());
+        builder.Services.AddHostedService<DistillLoggerShutdownService>();
         builder.Services.AddHealthChecks().AddCheck<DistillHealthCheck>("distill");
 
         return builder;
@@ -119,4 +131,11 @@ public static class DistillClientExtensions
         }.Uri;
         return safeUri.AbsoluteUri.TrimEnd('/');
     }
+}
+
+/// Drains queued logging before the container disposes its HTTP client wrappers.
+internal sealed class DistillLoggerShutdownService(DistillLoggerProvider provider) : IHostedService
+{
+    public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task StopAsync(CancellationToken cancellationToken) => provider.DisposeAsync().AsTask();
 }

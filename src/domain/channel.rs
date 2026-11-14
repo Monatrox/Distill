@@ -5,15 +5,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{
-    AggregatorSpec, MAX_BUFFER_BYTES, MAX_CHANNEL_ID_LENGTH, MAX_MAILBOX_CAPACITY,
-    MAX_RETENTION_HOURS, MAX_TTL_SECONDS, OrderingMode, SeverityLevel, SinkConfig,
-    default_allowed_lateness_ms, default_buffer_bytes, default_mailbox_capacity,
-    default_ttl_seconds,
+    AggregatorSpec, MAX_BUFFER_BYTES, MAX_CHANNEL_ID_LENGTH, MAX_MAILBOX_CAPACITY, MAX_TTL_SECONDS,
+    OrderingMode, SeverityLevel, SinkConfig, default_allowed_lateness_ms, default_buffer_bytes,
+    default_mailbox_capacity, default_ttl_seconds,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ChannelDefinition {
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub severity_threshold: SeverityLevel,
     pub rabbitmq_config: RabbitMqConfig,
     #[serde(default)]
@@ -57,6 +58,15 @@ impl ChannelDefinition {
                 "channel_id must not exceed {MAX_CHANNEL_ID_LENGTH} characters"
             ));
         }
+        if self.version.as_ref().is_some_and(|version| {
+            version.is_empty()
+                || version.len() > 64
+                || !version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        }) {
+            return Err("version must contain 1-64 ASCII letters, digits, dots, hyphens, underscores, or plus signs".to_string());
+        }
         if self.buffer_bytes == 0 || self.mailbox_capacity == 0 {
             return Err("buffer_bytes and mailbox_capacity must be positive".to_string());
         }
@@ -71,28 +81,36 @@ impl ChannelDefinition {
         if self.ttl_seconds > MAX_TTL_SECONDS {
             return Err(format!("ttl_seconds must not exceed {MAX_TTL_SECONDS}"));
         }
-        if self
-            .retention_hours
-            .is_some_and(|hours| hours > MAX_RETENTION_HOURS)
-        {
-            return Err(format!(
-                "retention_hours must not exceed {MAX_RETENTION_HOURS}"
-            ));
+        if self.retention_hours.is_some() {
+            return Err("retention_hours is not supported in v1".to_string());
+        }
+        if self.compression_enabled {
+            return Err("compression_enabled is not supported in v1".to_string());
         }
         if self.sink_id.is_none() {
-            self.sink_config.validate()
-        } else {
-            Ok(())
+            self.sink_config.validate()?;
         }
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 pub struct RabbitMqConfig {
     pub connection_string: String,
     pub exchange_name: String,
     #[serde(default)]
     pub routing_key_prefix: String,
+}
+
+impl std::fmt::Debug for RabbitMqConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RabbitMqConfig")
+            .field("connection_string", &"[REDACTED]")
+            .field("exchange_name", &self.exchange_name)
+            .field("routing_key_prefix", &self.routing_key_prefix)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -104,7 +122,10 @@ pub struct MessageSchemaDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig};
+    use super::{
+        AggregatorSpec, ChannelDefinition, OrderingMode, RabbitMqConfig, SeverityLevel, SinkConfig,
+    };
+    use crate::domain::{AggregationFunction, Granularity};
 
     fn definition(
         buffer_bytes: usize,
@@ -112,6 +133,7 @@ mod tests {
         ttl_seconds: u64,
     ) -> ChannelDefinition {
         ChannelDefinition {
+            version: None,
             channel_id: "orders.production".to_string(),
             severity_threshold: SeverityLevel::Error,
             rabbitmq_config: RabbitMqConfig {
@@ -162,15 +184,32 @@ mod tests {
     }
 
     #[test]
-    fn bounds_reject_excessive_channel_identifier_and_retention() {
-        let mut long = definition(1_024, 1_024, 3_600);
-        long.channel_id = "a".repeat(super::MAX_CHANNEL_ID_LENGTH + 1);
-        assert!(long.validate().is_err());
+    fn unsupported_v1_features_are_rejected() {
+        let mut definition = definition(1_024, 1_024, 3_600);
+        definition.retention_hours = Some(1);
+        assert!(definition.validate().is_err());
 
-        let mut retention = definition(1_024, 1_024, 3_600);
-        retention.retention_hours = Some(super::MAX_RETENTION_HOURS + 1);
-        assert!(retention.validate().is_err());
-        retention.retention_hours = Some(super::MAX_RETENTION_HOURS);
-        assert!(retention.validate().is_ok());
+        definition.retention_hours = None;
+        definition.compression_enabled = true;
+        assert!(definition.validate().is_err());
+
+        definition.compression_enabled = false;
+        definition.aggregator = Some(AggregatorSpec {
+            function: AggregationFunction::Count,
+            granularity: Granularity::Overall,
+            parameter: None,
+            rolling: true,
+        });
+        assert!(definition.validate().is_ok());
+        definition.sink_config.driver = "http".to_string();
+        definition.sink_config.connection_string = "https://receiver.example/records".to_string();
+        assert!(definition.validate().is_ok());
+    }
+
+    #[test]
+    fn bounds_reject_excessive_channel_identifier() {
+        let mut definition = definition(1_024, 1_024, 3_600);
+        definition.channel_id = "a".repeat(super::MAX_CHANNEL_ID_LENGTH + 1);
+        assert!(definition.validate().is_err());
     }
 }

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
+    <ProjectReference Include="..\Distill.Extensions.Logging\Distill.Extensions.Logging.csproj" />
+    <ProjectReference Include="..\Distill.Aspire\Distill.Aspire.csproj" />
+  </ItemGroup>
+</Project>
