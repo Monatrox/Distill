@@ -1,0 +1,65 @@
+# Local demo only: loopback ports and disposable credentials.
+name: distill-quickstart
+
+services:
+  rabbitmq:
+    image: docker.io/library/rabbitmq:3.13-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: distill
+      RABBITMQ_DEFAULT_PASS: dev-broker-password
+      # Disposable demo cookie avoids cookie-file ownership differences on rootless hosts.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 -setcookie distill-demo-cookie"
+      RABBITMQ_CTL_ERL_ARGS: "+S 2:2 -setcookie distill-demo-cookie"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  receiver:
+    image: docker.io/library/python:3.13-slim
+    command: ["python", "/app/http_receiver.py", "--database", "/data/records.sqlite3", "--host", "0.0.0.0", "--port", "8765"]
+    environment:
+      DISTILL_RECEIVER_TOKEN: dev-receiver-token
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./http_receiver.py:/app/http_receiver.py:ro
+      - receiver_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=2)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  distill:
+    stop_grace_period: 45s
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      receiver:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URI: amqp://distill:dev-broker-password@rabbitmq:5672/%2f
+      DISTILL_INGEST_API_KEY: dev-key
+      DISTILL_ADMIN_API_KEY: dev-key-admin
+      DISTILL_BIND_ADDRESS: 0.0.0.0:8080
+      DISTILL_ADMIN_BIND_ADDRESS: 0.0.0.0:8081
+      DISTILL_ALLOW_ADMIN_NETWORK: "true"
+      DISTILL_SINK_ALLOWLIST: receiver:8765
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - distill_state:/var/lib/distill
+
+volumes:
+  rabbitmq_data:
+  receiver_data:
+  distill_state:

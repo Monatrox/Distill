@@ -2,6 +2,8 @@
 
 `Distill.Aspire` provides Aspire hosting and client integration for Distill structured logging.
 
+It targets .NET 9/10 and uses Aspire 13.6.5. The client and logging packages also support .NET 8. Build from source or use packages from your configured local/private feed; the current package version is `0.1.0`.
+
 ## AppHost usage
 
 ### External Distill (no container)
@@ -10,8 +12,9 @@ Configure an existing Distill instance by providing the endpoint:
 
 ```csharp
 var distill = builder.AddDistill("distill",
-    endpoint: new Uri("http://distill.example.com:8080"),
-    apiKey: "your-api-key");
+    endpoint: new Uri("https://distill.example.com"),
+    apiKey: "your-api-key",
+    adminEndpoint: new Uri("https://distill-admin.internal.example.com"));
 
 var myService = builder.AddProject<Projects.MyService>("my-service")
     .WithReference(distill);
@@ -19,8 +22,7 @@ var myService = builder.AddProject<Projects.MyService>("my-service")
 
 ### Container-mode Distill
 
-Launch Distill with a managed RabbitMQ resource, non-default broker user, generated credentials, and persistent broker/state volumes. A generated shared Distill key is used if `apiKey` is omitted. Configure a `UserSecretsId` in the AppHost project so generated broker/API credentials persist across local runs when their data volumes are retained. Production supplies stable credentials through its secret configuration. The image defaults to private `ghcr.io/monatrox/distill:0.1.0`; authenticate your container runtime to the registry.
-Override with `.WithImage(...)` for a custom image.
+Launch Distill with a managed RabbitMQ resource, non-default broker user, generated credentials, and persistent broker/state volumes. A generated shared Distill key is used if `apiKey` is omitted. Configure a `UserSecretsId` in the AppHost project so generated broker/API credentials persist across local runs when their data volumes are retained. Production supplies stable credentials through its secret configuration. The default image reference is `ghcr.io/monatrox/distill:0.1.0`; that reference does not guarantee a published or accessible image. Use `.WithLocalBuild(...)` for source development, or `.WithImage(...)` for an image you have published and can pull. Authenticate to the registry when needed.
 
 #### Automatic local build (recommended for development)
 
@@ -53,7 +55,7 @@ Provide explicit paths if the Dockerfile is not under the current directory:
 var distill = builder.AddDistill("distill", apiKey: "dev-key");
 
 // (Optional) use a custom registry image
-// distill.WithImage("ghcr.io/myorg/distill", "1.0.0");
+// distill.WithImage("ghcr.io/myorg/distill", "0.1.0");
 ```
 
 ### Register a PostgreSQL sink
@@ -62,8 +64,12 @@ var distill = builder.AddDistill("distill", apiKey: "dev-key");
 var postgres = builder.AddPostgres("pg").AddDatabase("distill");
 
 var distill = builder.AddDistill("distill", apiKey: "dev-key")
+    .WithLocalBuild()
+    .WithEnvironment("DISTILL_AUTO_MIGRATE", "true") // Disposable local database only.
     .WithSink(postgres, name: "primary");  // waits for PostgreSQL; primary becomes default
 ```
+
+The example above enables automatic DDL only for its disposable local database. For an existing or production database, apply the explicit migration CLI before startup and leave `DISTILL_AUTO_MIGRATE` disabled. Use `.WithLocalBuild(...)` with the source checkout, or configure an available pre-built image as described above.
 
 For an existing PostgreSQL server, keep its connection string in AppHost configuration or a secret provider:
 
@@ -163,6 +169,7 @@ The extension reads configuration directly from environment variables or `appset
 {
   "Distill": {
     "Endpoint": "http://localhost:8080",
+    "AdminEndpoint": "http://localhost:8081",
     "ApiKey": "change-me-ingest",
     "AdminApiKey": "change-me-admin"
   }
@@ -187,6 +194,6 @@ When sinks are registered via `.WithSink(...)`, the integration sets the followi
 
 `WithSink` is optional; application startup can call `RegisterSinkAsync` and `ReconcileChannelAsync` without changing the logger deployment. External mode also accepts an Aspire secret `ParameterResource` for the shared key and an explicit `adminEndpoint`. Ensure that destination addresses are reachable from Distill, and explicitly allowlist private HTTP receiver hosts/ports through `DISTILL_SINK_ALLOWLIST`. Native database schemas require the explicit `distill sink migrate` workflow unless development-only auto-migration is enabled.
 
-Run only one active Distill instance per dedicated broker vhost. Persist `/var/lib/distill` on local-disk-compatible storage. An actual deployed Aspire/Azure end-to-end run and Azure SQLite storage compatibility remain release gates; local resource-model tests do not establish deployment compatibility.
+Run only one active Distill instance per dedicated broker vhost. Persist `/var/lib/distill` on local-disk-compatible storage. Actual local Aspire application qualification has passed; production-target/Azure deployment, restore and SQLite storage compatibility remain release gates. Local results do not establish Azure deployment compatibility.
 
 The client resolves its HTTP transports lazily so the logging provider can be constructed alongside HttpClientFactory/resilience defaults without a logger-factory dependency cycle. Distill transport HTTP loggers are disabled to avoid logging its own delivery requests. A hosted shutdown service drains logging before dependency injection disposes the HTTP client wrappers.

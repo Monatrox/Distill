@@ -21,24 +21,30 @@ using Distill.Client;
 
 using var client = DistillClient.Create(
     new Uri("http://localhost:8080/"),
-    apiKey: "change-me-ingest");
+    apiKey: "dev-key",
+    adminApiKey: "dev-key-admin",
+    adminEndpoint: "http://localhost:8081/");
 
-// Use a protected admin endpoint when it differs from the ingest endpoint.
+// These destination values match the root README's local demo.
 await client.RegisterSinkAsync(new RegisterSinkRequest
 {
-    Name = "orders-receiver",
+    Name = "demo-receiver",
     Version = "1",
     Config = new SinkConfig
     {
         Driver = "http",
-        ConnectionString = "https://collector.example.com/records"
+        ConnectionString = "http://receiver:8765/records",
+        Headers = new Dictionary<string, string>
+        {
+            ["Authorization"] = "Bearer dev-receiver-token"
+        }
     }
 });
 await client.ReconcileChannelAsync(new CreateChannelRequest
 {
     Name = "orders.production",
     Version = "1",
-    SinkId = "orders-receiver@1",
+    SinkId = "demo-receiver@1",
     Preset = ChannelPreset.RawEvents
 });
 
@@ -71,40 +77,14 @@ Clients constructed from caller-provided `HttpClient` instances leave them owned
 
 ## Add the project
 
-`ProjectReference` paths are resolved relative to the consuming `.csproj`, not relative to the solution file. For a quick diagnosis, use the absolute path first:
+For source development, add a project reference using the path to your checkout:
 
-```xml
-<ItemGroup>
-  <ProjectReference Include="A:\Dev\Rust\Projects\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj" />
-</ItemGroup>
+```sh
+dotnet add ./MyApp/MyApp.csproj reference ../Distill/clients/dotnet/Distill.Client/Distill.Client.csproj
 ```
 
-Once that works, replace the absolute path with a relative path calculated from the consuming project's directory. In PowerShell, verify the result before adding it:
+Adjust paths for your directory layout. XML `ProjectReference` paths are relative to the consuming `.csproj`.
 
-```powershell
-$consumerProject = "A:\path\to\MyApp.csproj"
-$reference = "..\..\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj"
-$consumerDirectory = Split-Path -Parent $consumerProject
-[IO.Path]::GetFullPath((Join-Path $consumerDirectory $reference))
-Test-Path (Join-Path $consumerDirectory $reference)
-```
+CI produces `Distill.Client`, `Distill.Extensions.Logging` and `Distill.Aspire` packages at version `0.1.0`. Build them using the root README's package commands and restore them from a local/private feed; public NuGet publication is not automatic.
 
-The final command must return `True`. For local source development use a `ProjectReference`. Release CI also produces `Distill.Client`, `Distill.Extensions.Logging`, and `Distill.Aspire` packages at version `0.1.0`; these can be restored from a private feed. Publication to NuGet is not automatic:
-
-```xml
-<ProjectReference Include="..\..\Distill\clients\dotnet\Distill.Client\Distill.Client.csproj" />
-```
-
-If using an IDE, add `Distill.Client.csproj` as an existing project in the solution and then add it as a project reference. Reload the solution after correcting the path.
-
-```xml
-<ProjectReference Include="..\Distill.Client\Distill.Client.csproj" />
-```
-
-Build it locally with:
-
-```powershell
-dotnet build clients/dotnet/Distill.Client/Distill.Client.csproj
-```
-
-The client intentionally does not auto-retry requests: callers should choose retry policy appropriate to their workload and preserve stable event IDs when retrying.
+The client does not automatically retry requests. Choose a caller retry policy and preserve the original event identity/content after ambiguous failures. The example above uses the root README's development endpoints and credentials; replace them with deployment configuration outside the demo.

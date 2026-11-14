@@ -12,23 +12,26 @@ Register a destination and reconcile versioned channels during application start
 using Distill.Client;
 using Distill.Extensions.Logging;
 
-var distill = DistillClient.Create(
+using var distill = DistillClient.Create(
     new Uri("http://localhost:8080/"),
-    apiKey: Environment.GetEnvironmentVariable("DISTILL_API_KEY")!,
-    adminApiKey: Environment.GetEnvironmentVariable("DISTILL_ADMIN_API_KEY"));
+    apiKey: Environment.GetEnvironmentVariable("DISTILL_INGEST_API_KEY")!,
+    adminApiKey: Environment.GetEnvironmentVariable("DISTILL_ADMIN_API_KEY"),
+    adminEndpoint: "http://localhost:8081/");
 
-builder.Logging.AddDistill(distill, options =>
+var options = new DistillLoggerOptions
 {
-    options.DefaultChannel = "application.production";
-    options.DefaultVersion = "1";
-    options.MinimumLevel = LogLevel.Information;
-    options.BatchSize = 100;
-    options.FlushInterval = TimeSpan.FromSeconds(1);
-    options.MaxRetries = 3;
-});
+    DefaultChannel = "application.production",
+    DefaultVersion = "1",
+    MinimumLevel = LogLevel.Information,
+    BatchSize = 100,
+    FlushInterval = TimeSpan.FromSeconds(1),
+    MaxRetries = 3
+};
+await using var provider = new DistillLoggerProvider(distill, options);
+builder.Logging.AddProvider(provider);
 ```
 
-Before `app.Run()`, ensure application-owned channels with an admin-enabled `DistillClient`:
+Before `app.RunAsync()`, reconcile application-owned channels with an admin-enabled `DistillClient`:
 
 ```csharp
 var app = builder.Build();
@@ -41,10 +44,12 @@ await distill.ReconcileChannelAsync(new CreateChannelRequest
     Preset = ChannelPreset.RawEvents
 });
 
-app.Run();
+await app.RunAsync();
 ```
 
 `ReconcileChannelAsync` binds the client to the declared immutable version. Register the named sink first through `RegisterSinkAsync` (see the SDK README). Let reconciliation conflicts stop startup; use a new version for changed configuration. `EnsureChannelAsync` remains create-only.
+
+The sample explicitly owns the provider and HTTP client. Keep the client alive until the provider has drained: declaring `await using` for the provider after `using` for the client gives that disposal order. The convenience `builder.Logging.AddDistill(...)` helper is also available when your application arranges their lifetimes. See the complete [web application example](../../../docs/csharp_integration.md#ilogger-integration) for a runnable setup.
 
 Existing logging code continues to work:
 

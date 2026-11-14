@@ -10,7 +10,7 @@ The public listener serves ingestion and authenticated metrics. Configuration, s
 
 `/health` and `/ready` are unauthenticated operational endpoints. Liveness does not establish destination health; readiness checks active configuration and broker paths rather than universally probing every sink. Restrict metrics and operational endpoints at the network or proxy boundary as appropriate.
 
-Use protected transport for ingest and administration. Compose includes development credentials and a local Caddy certificate setup; replace those credentials before using a deployment outside local testing. RabbitMQ and native destinations need their own protected credentials and network access controls.
+Use protected transport for ingest and administration. The root Compose stack includes development credentials and a local Caddy certificate setup. The README's separate quick-start stack uses plaintext HTTP bound to host loopback. Both are local development setups; replace their credentials and configure protected transport before using a deployment outside local testing. RabbitMQ and native destinations need their own protected credentials and network access controls.
 
 ## Credential and recovery storage
 
